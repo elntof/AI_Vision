@@ -23,9 +23,9 @@ mpl.rcParams['font.family'] = 'Malgun Gothic'
 mpl.rcParams['axes.unicode_minus'] = False
 
 # 환경 플래그: 경로 및 저장동작 테스트(True)/운영(False) 모드 구분
-LOAD_TEST_MODE = False
-SAVE_TEST_MODE = False
-INI_TEST_MODE  = False
+LOAD_TEST_MODE = True
+SAVE_TEST_MODE = True
+INI_TEST_MODE  = True
 
 # 이미지/CSV/그래프/이벤트 파일 경로 설정
 if LOAD_TEST_MODE:
@@ -77,6 +77,10 @@ NOISE_CIRCLE_THICKNESS = 1     # 노이즈(흰색) 원 테두리 두께
 
 # 밝기 참조 영역 (ROI)
 REF_ROI = (70, 90, 20, 20)
+
+# 앵커 밝기 기반 동적 임계값 파라미터
+ANCHOR_BRIGHTNESS_REF = 48
+ADAPTIVE_THRESHOLD_GAIN = 0.3
 
 def safe_image_load(image_path, max_retries=5, delay=0.2):
     """안전 이미지 로당 (재시도 최대 5회, 0.2초 간격)"""
@@ -138,7 +142,17 @@ def compute_anchor_brightness(gray_img):
     anchor = int(round(float((bins * weights).sum() / denom)))
     return max(0, min(anchor, 255))
 
-def particle_detection(image_path, exclude_boxes):
+
+def compute_adaptive_threshold(anchor_current: int | float | None) -> int:
+    """앵커 밝기에 따라 동적으로 조정된 이진화 임계값 계산"""
+    if anchor_current is None:
+        return int(MANUAL_THRESHOLD)
+
+    adaptive_value = MANUAL_THRESHOLD + ADAPTIVE_THRESHOLD_GAIN * (float(anchor_current) - ANCHOR_BRIGHTNESS_REF)
+    adaptive_value = max(0.0, min(255.0, adaptive_value))
+    return int(round(adaptive_value))
+
+def particle_detection(image_path, exclude_boxes, threshold=None):
     """파티클 탐지 (OpenCV 파이프라인)"""
     img = safe_image_load(image_path)
     if img is None:
@@ -148,7 +162,9 @@ def particle_detection(image_path, exclude_boxes):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, KERNEL_SIZE_TOPHAT)
         tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
-        _, binary_mask = cv2.threshold(tophat, MANUAL_THRESHOLD, 255, cv2.THRESH_BINARY)
+        thr_value = MANUAL_THRESHOLD if threshold is None else int(threshold)
+        thr_value = max(0, min(255, thr_value))
+        _, binary_mask = cv2.threshold(tophat, thr_value, 255, cv2.THRESH_BINARY)
         cleaned_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, KERNEL_SIZE_MORPH))
         vis_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
@@ -449,11 +465,13 @@ class ParticleDetectionGUI(QWidget):
         self.device_info_box.setFixedWidth(180)
         self.device_info_box.setAlignment(Qt.AlignCenter)
 
-        # CSV 관리 형식
+        # CSV, Image, Graph(스냅샷) 관리 형식
         self.current_lot = None
         self.csv_path = None
-        self.csv_header = ['이미지 파일명', 'Attempt 횟수', '밝기', '파티클 발생 여부', '파티클_크기', '파티클_x', '파티클_y']
-        self.processed_images = set()
+        self.csv_header = ['이미지 파일명', 'Attempt 횟수', '밝기', 'adaptive_value', '파티클 발생 여부', '파티클_크기', '파티클_x', '파티클_y']
+        self.processed_images: set[str] = set()
+        self.session_processed_images: set[str] = set()
+        self.saved_graph_lots: set[str] = set()
 
         # Noise Particle 판정 파라미터
         self.prev_particles = []         # 2회 이상 반복 좌표 및 크기 기억
@@ -619,6 +637,14 @@ class ParticleDetectionGUI(QWidget):
         for s in [self.crop2_x, self.crop2_y, self.crop2_w, self.crop2_h]:
             s.setEnabled(enabled2)
 
+    def _mark_image_processed(self, filename: str):
+        """현재 Lot/세션 처리 목록에 이미지명 기록"""
+        if not filename:
+            return
+        self.processed_images.add(filename)
+        self.session_processed_images.add(filename)
+
+
     @Slot(bool)
     def _on_crop1_toggled(self, checked: bool):
         "체크박스1 토글 핸들러"
@@ -696,6 +722,7 @@ class ParticleDetectionGUI(QWidget):
         self.collecting_initial = True
         self.prev_particles = []
         self.frame_buffer = []
+        self.saved_graph_lots.clear()
 
         self.show_noise_text = False
         self._update_noise_text()
@@ -705,7 +732,7 @@ class ParticleDetectionGUI(QWidget):
         self.stop_button.setEnabled(True)
 
         # 백로그 목록 구성 (processed_images 기준 미처리 파일 전체)
-        backlog = find_new_images(IMG_INPUT_DIR, self.processed_images)
+        backlog = find_new_images(IMG_INPUT_DIR, self.session_processed_images)
         if backlog:
             # 백로그를 메인스레드에 차례로 공급
             self._backlog_thread = QThread()
@@ -766,7 +793,7 @@ class ParticleDetectionGUI(QWidget):
 
     def process_new_images_tick(self):
         """(실시간)신규 이미지 처리"""
-        new_images = find_new_images(IMG_INPUT_DIR, self.processed_images)
+        new_images = find_new_images(IMG_INPUT_DIR, self.session_processed_images)
         if not new_images:
             # 상태 메세지 깜빡임 방지 (래치/홀드/유예시간 고려)
             now = time.monotonic()
@@ -794,21 +821,13 @@ class ParticleDetectionGUI(QWidget):
         """단일 이미지 처리 루틴 (메인 스레드에서 실행 → 모든 UI 요소 매 이미지 갱신)"""
         try:
             img_path = Path(img_path)
-
-            # 파일명 기준으로 중복 체크
-            if img_path.name in self.processed_images:
-                self.status_label.setText(f"이미 처리됨: {img_path.name}")
-                return
-
-            # 새 이미지 관측 시각 갱신
-            self.last_image_seen_at = time.monotonic()
+            img_name = img_path.name
 
             # 파일명 형식 기반 파싱: EQUIP_Lot#_Process_Attempt_YYYYMMDD_HHMM(SS).ext
-            info = parse_filename(img_path.name)
+            info = parse_filename(img_name)
             lot_number    = info['lot']
             process_name  = info['process']
             attempt_value = info['attempt']
-            self.device_info_box.setText('_'.join([info['equip'], info['lot'], info['process'], str(info['attempt'])]))
 
             # Lot 변경 시 CSV 생성 + 그래프 초기화 + 워밍업 리셋
             if self.current_lot != lot_number:
@@ -816,7 +835,12 @@ class ParticleDetectionGUI(QWidget):
                 try:
                     prev_lot = self.current_lot
                     prev_csv = self.csv_path
-                    if prev_lot and prev_csv and prev_csv.exists():
+                    if (
+                        prev_lot
+                        and prev_csv
+                        and prev_csv.exists()
+                        and prev_lot not in self.saved_graph_lots
+                    ):
                         out_dir = GRAPH_OUTPUT_DIR
                         ts = time.strftime('%Y%m%d_%H%M%S')
                         out_path = out_dir / f"{prev_lot}_{ts}.jpg"
@@ -825,6 +849,7 @@ class ParticleDetectionGUI(QWidget):
                             dpi=self.plot_canvas.fig.dpi,
                             bbox_inches='tight'
                         )
+                        self.saved_graph_lots.add(prev_lot)
                 except Exception as e:
                     self._set_status(f"그래프 이미지 저장 오류: {e}", hold_s=3.0)
 
@@ -850,7 +875,7 @@ class ParticleDetectionGUI(QWidget):
                             header = next(reader, None)
                             for row in reader:
                                 if row:
-                                    self.processed_images.add(row[0])
+                                    self._mark_image_processed(row[0])
                     except Exception:
                         pass
 
@@ -864,6 +889,16 @@ class ParticleDetectionGUI(QWidget):
 
                 # 빈 CSV 기반 그래프 즉시 초기화
                 self.update_graph()
+
+            # Lot 전환 이후 CSV 기반 중복 세트 로딩이 완료된 상태에서 중복 여부 재확인
+            if img_name in self.processed_images:
+                self.status_label.setText(f"이미 처리됨: {img_path.name}")
+                return
+
+            # 새 이미지 관측 시각 갱신
+            self.last_image_seen_at = time.monotonic()
+
+            self.device_info_box.setText('_'.join([info['equip'], info['lot'], info['process'], str(info['attempt'])]))
 
             # 허용 모드 체크
             if process_name not in self.ALLOWED_PULLER_MODES:
@@ -883,7 +918,7 @@ class ParticleDetectionGUI(QWidget):
                     )
                     self.preview_label.set_anchor_value(None)
 
-                self.processed_images.add(img_path.name)
+                self._mark_image_processed(img_path.name)
                 return
             else:
                 # 허용 모드 → 래치 해제
@@ -894,12 +929,16 @@ class ParticleDetectionGUI(QWidget):
             img_preview = safe_image_load(str(img_path))
             if img_preview is not None:
                 gray_prev = cv2.cvtColor(img_preview, cv2.COLOR_BGR2GRAY)
+                anchor_current = compute_anchor_brightness(gray_prev)
                 self.preview_label.show_image(gray_prev, [self.get_box1(), self.get_box2()], filename=img_path.name)
-                self.preview_label.set_anchor_value(compute_anchor_brightness(gray_prev))
+                self.preview_label.set_anchor_value(anchor_current)
+            else:
+                self.preview_label.set_anchor_value(None)
 
             # 현재 Noise 정보 텍스트 갱신
+            adaptive_value = compute_adaptive_threshold(anchor_current)
             self._update_noise_text()
-
+            
             # 워밍업 구간 (최초 10장 동안은 '판정/CSV/그래프' 수행하지 않음)
             if self.collecting_initial:
                 self.status_label.setText(f"초기 워밍업 수집 중... ({len(self.frame_buffer) + 1} / 10)")
@@ -907,11 +946,11 @@ class ParticleDetectionGUI(QWidget):
                 self._update_noise_text()
 
                 # 후보 파티클만 수집(판정/CSV/그래프/이벤트 저장 없음)
-                _, _, particle_info = particle_detection(str(img_path), [self.get_box1(), self.get_box2()])
+                _, _, particle_info = particle_detection(str(img_path), [self.get_box1(), self.get_box2()], adaptive_value)
                 if particle_info is None:
                     # 로딩/후보 추출 실패 시 스킵
                     self.status_label.setText(f"오류: {img_path.name} 로딩/후보 추출 실패 (워밍업)")
-                    self.processed_images.add(img_path.name)
+                    self._mark_image_processed(img_path.name)
                     return
 
                 self.frame_buffer.append(particle_info)
@@ -932,7 +971,7 @@ class ParticleDetectionGUI(QWidget):
                     self.status_label.setText("▶ 워밍업 완료 → 실시간 판정 시작")
                     self._update_noise_text()
 
-                self.processed_images.add(img_path.name)
+                self._mark_image_processed(img_path.name)
                 return
 
             # 실시간 판정 구간 (워밍업 이후 이미지부터)
@@ -942,14 +981,14 @@ class ParticleDetectionGUI(QWidget):
             self._update_noise_text()
 
             # 실제 판정 처리 (OpenCV 파이프라인)
-            gray, overlay_img, particle_info = particle_detection(str(img_path), [self.get_box1(), self.get_box2()])
+            gray, overlay_img, particle_info = particle_detection(str(img_path), [self.get_box1(), self.get_box2()], adaptive_value)
             if overlay_img is None or particle_info is None:
                 self.status_label.setText(f"오류: {img_path.name} 처리 실패")
-                self.processed_images.add(img_path.name)
+                self._mark_image_processed(img_path.name)
                 return
 
             # 이미지의 앵커 밝기 계산 (CSV 기록용)
-            anchor_brightness = compute_anchor_brightness(gray)
+            anchor_brightness = anchor_current if anchor_current is not None else compute_anchor_brightness(gray)
 
             # 유효 파티클 판별 (prev_particles와 매칭되지 않은 것만)
             valid_particles = []
@@ -992,10 +1031,10 @@ class ParticleDetectionGUI(QWidget):
             # CSV 저장
             if has_particle == 'O':
                 for (x, y, a) in valid_particles:
-                    row = [img_path.name, attempt_value, anchor_brightness, has_particle, a, x, y]
+                    row = [img_path.name, attempt_value, anchor_brightness, adaptive_value, has_particle, a, x, y]
                     self.save_csv(row)
             else:
-                row = [img_path.name, attempt_value, anchor_brightness, has_particle, 0, 0, 0]
+                row = [img_path.name, attempt_value, anchor_brightness, adaptive_value, has_particle, 0, 0, 0]
                 self.save_csv(row)
 
             # 이벤트 이미지 저장 (Lot# 폴더 내)
@@ -1010,7 +1049,7 @@ class ParticleDetectionGUI(QWidget):
 
             # 처리 완료 → 3초간 상태 홀드로 깜빡임 억제
             self._set_status(f"처리됨: {img_path.name}  - 파티클:{has_particle}", hold_s=3.0)
-            self.processed_images.add(img_path.name)
+            self._mark_image_processed(img_path.name)
 
         except Exception as e:
             self.status_label.setText(f"오류: {e}")
