@@ -197,7 +197,7 @@ def extract_row_info(row):
     puller_status_raw = row.get('Puller Mode Status', '')
     neck_attempt_raw = row.get('Neck Attempts', '')
     bottom_heater_raw = row.get('Bottom Heater Set Point', '')
-    seed_lift_set_point_raw = row.get('Seed Lift Set Point', '')
+    seed_lift_raw = row.get('Seed Lift Set Point', '')
 
     dt_full = parse_datetime(date_str, time_str)
     if dt_full:
@@ -225,9 +225,9 @@ def extract_row_info(row):
         bottom_heater = 0
 
     try:
-        seed_lift_set_point = float(seed_lift_set_point_raw)
+        seed_lift = float(seed_lift_raw)
     except (ValueError, TypeError):
-        seed_lift_set_point = 0
+        seed_lift = 0
 
     status_map = {
         0: "IDLE",
@@ -244,11 +244,11 @@ def extract_row_info(row):
         elif 20 <= puller_status <= 29:
             status_text = "STABILIZATION"
         elif 30 <= puller_status <= 39:
-            # mode 30~39 & BH Power≥10 → "REMELT" / mode 30~39 & Neck Att=1 & Seed Lift≥0.5 → "NECK", 아니면 "NECK(STAB)"
+            # mode 30~39 & BH Power≥10 → "REMELT" / mode 30~39 & Neck Att≥1 & Seed Lift≥0.3 → "NECK", 아니면 "NECK(STAB)"
             if bottom_heater >= 10:
                 status_text = "REMELT"
             else:
-                status_text = "NECK" if (neck_attempt == 1 and seed_lift_set_point >= 0.5) else "NECK(STAB)"
+                status_text = "NECK" if (neck_attempt >= 1 and seed_lift >= 0.3) else "NECK(STAB)"
         elif 40 <= puller_status <= 49:
             status_text = "CROWN"
         elif 50 <= puller_status <= 59:
@@ -807,4 +807,3 @@ if __name__ == '__main__':
 
     window.show()
     app.exec()
-
