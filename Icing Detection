@@ -1,9 +1,11 @@
 # ===== Icing Detection: 이미지에서 Icing 판정 및 결과 저장 =====
-import os, csv, glob, cv2
+import os
+import csv
+import glob
 from collections import Counter
 import pandas as pd
+import cv2
 import numpy as np
-from PIL import Image
 from tqdm import tqdm
 from scipy.stats import skew
 import matplotlib as mpl
@@ -14,191 +16,365 @@ import matplotlib.gridspec as gridspec
 plt.rcParams['font.family'] = 'Malgun Gothic'
 mpl.rcParams['axes.unicode_minus'] = False
 
+# 상세 패널 출력 설정
+FIGSIZE = (20, 4.8)
+HIST_BINS = 256
+HIST_YLIM = None
+AVG_YLIM = 255
+SKEW_YLIM = (-3, 5)
+
+# ROI 및 Band 기본 설정
+ROI_RECT = (115, 490, 80, 50)
+ROI_COVERAGE = 0.60
+BAND_MIN_WIDTH = 8
+BAND_PAD = 8
+KEEP_POLICY = "inside"
+GLOBAL_BAND_DELTA = 10
+
+# Icing 판정 기본 임계값
+ICING_AVG_THRESHOLD = 59.0
+ICING_SKEW_THRESHOLD = 1.0
+
+# 히스토그램 스무딩 및 모폴로지 커널
+_SMOOTH_KERNEL = np.array([1, 2, 3, 2, 1], dtype=np.float32)
+_SMOOTH_KERNEL /= _SMOOTH_KERNEL.sum()
+_MORPH_KERNEL_OPEN = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+_MORPH_KERNEL_CLOSE = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+
 def image_loader(path):
     img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
     return img
 
 def save_results_to_csv(rows, csv_path, header=None):
-    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    with open(csv_path, 'w', encoding='utf-8-sig', newline='') as f:
+    dir_path = os.path.dirname(csv_path)
+    if dir_path:
+        os.makedirs(dir_path, exist_ok=True)
+    keys = list(header) if header else (list(rows[0].keys()) if rows else [])
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
         if header:
             writer.writerow(header)
-        for r in rows:
-            writer.writerow([r.get(h, "") for h in header])
+        for row in rows:
+            writer.writerow([row.get(key, "") for key in keys])
 
-# 상세 패널 출력 설정
-FIGSIZE = (20, 4.8)
-HIST_BINS = 256
-HIST_YLIM = None
-AVG_YLIM  = 255
-SKEW_YLIM = (-2, 5)
-
-def _plot_and_save_detail_figure(
-    img_rgb, thresh, contour_img_rgb, masked_gray, mask, average, skewness, save_path,
-    show_in_notebook=False, figsize=FIGSIZE, hist_bins=HIST_BINS,
-    hist_ylim=HIST_YLIM, avg_ylim=AVG_YLIM, skew_ylim=SKEW_YLIM
-):
-    """상세 패널 구성 (원본/이진화/컨투어/히스토그램/평균/왜도)"""
-    # 히스토그램
+def _plot_and_save_detail_figure(img_rgb, thresh, contour_img_rgb, masked_gray, mask, average, skewness, save_path,
+                                 show_in_notebook=False, figsize=FIGSIZE, hist_bins=HIST_BINS, hist_ylim=HIST_YLIM, avg_ylim=AVG_YLIM, skew_ylim=SKEW_YLIM):
+    """상세 패널 구성 (원본/이진화/컨투어/히스토그램/평균 게이지바/왜도 게이지바)"""
     hist = cv2.calcHist([masked_gray], [0], mask, [hist_bins], [0, 256]).flatten()
     if hist_ylim is None:
         ymax = int(hist.max()) if hist.size else 0
         step = 200
-        hist_ylim = ((ymax + step - 1)//step)*step + step
+        hist_ylim = ((ymax + step - 1) // step) * step + step
 
     fig = plt.figure(figsize=figsize)
+    gs = gridspec.GridSpec(1, 7, width_ratios=[1, 1, 1, 0.05, 3, 0.7, 0.7])
 
-    # 패널 수 구성: 원본, 이진화, 컨투어 + 간격 + 히스토/게이지
-    gs = gridspec.GridSpec(1, 7, width_ratios=[1,1,1, 0.05, 3, 0.7, 0.7])
+    # 패널 수 구성
+    ax0 = plt.subplot(gs[0])
+    ax0.imshow(img_rgb)
+    ax0.set_title("원본")
+    ax0.axis("off")
 
     # 1) 원본 / 이진화 / 컨투어
-    ax0 = plt.subplot(gs[0]); ax0.imshow(img_rgb);        ax0.set_title('원본');   ax0.axis('off')
-    ax1 = plt.subplot(gs[1]); ax1.imshow(thresh, 'gray'); ax1.set_title('이진화'); ax1.axis('off')
-    ax2 = plt.subplot(gs[2]); ax2.imshow(contour_img_rgb);ax2.set_title('컨투어'); ax2.axis('off')
+    ax1 = plt.subplot(gs[1])
+    ax1.imshow(thresh, "gray")
+    ax1.set_title("이진화")
+    ax1.axis("off")
 
     # 간격용
-    plt.subplot(gs[3]).axis('off')
+    ax2 = plt.subplot(gs[2])
+    ax2.imshow(contour_img_rgb)
+    ax2.set_title("컨투어")
+    ax2.axis("off")
+
+    plt.subplot(gs[3]).axis("off")
 
     # 2) 히스토그램
     ax4 = plt.subplot(gs[4])
-    ax4.plot(hist, color='black')
-    ax4.set_title('컨투어 영역 히스토그램')
-    ax4.set_xlabel('Pixel Value')
-    ax4.set_ylabel('Frequency')
+    ax4.plot(hist, color="black")
+    ax4.set_title("컨투어 영역 히스토그램")
+    ax4.set_xlabel("Pixel Value")
+    ax4.set_ylabel("Frequency")
     ax4.set_xlim(0, 255)
     ax4.set_ylim(0, hist_ylim)
-    ax4.grid(True, axis='y', linestyle='--', alpha=0.6)
+    ax4.grid(True, axis="y", linestyle="--", alpha=0.6)
 
     # 3) 평균 게이지
     ax5 = plt.subplot(gs[5])
-    ax5.set_title('평균', fontsize=12)
+    ax5.set_title("평균", fontsize=12)
     ax5.set_xlim(0, 1)
     ax5.set_ylim(0, avg_ylim)
     ax5.get_xaxis().set_visible(False)
-    bar_h = max(1.0, avg_ylim*0.015)
-    ax5.barh(y=average, width=0.8, height=bar_h, left=0.1, color='orange', align='center')
-    ax5.grid(True, axis='y', linestyle='--', alpha=0.6)
-    ax5.text(0.5, np.clip(average, 0, avg_ylim), f'{average:.1f}',
-             va='bottom', ha='center', color='black', fontsize=12, fontweight='bold')
+    bar_h = max(1.0, avg_ylim * 0.015)
+    ax5.barh(y=average, width=0.8, height=bar_h, left=0.1, color="orange", align="center")
+    ax5.grid(True, axis="y", linestyle="--", alpha=0.6)
+    ax5.text(0.5, np.clip(average, 0, avg_ylim), f"{average:.1f}", va="bottom", ha="center", color="black", fontsize=12, fontweight="bold")
 
     # 4) 왜도 게이지
     ax6 = plt.subplot(gs[6])
-    ax6.set_title('왜도', fontsize=12)
+    ax6.set_title("왜도", fontsize=12)
     ax6.set_xlim(0, 1)
     ax6.set_ylim(*skew_ylim)
     ax6.get_xaxis().set_visible(False)
-    s_bar_h = max(0.02*(skew_ylim[1]-skew_ylim[0]), 0.1)
-    ax6.barh(y=skewness, width=0.8, height=s_bar_h, left=0.1, color='green', align='center')
-    ax6.grid(True, axis='y', linestyle='--', alpha=0.6)
-    ax6.text(0.5, np.clip(skewness, skew_ylim[0], skew_ylim[1]), f'{skewness:.2f}',
-             va='bottom', ha='center', color='black', fontsize=12, fontweight='bold')
+    s_bar_h = max(0.02 * (skew_ylim[1] - skew_ylim[0]), 0.1)
+    ax6.barh(y=skewness, width=0.8, height=s_bar_h, left=0.1, color="green", align="center")
+    ax6.grid(True, axis="y", linestyle="--", alpha=0.6)
+    ax6.text(0.5, np.clip(skewness, skew_ylim[0], skew_ylim[1]), f"{skewness:.2f}", va="bottom", ha="center", color="black", fontsize=12, fontweight="bold")
 
     plt.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
     if show_in_notebook:
         plt.show()
     plt.close(fig)
 
-def process_icing_detection(input_folder, output_folder_icing, icing_processes,
-    CONTOUR_AREA_MIN=8000, USE_CONVEX_HULL=True, AVERAGE_TOP_PERCENT=0.2, single_filename=None, show_in_notebook=False):
+def smooth_hist_1d(hist):
+    return np.convolve(hist.astype(np.float64), _SMOOTH_KERNEL, mode="same")
 
-    # === ROI 설정 ===
-    ROI_X, ROI_Y, ROI_W, ROI_H = 115, 490, 80, 50   # ROI 영역
-    COVERAGE = 0.60                                 # 최빈 영역(커버리지)
-    BAND_MIN_WIDTH = 8                              # 최소 대역 폭(bin)
-    BAND_PAD = 8                                    # 전역 적용 전 ±pad 확장
-    KEEP_POLICY = 'inside'                          # band 내부를 전경으로 취급
 
-    def _smooth_hist_1d(h):
-        k = np.array([1,2,3,2,1], dtype=np.float32); k /= k.sum()
-        return np.convolve(h.astype(np.float64), k, mode='same')
+def compute_roi_mode_band(gray, roi_rect, coverage, min_width, pad):
+    height, width = gray.shape[:2]
+    x, y, w, h = roi_rect
+    x = max(0, min(x, width - 1))
+    y = max(0, min(y, height - 1))
+    w = max(1, min(w, width - x))
+    h = max(1, min(h, height - y))
 
-    def compute_roi_mode_band(gray, roi_rect):
-        """ROI 밝기 히스토그램의 최빈 bin을 중심으로 좌우 확장하여 COVERAGE만큼의 연속 구간 확보"""
-        H, W = gray.shape[:2]
-        x, y, w, h = roi_rect
-        x = max(0, min(x, W-1)); y = max(0, min(y, H-1))
-        w = max(1, min(w, W-x)); h = max(1, min(h, H-y))
-        roi = gray[y:y+h, x:x+w]
-        if roi.size < 16:
-            return None
+    roi = gray[y : y + h, x : x + w]
+    if roi.size < 16:
+        return None
 
-        hist = cv2.calcHist([roi], [0], None, [256], [0,256]).flatten()
-        if hist.sum() == 0:
-            return None
-        hs = _smooth_hist_1d(hist)
-        mode_bin = int(np.argmax(hs))
-        target = COVERAGE * roi.size
+    hist = cv2.calcHist([roi], [0], None, [256], [0, 256]).flatten()
+    if hist.sum() == 0:
+        return None
 
-        left = right = mode_bin
-        cum = hist[mode_bin]
-        while cum < target and (left > 0 or right < 255):
-            cand_left  = hist[left-1]  if left  > 0   else -1
-            cand_right = hist[right+1] if right < 255 else -1
-            if cand_left >= cand_right and cand_left >= 0:
-                left -= 1; cum += hist[left]
-            elif cand_right >= 0:
-                right += 1; cum += hist[right]
-            else:
-                break
+    hs = smooth_hist_1d(hist)
+    mode_bin = int(np.argmax(hs))
+    target = coverage * roi.size
 
-        # 최소 폭 보정 + pad 적용
-        if (right - left + 1) < BAND_MIN_WIDTH:
-            need = BAND_MIN_WIDTH - (right - left + 1)
-            left  = max(0, left - need//2)
-            right = min(255, right + (need - need//2))
-        lo = max(0, left - BAND_PAD)
-        hi = min(255, right + BAND_PAD)
-
-        if (hi - lo + 1) >= 240 or (hi - lo + 1) <= 2:
-            return None
-        return int(lo), int(hi), int(mode_bin)
-
-    def threshold_by_band(gray, lo, hi, keep='inside'):
-        """band 기준 이진화: keep='inside'면 band 내부를 전경(255)으로"""
-        if keep == 'inside':
-            mask = (gray >= lo) & (gray <= hi)
+    left = right = mode_bin
+    cumulative = hist[mode_bin]
+    while cumulative < target and (left > 0 or right < 255):
+        cand_left = hist[left - 1] if left > 0 else -1
+        cand_right = hist[right + 1] if right < 255 else -1
+        if cand_left >= cand_right and cand_left >= 0:
+            left -= 1
+            cumulative += hist[left]
+        elif cand_right >= 0:
+            right += 1
+            cumulative += hist[right]
         else:
-            mask = (gray < lo) | (gray > hi)
-        return (mask.astype(np.uint8) * 255)
+            break
 
+    if (right - left + 1) < min_width:
+        need = min_width - (right - left + 1)
+        left = max(0, left - need // 2)
+        right = min(255, right + (need - need // 2))
+
+    lo = max(0, left - pad)
+    hi = min(255, right + pad)
+
+    if (hi - lo + 1) >= 240 or (hi - lo + 1) <= 2:
+        return None
+    return int(lo), int(hi), int(mode_bin)
+
+def compute_global_mode_band(gray, delta=GLOBAL_BAND_DELTA):
+    hist_all = cv2.calcHist([gray], [0], None, [256], [0, 256]).flatten()
+    if hist_all.sum() == 0:
+        return None
+    hs = smooth_hist_1d(hist_all)
+    mode = int(np.argmax(hs))
+    lo = max(0, mode - delta)
+    hi = min(255, mode + delta)
+    return int(lo), int(hi), int(mode)
+
+def find_effective_band(gray, roi_rect, coverage, min_width, pad):
+    band = compute_roi_mode_band(gray, roi_rect, coverage, min_width, pad)
+    if band is not None:
+        return band
+    return compute_global_mode_band(gray)
+
+def threshold_by_band(gray, lo, hi, keep=KEEP_POLICY):
+    if keep == "inside":
+        mask = (gray >= lo) & (gray <= hi)
+    else:
+        mask = (gray < lo) | (gray > hi)
+    return mask.astype(np.uint8) * 255
+
+def refine_binary_mask(binary_img, open_kernel=_MORPH_KERNEL_OPEN, close_kernel=_MORPH_KERNEL_CLOSE):
+    opened = cv2.morphologyEx(binary_img, cv2.MORPH_OPEN, open_kernel, iterations=1)
+    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+    return closed
+
+def create_convex_hull_mask(thresh, min_area, use_convex_hull, draw_img=None):
+    mask = np.zeros(thresh.shape, dtype=np.uint8)
+    hull_area = 0
+    if not use_convex_hull:
+        return mask, hull_area
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    valid_contours = [cnt for cnt in contours if cv2.contourArea(cnt) >= min_area]
+    if not valid_contours:
+        return mask, hull_area
+
+    all_points = np.vstack(valid_contours)
+    combined_hull = cv2.convexHull(all_points)
+    cv2.drawContours(mask, [combined_hull], -1, 255, thickness=cv2.FILLED)
+    if draw_img is not None:
+        cv2.drawContours(draw_img, [combined_hull], -1, (0, 255, 255), 2)
+    hull_area = cv2.contourArea(combined_hull)
+    return mask, float(hull_area)
+
+def annotate_roi(image, roi_rect, text, color=(0, 200, 0)):
+    annotated = image.copy()
+    x, y, w, h = roi_rect
+    cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 1)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    thickness = 1
+    (_, text_height), _ = cv2.getTextSize(text, font, font_scale, thickness)
+    text_x = x
+    text_y = y + h + text_height + 4
+    if text_y + 4 > annotated.shape[0]:
+        text_y = max(0, y - 4)
+    cv2.putText(annotated, text, (text_x, text_y), font, font_scale, color, thickness, cv2.LINE_AA)
+    return annotated
+
+def draw_detection_label(image, text="Icing Detected"):
+    height, width = image.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 1.2
+    thickness = 3
+    (text_w, text_h), _ = cv2.getTextSize(text, font, font_scale, thickness)
+    text_x = (width - text_w) // 2
+    text_y = height - 10
+    cv2.rectangle(image, (text_x - 10, text_y - text_h - 10), (text_x + text_w + 10, text_y + 10), (0, 0, 255), -1)
+    cv2.putText(image, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+def average_top_percent_pixels(pixels, top_percent):
+    if pixels.size == 0:
+        return 0.0
+    counts = Counter(pixels.tolist())
+    total_count = sum(counts.values())
+    if total_count == 0:
+        return 0.0
+
+    threshold = total_count * top_percent
+    cumulative_count = 0
+    selected_values = []
+    for value, cnt in sorted(counts.items(), key=lambda x: x[1], reverse=True):
+        cumulative_count += cnt
+        selected_values.append(value)
+        if cumulative_count >= threshold:
+            break
+    return float(np.mean(selected_values)) if selected_values else 0.0
+
+def compute_mask_statistics(gray, mask, top_percent):
+    masked_gray = cv2.bitwise_and(gray, gray, mask=mask)
+    pixels = masked_gray[mask == 255]
+    skewness = float(skew(pixels)) if pixels.size > 0 else 0.0
+    average = float(average_top_percent_pixels(pixels, top_percent))
+    return masked_gray, average, skewness
+
+def classify_icing(average, skewness, avg_threshold, skew_threshold):
+    return (average >= avg_threshold) and (skewness <= skew_threshold)
+
+def get_image_paths(folder, single_filename=None, exts=("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff")):
+    if single_filename is not None:
+        candidate = os.path.join(folder, single_filename)
+        return [candidate] if os.path.isfile(candidate) else []
+
+    paths = []
+    for ext in exts:
+        paths.extend(glob.glob(os.path.join(folder, ext)))
+    paths = [p for p in paths if os.path.isfile(p)]
+    paths.sort(key=lambda p: os.path.basename(p))
+    return paths
+
+def process_single_image(
+    img_path,
+    img,
+    gray,
+    roi_rect,
+    coverage,
+    band_min_width,
+    band_pad,
+    keep_policy,
+    contour_area_min,
+    use_convex_hull,
+    average_top_percent,
+    avg_threshold,
+    skew_threshold,
+):
+    img_file = os.path.basename(img_path)
+    band = find_effective_band(gray, roi_rect, coverage, band_min_width, band_pad)
+    if band is None:
+        print(f"{img_file} : 히스토그램 비정상 - 스킵")
+        return None
+
+    lo, hi, _ = band
+    thresh = threshold_by_band(gray, lo, hi, keep=keep_policy)
+    thresh = refine_binary_mask(thresh)
+
+    result_img = img.copy()
+    mask, hull_area = create_convex_hull_mask(thresh, contour_area_min, use_convex_hull, draw_img=result_img)
+
+    orig_vis_bgr = annotate_roi(img, roi_rect, f"{lo}~{hi}")
+    masked_gray, average, skewness = compute_mask_statistics(gray, mask, average_top_percent)
+
+    x, y, w, h = roi_rect
+    msg = (f"{img_file} ROI[{x},{y},{w},{h}] Range: {lo}~{hi}, " f"컨투어 면적: {int(hull_area)}, 평균: {average:.1f}, 왜도: {skewness:.2f}")
+    print(msg)
+
+    icing_flag = classify_icing(average, skewness, avg_threshold, skew_threshold)
+    if icing_flag:
+        draw_detection_label(result_img)
+
+    plot_inputs = {
+        "img_rgb": cv2.cvtColor(orig_vis_bgr, cv2.COLOR_BGR2RGB),
+        "thresh": thresh,
+        "contour_img_rgb": cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB),
+        "masked_gray": masked_gray,
+        "mask": mask,
+        "average": average,
+        "skewness": skewness,
+    }
+
+    result_record = {
+        "filename": img_file,
+        "hull_area": hull_area,
+        "average": average,
+        "skewness": skewness,
+        "result": "Icing Detected" if icing_flag else "Melted",
+    }
+    return result_record, plot_inputs
+
+
+def process_icing_detection(
+    input_folder,
+    output_folder_icing,
+    icing_processes,
+    CONTOUR_AREA_MIN=8000,
+    USE_CONVEX_HULL=True,
+    AVERAGE_TOP_PERCENT=0.2,
+    single_filename=None,
+    show_in_notebook=False,
+    roi_rect=ROI_RECT,
+    coverage=ROI_COVERAGE,
+    band_min_width=BAND_MIN_WIDTH,
+    band_pad=BAND_PAD,
+    keep_policy=KEEP_POLICY,
+    avg_threshold=ICING_AVG_THRESHOLD,
+    skew_threshold=ICING_SKEW_THRESHOLD,
+):
     all_results = []
+
     for icing_section in icing_processes:
         input_folder_section = os.path.join(input_folder, icing_section)
         output_folder_section = os.path.join(output_folder_icing, icing_section)
         os.makedirs(output_folder_section, exist_ok=True)
 
-        # 특정 파일만 처리
-        if single_filename is not None:
-            image_paths = [os.path.join(input_folder_section, single_filename)]
-        else:
-            exts = ("*.jpg","*.jpeg","*.png","*.bmp","*.tif","*.tiff")
-            image_paths = []
-            for e in exts:
-                image_paths.extend(glob.glob(os.path.join(input_folder_section, e)))
-        image_paths = [p for p in image_paths if os.path.isfile(p)]
-        image_paths.sort(key=lambda x: os.path.basename(x))
-
-        def average_top_percent_pixels(pixels, top_percent=AVERAGE_TOP_PERCENT):
-            """빈도 상위 top_percent만 평균"""
-            if pixels.size == 0:
-                return 0
-            counts = Counter(pixels)
-            total_count = sum(counts.values())
-            sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-            cumulative_count = 0
-            threshold = total_count * top_percent
-            selected_values = []
-            for val, cnt in sorted_counts:
-                cumulative_count += cnt
-                selected_values.append(val)
-                if cumulative_count >= threshold:
-                    break
-            return float(np.mean(selected_values)) if selected_values else 0.0
-
-        for img_path in tqdm(image_paths, desc=f'Icing Detection 배치 처리: {icing_section}'):
-            img_file = os.path.basename(img_path)
+        image_paths = get_image_paths(input_folder_section, single_filename=single_filename)
+        for img_path in tqdm(image_paths, desc=f"Icing Detection 배치 처리: {icing_section}"):
             img = image_loader(img_path)
             if img is None:
                 print(f"파일을 읽을 수 없습니다: {img_path}")
@@ -206,137 +382,52 @@ def process_icing_detection(input_folder, output_folder_icing, icing_processes,
 
             # LAB → L 채널 생성
             lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-            gray = lab[:, :, 0]  # L channel
+            gray = lab[:, :, 0]
 
-            # ROI 기반 band 계산
-            roi_rect = (ROI_X, ROI_Y, ROI_W, ROI_H)
-            band = compute_roi_mode_band(gray, roi_rect)
-
-            # 폴백(band 계산 실패 시 전역 모드 ±10)
-            if band is None:
-                hist_all = cv2.calcHist([gray], [0], None, [256], [0,256]).flatten()
-                if hist_all.sum() == 0:
-                    print(f"{img_file} : 히스토그램 비정상 - 스킵")
-                    continue
-                # 스무딩 후 최빈
-                k = np.array([1,2,3,2,1], dtype=np.float32); k /= k.sum()
-                hs = np.convolve(hist_all.astype(np.float64), k, mode='same')
-                mode = int(np.argmax(hs))
-                lo = max(0, mode - 10); hi = min(255, mode + 10)
-            else:
-                lo, hi, mode = band
-
-            # band 이진화 → 컨투어
-            thresh = threshold_by_band(gray, lo, hi, keep=KEEP_POLICY)
-
-            # 모폴로지 정리
-            k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-            k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,7))
-            thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN,  k3, iterations=1)
-            thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k7, iterations=1)
-
-            # 컨투어 → Convex Hull
-            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-            mask = np.zeros(gray.shape, dtype=np.uint8)
-            result_img = img.copy()
-            all_points = []
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area < CONTOUR_AREA_MIN:
-                    continue
-                all_points.extend(cnt.reshape(-1, 2))
-            if USE_CONVEX_HULL and all_points:
-                all_points = np.array(all_points, dtype=np.int32).reshape((-1, 1, 2))
-                combined_hull = cv2.convexHull(all_points)
-                cv2.drawContours(mask, [combined_hull], -1, 255, thickness=cv2.FILLED)
-                cv2.drawContours(result_img, [combined_hull], -1, (0, 255, 255), 2)
-                hull_area = cv2.contourArea(combined_hull)
-            else:
-                hull_area = 0
-
-            # ROI 박스 & band 텍스트 오버레이 (원본 패널용)
-            orig_vis_bgr = img.copy()
-            x, y, w, h = roi_rect
-            cv2.rectangle(orig_vis_bgr, (x, y), (x+w, y+h), (0, 200, 0), 1)
-            text = f"{lo}~{hi}"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.5
-            thickness = 1
-            (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
-            tx = x
-            ty = y + h + th + 4
-            if ty + 4 > orig_vis_bgr.shape[0]:
-                ty = max(0, y - 4)
-            cv2.putText(orig_vis_bgr, text, (tx, ty), font, font_scale, (0, 200, 0), thickness, cv2.LINE_AA)
-
-            # 마스크 영역 픽셀 통계량
-            masked_gray = cv2.bitwise_and(gray, gray, mask=mask)
-            pixels = masked_gray[mask == 255]
-            skewness = float(skew(pixels)) if pixels.size > 0 else 0.0
-            average = float(average_top_percent_pixels(pixels))
-
-            # 로그 출력
-            msg = (f"{img_file} ROI[{x},{y},{w},{h}] Range: {lo}~{hi}, "
-                   f"컨투어 면적: {int(hull_area)}, 평균: {average:.1f}, 왜도: {skewness:.2f}")
-            print(msg)
-
-            # Icing 판정 및 텍스트 표시
-            icing_flag = (average >= 59) and (skewness <= 1)
-            if icing_flag:
-                H, W = result_img.shape[:2]
-                text2 = "Icing Detected"
-                font2 = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale2 = 1.2
-                thickness2 = 3
-                (text_w, text_h), _ = cv2.getTextSize(text2, font2, font_scale2, thickness2)
-                text_x = (W - text_w) // 2
-                text_y = H - 10
-                cv2.rectangle(result_img, (text_x-10, text_y-text_h-10), (text_x+text_w+10, text_y+10), (0,0,255), -1)
-                cv2.putText(result_img, text2, (text_x, text_y), font2, font_scale2, (255,255,255), thickness2, cv2.LINE_AA)
-
-            # RGB 변환
-            img_rgb = cv2.cvtColor(orig_vis_bgr, cv2.COLOR_BGR2RGB)
-            contour_img_rgb = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
-
-            save_path = os.path.join(output_folder_section, os.path.splitext(img_file)[0] + '_processed.png')
-            _plot_and_save_detail_figure(
-                img_rgb=img_rgb,
-                thresh=thresh,
-                contour_img_rgb=contour_img_rgb,
-                masked_gray=masked_gray,
-                mask=mask,
-                average=average,
-                skewness=skewness,
-                save_path=save_path,
-                show_in_notebook=show_in_notebook
+            processed = process_single_image(
+                img_path=img_path,
+                img=img,
+                gray=gray,
+                roi_rect=roi_rect,
+                coverage=coverage,
+                band_min_width=band_min_width,
+                band_pad=band_pad,
+                keep_policy=keep_policy,
+                contour_area_min=CONTOUR_AREA_MIN,
+                use_convex_hull=USE_CONVEX_HULL,
+                average_top_percent=AVERAGE_TOP_PERCENT,
+                avg_threshold=avg_threshold,
+                skew_threshold=skew_threshold,
             )
+            if processed is None:
+                continue
 
             # 결과 통계 저장
-            all_results.append({
-                'filename': img_file,
-                'hull_area': hull_area,
-                'average': average,
-                'skewness': skewness,
-                'result': 'Icing Detected' if icing_flag else 'Melted'
-            })
+            result_record, plot_inputs = processed
+            save_path = os.path.join(
+                output_folder_section,
+                os.path.splitext(os.path.basename(img_path))[0] + "_processed.png",
+            )
+            _plot_and_save_detail_figure(save_path=save_path, show_in_notebook=show_in_notebook, **plot_inputs)
+            all_results.append(result_record)
 
-    # 결과 통계 값 csv 저장
-    csv_save_path = os.path.join(output_folder_icing, 'icing_info.csv')
-    header = ['filename', 'hull_area', 'average', 'skewness', 'result']
+    csv_save_path = os.path.join(output_folder_icing, "icing_info.csv")
+    header = ["filename", "hull_area", "average", "skewness", "result"]
     save_results_to_csv(all_results, csv_save_path, header=header)
 
+
 # ===== 실행: 단일 파일 테스트 =====
-input_folder = 'rawdata'
-output_folder_icing = 'output_results'
-icing_processes = ['']
-# single_test_file = 'X7_WX7VP_REMELT_1_01m00s_000900.jpg'
-single_test_file = 'X7_WX7VP_REMELT_1_03m21s_003025.jpg'
-# single_test_file = 'X7_WX7VP_REMELT_1_03m53s_003505.jpg'
+input_folder = "rawdata"
+output_folder_icing = "output_results"
+icing_processes = [""]
+# single_test_file = "X7_WX7VP_REMELT_1_01m00s_000900.jpg"
+single_test_file = "X7_WX7VP_REMELT_1_03m21s_003025.jpg"
+# single_test_file = "X7_WX7VP_REMELT_1_03m53s_003505.jpg"
 
 process_icing_detection(
     input_folder=input_folder,
     output_folder_icing=output_folder_icing,
     icing_processes=icing_processes,
     single_filename=single_test_file,
-    show_in_notebook=True
+    show_in_notebook=True,
 )
