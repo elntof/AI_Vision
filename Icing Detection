@@ -25,7 +25,7 @@ SKEW_YLIM = (-3, 5)
 
 # ROI 및 Band 기본 설정 ========================
 ROI_RECT = (115, 490, 80, 50)   # (x, y, w, h)
-ROI_COVERAGE = 0.60             # ROI 픽셀 누적 빈도 목표 비율
+ROI_COVERAGE = 0.30             # ROI 픽셀 누적 빈도 목표 비율
 BAND_MIN_WIDTH = 8              # 최소 밴드 폭
 BAND_PAD = 8                    # 밴드 좌우 패딩
 KEEP_POLICY = "inside"          # "inside"면 [lo,hi] 내부를 전경으로 유지
@@ -39,7 +39,7 @@ ICING_SKEW_THRESHOLD = 1.0
 _SMOOTH_KERNEL = np.array([1, 2, 3, 2, 1], dtype=np.float32)
 _SMOOTH_KERNEL /= _SMOOTH_KERNEL.sum()
 _MORPH_KERNEL_OPEN = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-_MORPH_KERNEL_CLOSE = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+_MORPH_KERNEL_CLOSE = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
 
 def image_loader(path):
@@ -64,9 +64,9 @@ def save_results_to_csv(rows, csv_path, header=None):
             writer.writerow([row.get(key, "") for key in keys])
 
 
-def _plot_and_save_detail_figure(img_rgb, thresh, contour_img_rgb, masked_gray, mask, average, skewness, save_path,
+def _plot_and_save_detail_figure(img_rgb, thresh, raw_contour_img_rgb, contour_img_rgb, masked_gray, mask, average, skewness, save_path,
                                  show_in_notebook=False, figsize=FIGSIZE, hist_bins=HIST_BINS, hist_ylim=HIST_YLIM, avg_ylim=AVG_YLIM, skew_ylim=SKEW_YLIM):
-    """상세 패널 구성 및 저장(원본/이진화/컨투어/히스토그램/평균&왜도 게이지바)"""
+    """상세 패널 구성 및 저장(원본/이진화/컨투어/Convex Hull/히스토그램/평균&왜도 게이지바)"""
     # 컨투어 마스크 영역 히스토그램 계산
     hist = cv2.calcHist([masked_gray], [0], mask, [hist_bins], [0, 256]).flatten()
     if hist_ylim is None:
@@ -76,7 +76,7 @@ def _plot_and_save_detail_figure(img_rgb, thresh, contour_img_rgb, masked_gray, 
 
     # 그리드 생성
     fig = plt.figure(figsize=figsize)
-    gs = gridspec.GridSpec(1, 7, width_ratios=[1, 1, 1, 0.05, 3, 0.7, 0.7])
+    gs = gridspec.GridSpec(1, 8, width_ratios=[1, 1, 1, 1, 0.05, 3, 0.7, 0.7])
 
     # (1) 원본
     ax0 = plt.subplot(gs[0])
@@ -90,41 +90,46 @@ def _plot_and_save_detail_figure(img_rgb, thresh, contour_img_rgb, masked_gray, 
     ax1.axis("off")
     # (3) 컨투어
     ax2 = plt.subplot(gs[2])
-    ax2.imshow(contour_img_rgb)
+    ax2.imshow(raw_contour_img_rgb)
     ax2.set_title("컨투어")
     ax2.axis("off")
+    # (4) Convex Hull
+    ax3 = plt.subplot(gs[3])
+    ax3.imshow(contour_img_rgb)
+    ax3.set_title("Convex Hull")
+    ax3.axis("off")
     # 간격(빈칸)
-    plt.subplot(gs[3]).axis("off")
-    # (4) 히스토그램
-    ax4 = plt.subplot(gs[4])
-    ax4.plot(hist, color="black")
-    ax4.set_title("컨투어 영역 히스토그램")
-    ax4.set_xlabel("Pixel Value")
-    ax4.set_ylabel("Frequency")
-    ax4.set_xlim(0, 255)
-    ax4.set_ylim(0, hist_ylim)
-    ax4.grid(True, axis="y", linestyle="--", alpha=0.6)
-    # (5) 평균 게이지바
-    ax5 = plt.subplot(gs[5])
-    ax5.set_title("평균", fontsize=12)
-    ax5.set_xlim(0, 1)
-    ax5.set_ylim(0, avg_ylim)
-    ax5.get_xaxis().set_visible(False)
+    plt.subplot(gs[4]).axis("off")
+    # (5) 히스토그램
+    ax_hist = plt.subplot(gs[5])
+    ax_hist.plot(hist, color="black")
+    ax_hist.set_title("컨투어 영역 히스토그램")
+    ax_hist.set_xlabel("Pixel Value")
+    ax_hist.set_ylabel("Frequency")
+    ax_hist.set_xlim(0, 255)
+    ax_hist.set_ylim(0, hist_ylim)
+    ax_hist.grid(True, axis="y", linestyle="--", alpha=0.6)
+    # (6) 평균 게이지바
+    ax_avg = plt.subplot(gs[6])
+    ax_avg.set_title("평균", fontsize=12)
+    ax_avg.set_xlim(0, 1)
+    ax_avg.set_ylim(0, avg_ylim)
+    ax_avg.get_xaxis().set_visible(False)
     bar_h = max(1.0, avg_ylim * 0.015)
-    ax5.barh(y=average, width=0.8, height=bar_h, left=0.1, color="orange", align="center")
-    ax5.grid(True, axis="y", linestyle="--", alpha=0.6)
-    ax5.text(0.5, np.clip(average, 0, avg_ylim), f"{average:.1f}", va="bottom", ha="center", color="black", fontsize=12, fontweight="bold")
-    # (6) 왜도 게이지바
-    ax6 = plt.subplot(gs[6])
-    ax6.set_title("왜도", fontsize=12)
-    ax6.set_xlim(0, 1)
-    ax6.set_ylim(*skew_ylim)
-    ax6.get_xaxis().set_visible(False)
+    ax_avg.barh(y=average, width=0.8, height=bar_h, left=0.1, color="orange", align="center")
+    ax_avg.grid(True, axis="y", linestyle="--", alpha=0.6)
+    ax_avg.text(0.5, np.clip(average, 0, avg_ylim), f"{average:.1f}", va="bottom", ha="center", color="black", fontsize=12, fontweight="bold")
+    # (7) 왜도 게이지바
+    ax_skew = plt.subplot(gs[7])
+    ax_skew.set_title("왜도", fontsize=12)
+    ax_skew.set_xlim(0, 1)
+    ax_skew.set_ylim(*skew_ylim)
+    ax_skew.get_xaxis().set_visible(False)
     s_bar_h = max(0.02 * (skew_ylim[1] - skew_ylim[0]), 0.1)
-    ax6.barh(y=skewness, width=0.8, height=s_bar_h, left=0.1, color="green", align="center")
-    ax6.grid(True, axis="y", linestyle="--", alpha=0.6)
-    ax6.text(0.5, np.clip(skewness, skew_ylim[0], skew_ylim[1]), f"{skewness:.2f}", va="bottom", ha="center", color="black", fontsize=12, fontweight="bold")
-
+    ax_skew.barh(y=skewness, width=0.8, height=s_bar_h, left=0.1, color="green", align="center")
+    ax_skew.grid(True, axis="y", linestyle="--", alpha=0.6)
+    ax_skew.text(0.5, np.clip(skewness, skew_ylim[0], skew_ylim[1]), f"{skewness:.2f}", va="bottom", ha="center", color="black", fontsize=12, fontweight="bold")
+    
     plt.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     if show_in_notebook:
@@ -227,17 +232,19 @@ def refine_binary_mask(binary_img, open_kernel=_MORPH_KERNEL_OPEN, close_kernel=
     return closed
 
 
-def create_convex_hull_mask(thresh, min_area, use_convex_hull, draw_img=None):
+def create_convex_hull_mask(thresh, min_area, use_convex_hull, draw_img=None, raw_contour_img=None):
     """컨투어 필터링(면적 기준) 후 Convex Hull 마스크 생성"""
     mask = np.zeros(thresh.shape, dtype=np.uint8)
-    hull_area = 0
-    if not use_convex_hull:
-        return mask, hull_area
+    hull_area = 0.0
 
     # 외곽 컨투어 검출 및 최소 면적 필터
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     valid_contours = [cnt for cnt in contours if cv2.contourArea(cnt) >= min_area]
-    if not valid_contours:
+
+    if raw_contour_img is not None and valid_contours:
+        cv2.drawContours(raw_contour_img, valid_contours, -1, (0, 255, 0), 2)
+
+    if not use_convex_hull or not valid_contours:
         return mask, hull_area
 
     # 모든 유효 컨투어 점 병합 (Convex Hull)
@@ -353,8 +360,9 @@ def process_single_image(img_path, img, gray, roi_rect, coverage, band_min_width
     thresh = threshold_by_band(gray, lo, hi, keep=keep_policy)
     thresh = refine_binary_mask(thresh)
     # (3) Convex Hull 생성 및 결과 오버레이 이미지 준비
+    raw_contour_img = img.copy()
     result_img = img.copy()
-    mask, hull_area = create_convex_hull_mask(thresh, contour_area_min, use_convex_hull, draw_img=result_img)
+    mask, hull_area = create_convex_hull_mask(thresh, contour_area_min, use_convex_hull, draw_img=result_img, raw_contour_img=raw_contour_img)
     # (4) ROI 및 밴드 정보 주석
     orig_vis_bgr = annotate_roi(img, roi_rect, f"{lo}~{hi}")
     # (5) 마스크 영역 통계(평균/왜도)
@@ -372,6 +380,7 @@ def process_single_image(img_path, img, gray, roi_rect, coverage, band_min_width
     plot_inputs = {
         "img_rgb": cv2.cvtColor(orig_vis_bgr, cv2.COLOR_BGR2RGB),
         "thresh": thresh,
+        "raw_contour_img_rgb": cv2.cvtColor(raw_contour_img, cv2.COLOR_BGR2RGB),
         "contour_img_rgb": cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB),
         "masked_gray": masked_gray,
         "mask": mask,
@@ -434,8 +443,9 @@ input_folder = "rawdata"
 output_folder_icing = "output_results"
 
 # single_test_file = "X7_WX7VP_REMELT_1_01m00s_000900.jpg"
-single_test_file = "X7_WX7VP_REMELT_1_01m00s_000901.jpg"
-# single_test_file = "X7_WX7VP_REMELT_1_03m21s_003025.jpg"
+# single_test_file = "X7_WX7VP_REMELT_1_01m00s_000901.jpg"
+# single_test_file = "X7_WX7VP_REMELT_1_01m01s_000917.jpg"
+single_test_file = "X7_WX7VP_REMELT_1_03m21s_003025.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_03m53s_003505.jpg"
 
 process_icing_detection(input_folder=input_folder, output_folder_icing=output_folder_icing, single_filename=single_test_file, show_in_notebook=True)
