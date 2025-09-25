@@ -26,8 +26,8 @@ SKEW_YLIM = (-3, 5)
 # ROI 및 Band 설정 ========================
 ROI_RECT = (105, 490, 100, 50)   # (x, y, w, h)
 ROI_COVERAGE = 0.30             # ROI 픽셀 누적 빈도 목표 비율
-BAND_MIN_WIDTH = 5             # 최소 밴드 폭
-BAND_PAD = 12                   # 밴드 좌우 패딩
+BAND_MIN_WIDTH = 10             # 최소 밴드 폭
+BAND_PAD = 20                   # 밴드 좌우 패딩
 KEEP_POLICY = "inside"          # "inside"면 [lo,hi] 내부를 전경으로 유지
 GLOBAL_BAND_DELTA = 10          # 전역 모드 밴드 폭(±delta)
 
@@ -38,7 +38,7 @@ ICING_SKEW_THRESHOLD = 1.0
 # 히스토그램 스무딩 및 모폴로지 커널 =============
 _SMOOTH_KERNEL = np.array([1, 2, 3, 2, 1], dtype=np.float32)
 _SMOOTH_KERNEL /= _SMOOTH_KERNEL.sum()
-_MORPH_KERNEL_OPEN = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+_MORPH_KERNEL_OPEN = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 _MORPH_KERNEL_CLOSE = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
 
@@ -457,7 +457,7 @@ def process_single_image(img_path, img, gray, roi_rect, coverage, band_min_width
     return result_record, plot_inputs
 
 
-def process_icing_detection(input_folder, output_folder_icing, CONTOUR_AREA_MIN=8000, USE_CONVEX_HULL=True, AVERAGE_TOP_PERCENT=0.2, single_filename=None, show_in_notebook=False,
+def process_icing_detection(input_folder, output_folder_icing, CONTOUR_AREA_MIN=7000, USE_CONVEX_HULL=True, AVERAGE_TOP_PERCENT=0.2, single_filename=None, show_in_notebook=False,
                             roi_rect=ROI_RECT, coverage=ROI_COVERAGE, band_min_width=BAND_MIN_WIDTH, band_pad=BAND_PAD, keep_policy=KEEP_POLICY, avg_threshold=ICING_AVG_THRESHOLD, skew_threshold=ICING_SKEW_THRESHOLD):
     """배치 처리 루틴"""
     all_results = []
@@ -505,10 +505,14 @@ output_folder_icing = "output_results"
 # single_test_file = "X7_WX7VP_REMELT_1_01m00s_000901.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_01m01s_000917.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_01m36s_001448.jpg"
+single_test_file = "X7_WX7VP_REMELT_1_01m54s_001716.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_02m06s_001903.jpg"
+# single_test_file = "X7_WX7VP_REMELT_1_03m00s_002713.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_03m14s_002913.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_03m21s_003025.jpg"
-single_test_file = "X7_WX7VP_REMELT_1_03m44s_003369.jpg"
+# single_test_file = "X7_WX7VP_REMELT_1_03m30s_003155.jpg"
+# single_test_file = "X7_WX7VP_REMELT_1_03m30s_003158.jpg"
+# single_test_file = "X7_WX7VP_REMELT_1_03m44s_003369.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_03m53s_003505.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_06m28s_005829.jpg"
 
