@@ -23,11 +23,11 @@ HIST_YLIM = None
 AVG_YLIM = 255
 SKEW_YLIM = (-3, 5)
 
-# ROI 및 Band 기본 설정 ========================
-ROI_RECT = (115, 490, 80, 50)   # (x, y, w, h)
+# ROI 및 Band 설정 ========================
+ROI_RECT = (105, 490, 100, 50)   # (x, y, w, h)
 ROI_COVERAGE = 0.30             # ROI 픽셀 누적 빈도 목표 비율
-BAND_MIN_WIDTH = 8              # 최소 밴드 폭
-BAND_PAD = 8                    # 밴드 좌우 패딩
+BAND_MIN_WIDTH = 5             # 최소 밴드 폭
+BAND_PAD = 12                   # 밴드 좌우 패딩
 KEEP_POLICY = "inside"          # "inside"면 [lo,hi] 내부를 전경으로 유지
 GLOBAL_BAND_DELTA = 10          # 전역 모드 밴드 폭(±delta)
 
@@ -38,7 +38,7 @@ ICING_SKEW_THRESHOLD = 1.0
 # 히스토그램 스무딩 및 모폴로지 커널 =============
 _SMOOTH_KERNEL = np.array([1, 2, 3, 2, 1], dtype=np.float32)
 _SMOOTH_KERNEL /= _SMOOTH_KERNEL.sum()
-_MORPH_KERNEL_OPEN = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+_MORPH_KERNEL_OPEN = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
 _MORPH_KERNEL_CLOSE = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
 
@@ -103,7 +103,7 @@ def _plot_and_save_detail_figure(img_rgb, thresh, raw_contour_img_rgb, contour_i
     # (5) 히스토그램
     ax_hist = plt.subplot(gs[5])
     ax_hist.plot(hist, color="black")
-    ax_hist.set_title("컨투어 영역 히스토그램")
+    ax_hist.set_title("Convex Hull 영역 히스토그램")
     ax_hist.set_xlabel("Pixel Value")
     ax_hist.set_ylabel("Frequency")
     ax_hist.set_xlim(0, 255)
@@ -166,34 +166,81 @@ def compute_roi_mode_band(gray, roi_rect, coverage, min_width, pad):
     mode_bin = int(np.argmax(hs))
     target = coverage * roi.size
 
-    # 모드에서 좌우로 확장하며 누적 빈도 충족
-    left = right = mode_bin
-    cumulative = hist[mode_bin]
-    while cumulative < target and (left > 0 or right < 255):
-        cand_left = hist[left - 1] if left > 0 else -1
-        cand_right = hist[right + 1] if right < 255 else -1
-        if cand_left >= cand_right and cand_left >= 0:
-            left -= 1
-            cumulative += hist[left]
-        elif cand_right >= 0:
-            right += 1
-            cumulative += hist[right]
-        else:
+    # coverage를 만족할 때까지 상위 빈도 bin을 선택
+    sorted_bins = np.argsort(hist)[::-1]
+    selected = np.zeros_like(hist, dtype=bool)
+    cumulative = 0.0
+    for bin_idx in sorted_bins:
+        bin_count = hist[bin_idx]
+        if bin_count <= 0:
+            break
+        selected[bin_idx] = True
+        cumulative += bin_count
+        if cumulative >= target:
             break
 
-    # 최소 영역(밴드) 폭 보정
-    if (right - left + 1) < min_width:
-        need = min_width - (right - left + 1)
-        left = max(0, left - need // 2)
-        right = min(255, right + (need - need // 2))
+    # coverage 미충족 시 잔여 비영 bin 모두 포함
+    if cumulative < target:
+        non_zero_bins = np.nonzero(hist)[0]
+        if non_zero_bins.size == 0:
+            return None
+        selected[non_zero_bins] = True
 
-    # 양끝 패딩 적용
-    lo = max(0, left - pad)
-    hi = min(255, right + pad)
-
-    if (hi - lo + 1) >= 240 or (hi - lo + 1) <= 2:
+    chosen_bins = np.where(selected)[0]
+    if chosen_bins.size == 0:
         return None
-    return int(lo), int(hi), int(mode_bin)
+
+    # 선택된 bin을 기준으로 연속 구간을 정의
+    ranges = []
+    start = prev = int(chosen_bins[0])
+    for idx in chosen_bins[1:]:
+        idx = int(idx)
+        if idx == prev + 1:
+            prev = idx
+            continue
+        ranges.append([start, prev])
+        start = prev = idx
+    ranges.append([start, prev])
+
+    # 각 구간에 최소 폭 및 pad 적용 후 병합
+    adjusted = []
+    for left, right in ranges:
+        if (right - left + 1) < min_width:
+            need = min_width - (right - left + 1)
+            expand_left = need // 2
+            expand_right = need - expand_left
+            left = max(0, left - expand_left)
+            right = min(255, right + expand_right)
+
+        left = max(0, left - pad)
+        right = min(255, right + pad)
+        adjusted.append([left, right])
+
+    if not adjusted:
+        return None
+
+    # 구간 병합(중복 및 인접 허용)
+    adjusted.sort(key=lambda x: x[0])
+    merged = [adjusted[0]]
+    for left, right in adjusted[1:]:
+        last_left, last_right = merged[-1]
+        if left <= last_right + 1:
+            merged[-1][1] = max(last_right, right)
+        else:
+            merged.append([left, right])
+
+    # 폭이 비정상적으로 큰 구간은 무효 처리
+    valid_ranges = []
+    for left, right in merged:
+        width = right - left + 1
+        if width >= 240 or width <= 2:
+            continue
+        valid_ranges.append((int(left), int(right)))
+
+    if not valid_ranges:
+        return None
+
+    return valid_ranges, int(mode_bin)
 
 
 def compute_global_mode_band(gray, delta=GLOBAL_BAND_DELTA):
@@ -205,7 +252,9 @@ def compute_global_mode_band(gray, delta=GLOBAL_BAND_DELTA):
     mode = int(np.argmax(hs))
     lo = max(0, mode - delta)
     hi = min(255, mode + delta)
-    return int(lo), int(hi), int(mode)
+    if (hi - lo + 1) >= 240 or (hi - lo + 1) <= 2:
+        return None
+    return [(int(lo), int(hi))], int(mode)
 
 
 def find_effective_band(gray, roi_rect, coverage, min_width, pad):
@@ -216,13 +265,21 @@ def find_effective_band(gray, roi_rect, coverage, min_width, pad):
     return compute_global_mode_band(gray)
 
 
-def threshold_by_band(gray, lo, hi, keep=KEEP_POLICY):
+def threshold_by_band(gray, ranges, keep=KEEP_POLICY):
     """영역(밴드) 기준 임계화 마스크 생성"""
+    if not ranges:
+        return np.zeros_like(gray, dtype=np.uint8)
+
     if keep == "inside":
-        mask = (gray >= lo) & (gray <= hi)
+        mask_bool = np.zeros_like(gray, dtype=bool)
+        for lo, hi in ranges:
+            mask_bool |= (gray >= lo) & (gray <= hi)
     else:
-        mask = (gray < lo) | (gray > hi)
-    return mask.astype(np.uint8) * 255
+        mask_bool = np.ones_like(gray, dtype=bool)
+        for lo, hi in ranges:
+            mask_bool &= ~((gray >= lo) & (gray <= hi))
+
+    return mask_bool.astype(np.uint8) * 255
 
 
 def refine_binary_mask(binary_img, open_kernel=_MORPH_KERNEL_OPEN, close_kernel=_MORPH_KERNEL_CLOSE):
@@ -355,22 +412,23 @@ def process_single_image(img_path, img, gray, roi_rect, coverage, band_min_width
     if band is None:
         print(f"{img_file} : 히스토그램 비정상 - 스킵")
         return None
-    lo, hi, _ = band
+    ranges, mode_bin = band
     # (2) 임계화 후 모폴로지 정제
-    thresh = threshold_by_band(gray, lo, hi, keep=keep_policy)
+    thresh = threshold_by_band(gray, ranges, keep=keep_policy)
     thresh = refine_binary_mask(thresh)
     # (3) Convex Hull 생성 및 결과 오버레이 이미지 준비
     raw_contour_img = img.copy()
     result_img = img.copy()
     mask, hull_area = create_convex_hull_mask(thresh, contour_area_min, use_convex_hull, draw_img=result_img, raw_contour_img=raw_contour_img)
     # (4) ROI 및 밴드 정보 주석
-    orig_vis_bgr = annotate_roi(img, roi_rect, f"{lo}~{hi}")
+    range_text = ", ".join(f"{lo}~{hi}" for lo, hi in ranges)
+    range_text = ", ".join(f"{lo}~{hi}" for lo, hi in ranges)
+    band_label = range_text if range_text else str(mode_bin)
+    orig_vis_bgr = annotate_roi(img, roi_rect, band_label)
     # (5) 마스크 영역 통계(평균/왜도)
     masked_gray, average, skewness = compute_mask_statistics(gray, mask, average_top_percent)
     # (6) 로그 메시지 출력
-    # x, y, w, h = roi_rect
-    # msg = (f"{img_file} ROI[{x},{y},{w},{h}] Range: {lo}~{hi}, "
-    #        f"컨투어 면적: {int(hull_area)}, 평균: {average:.1f}, 왜도: {skewness:.2f}")
+    # msg = (f"[{img_file}]   ROI Band Range: {band_label} / Hull 면적: {int(hull_area)} / 평균: {average:.1f} / 왜도: {skewness:.2f}")
     # print(msg)
     # (7) Icing 판정 및 라벨 오버레이
     icing_flag = classify_icing(average, skewness, avg_threshold, skew_threshold)
@@ -390,9 +448,10 @@ def process_single_image(img_path, img, gray, roi_rect, coverage, band_min_width
     # (9) CSV 저장용 결과 레코드
     result_record = {
         "filename": img_file,
-        "hull_area": hull_area,
-        "average": average,
-        "skewness": skewness,
+        "roi band range": band_label,
+        "hull area": hull_area,
+        "hull average": average,
+        "hull skewness": skewness,
         "result": "Icing Detected" if icing_flag else "Melted",
     }
     return result_record, plot_inputs
@@ -434,7 +493,7 @@ def process_icing_detection(input_folder, output_folder_icing, CONTOUR_AREA_MIN=
 
     # 전체 결과 CSV 저장
     csv_save_path = os.path.join(output_folder_icing, "icing_info.csv")
-    header = ["filename", "hull_area", "average", "skewness", "result"]
+    header = ["filename", "roi band range", "hull area", "hull average", "hull skewness", "result"]
     save_results_to_csv(all_results, csv_save_path, header=header)
 
 
@@ -445,8 +504,13 @@ output_folder_icing = "output_results"
 # single_test_file = "X7_WX7VP_REMELT_1_01m00s_000900.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_01m00s_000901.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_01m01s_000917.jpg"
-single_test_file = "X7_WX7VP_REMELT_1_03m21s_003025.jpg"
+# single_test_file = "X7_WX7VP_REMELT_1_01m36s_001448.jpg"
+# single_test_file = "X7_WX7VP_REMELT_1_02m06s_001903.jpg"
+# single_test_file = "X7_WX7VP_REMELT_1_03m14s_002913.jpg"
+# single_test_file = "X7_WX7VP_REMELT_1_03m21s_003025.jpg"
+single_test_file = "X7_WX7VP_REMELT_1_03m44s_003369.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_03m53s_003505.jpg"
+# single_test_file = "X7_WX7VP_REMELT_1_06m28s_005829.jpg"
 
 process_icing_detection(input_folder=input_folder, output_folder_icing=output_folder_icing, single_filename=single_test_file, show_in_notebook=True)
 # process_icing_detection(input_folder=input_folder, output_folder_icing=output_folder_icing, single_filename=None, show_in_notebook=False)
