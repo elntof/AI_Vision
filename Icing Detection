@@ -38,8 +38,8 @@ ICING_SKEW_THRESHOLD = 1.0
 # 히스토그램 스무딩 및 모폴로지 커널 =============
 _SMOOTH_KERNEL = np.array([1, 2, 3, 2, 1], dtype=np.float32)
 _SMOOTH_KERNEL /= _SMOOTH_KERNEL.sum()
-_MORPH_KERNEL_OPEN = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-_MORPH_KERNEL_CLOSE = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+_MORPH_KERNEL_OPEN = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (12, 12))
+_MORPH_KERNEL_CLOSE = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (1, 1))
 
 
 def image_loader(path):
@@ -298,6 +298,15 @@ def create_convex_hull_mask(thresh, min_area, use_convex_hull, draw_img=None, ra
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     valid_contours = [cnt for cnt in contours if cv2.contourArea(cnt) >= min_area]
 
+    if len(valid_contours) > 1:
+        # 복수 컨투어가 존재하면 이미지의 아래쪽에 위치하는 컨투어만 사용
+        def contour_bottom(contour):
+            x, y, w, h = cv2.boundingRect(contour)
+            return y + h
+
+        lowest_contour = max(valid_contours, key=contour_bottom)
+        valid_contours = [lowest_contour]
+
     if raw_contour_img is not None and valid_contours:
         cv2.drawContours(raw_contour_img, valid_contours, -1, (0, 255, 0), 2)
 
@@ -505,14 +514,19 @@ output_folder_icing = "output_results"
 # single_test_file = "X7_WX7VP_REMELT_1_01m00s_000901.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_01m01s_000917.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_01m36s_001448.jpg"
-single_test_file = "X7_WX7VP_REMELT_1_01m54s_001716.jpg"
+# single_test_file = "X7_WX7VP_REMELT_1_01m54s_001716.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_02m06s_001903.jpg"
+# single_test_file = "X7_WX7VP_REMELT_1_02m11s_001971.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_03m00s_002713.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_03m14s_002913.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_03m21s_003025.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_03m30s_003155.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_03m30s_003158.jpg"
+# single_test_file = "X7_WX7VP_REMELT_1_03m43s_003353.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_03m44s_003369.jpg"
+# single_test_file = "X7_WX7VP_REMELT_1_03m45s_003375.jpg"
+single_test_file = "X7_WX7VP_REMELT_1_03m47s_003411.jpg"
+# single_test_file = "X7_WX7VP_REMELT_1_03m48s_003432.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_03m53s_003505.jpg"
 # single_test_file = "X7_WX7VP_REMELT_1_06m28s_005829.jpg"
 
