@@ -299,3 +299,44 @@ for epoch in tqdm(range(1, EPOCHS_UNFROZEN + 1), desc="Unfrozen epochs", dynamic
 model.load_state_dict(best_wts)
 torch.save(model.state_dict(), "vit_melt_icing_best.pth")
 print(f"Best val acc: {best_val_acc:.4f}  (weights saved to vit_melt_icing_best.pth)")
+
+### 7) 학습 곡선 & 테스트 성능
+# 학습 곡선
+epochs_range = range(1, len(history['train_acc'])+1)
+plt.figure(figsize=(10,4))
+plt.subplot(1,2,1)
+plt.plot(epochs_range, history['train_loss'], label='train')
+plt.plot(epochs_range, history['val_loss'], label='val')
+plt.title('Loss'); plt.legend(); plt.grid(True, alpha=0.3)
+
+plt.subplot(1,2,2)
+plt.plot(epochs_range, history['train_acc'], label='train')
+plt.plot(epochs_range, history['val_acc'], label='val')
+plt.title('Accuracy'); plt.legend(); plt.grid(True, alpha=0.3)
+plt.show()
+
+# 테스트 평가
+model.eval()
+y_true, y_pred = [], []
+probs_all = []
+
+with torch.no_grad():
+    for images, labels in test_loader:
+        images = images.to(device, non_blocking=True)
+        outputs = model(images)
+        probs = torch.softmax(outputs, dim=1).cpu().numpy()
+        preds = outputs.argmax(1).cpu().numpy()
+
+        probs_all.append(probs)
+        y_pred.extend(preds)
+        y_true.extend(labels.numpy())
+
+probs_all = np.concatenate(probs_all, axis=0)
+
+print(classification_report(y_true, y_pred, target_names=class_names, digits=4))
+
+cm = confusion_matrix(y_true, y_pred)
+plt.figure(figsize=(4.8,4.2))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+plt.xlabel('Predicted'); plt.ylabel('True'); plt.title('Confusion Matrix')
+plt.show()
