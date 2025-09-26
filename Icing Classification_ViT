@@ -1,342 +1,636 @@
-### 1) 기본 설정 & 유틸
-import os
-os.environ.pop('REQUESTS_CA_BUNDLE', None)
-os.environ.pop('SSL_CERT_FILE', None)
+### 1. 기본 설정 & 유틸
+import os, time, math, random
 from pathlib import Path
-import random
-import time
-import numpy as np
-import matplotlib.pyplot as plt
-from typing import Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
-from torchvision import datasets, transforms
-import torchvision.transforms.functional as F
+from torchvision import transforms, datasets
 
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
-import seaborn as sns
+from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
 
-import timm
-from torch.amp import autocast, GradScaler
-
-use_cuda = torch.cuda.is_available()
-scaler = GradScaler(enabled=use_cuda)
-
-# 재현성
-def set_seed(seed=42):
+def seed_everything(seed: int = 42):
     random.seed(seed)
-    np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-set_seed(42)
+seed_everything(42)
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print("Device:", device)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[INFO] device: {device} | CUDA: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"[INFO] GPU: {torch.cuda.get_device_name(0)}")
 
-### 2) (선택) 고정 ROI 크롭 변환
-class FixedROICrop:
-    """고정된 픽셀 좌표 ROI로 자르는 변환"""
-    def __init__(self, roi_rect: Optional[Tuple[int,int,int,int]] = None):
-        self.roi = roi_rect  # (x, y, w, h)
+### 2. 경로 & 하이퍼파라미터
+DATA_ROOT = r"D:\Python\3. Deep Learning\1. Icing Classification_ViT\rawdata"
 
-    def __call__(self, img):
-        if self.roi is None:
-            return img
-        x, y, w, h = self.roi
-        W, H = img.size  # PIL size = (width, height)
-        x = max(0, min(x, W-1))
-        y = max(0, min(y, H-1))
-        w = max(1, min(w, W - x))
-        h = max(1, min(h, H - y))
-        return F.crop(img, top=y, left=x, height=h, width=w)
+# 입력/학습
+IMG_SIZE         = 224
+EPOCHS           = 20
+WARMUP_EPOCHS    = 2                # 초반 LR 워밍업(에폭 단위)
+BATCH_SIZE       = 32
+BASE_LR          = 5e-5             # ViT 미세조정 권장 범위(5e-5 ~ 1e-4)
+WEIGHT_DECAY     = 0.05
+NUM_WORKERS      = 4
+PIN_MEMORY       = torch.cuda.is_available()
 
-### 3) 경로/하이퍼파라미터/변환
-data_root = Path("rawdata")
-assert data_root.exists(), f"{data_root} 가 존재하지 않습니다."
+# 모델
+MODEL_NAME       = "vit_small_patch16_224"   # 필요 시 'vit_base_patch16_224'로 상향
+USE_PRETRAINED   = True
+DROP_PATH_RATE   = 0.1                       # timm 모델일 때만 적용됨(자동)
 
-# (선택) 고정 ROI 지정 (모르면 None)
-ROI_RECT = None
+# 로깅/저장
+SAVE_BEST_PATH   = "vit_icing_melted_standard_best.pth"
 
-IMG_SIZE = 224
-BATCH_SIZE = 32 if torch.cuda.is_available() else 16
-LR = 5e-5               # ViT 미세조정 보편적 시작점
-WEIGHT_DECAY = 0.05
-EPOCHS_FROZEN = 3       # 백본 동결 에폭
-EPOCHS_UNFROZEN = 12    # 전체 미세조정 에폭
-EARLY_STOP_PATIENCE = 5
+# 배치 제한은 표준 모드에서는 사용 안 함(None)
+LIMIT_TRAIN_BATCHES = None
+LIMIT_VAL_BATCHES   = None
 
-# ViT(ImageNet) 표준 정규화
-IMNET_MEAN = (0.485, 0.456, 0.406)
-IMNET_STD  = (0.229, 0.224, 0.225)
+assert Path(DATA_ROOT).exists(), f"DATA_ROOT not found: {DATA_ROOT}"
 
-# 데이터 변환
-train_tfms = transforms.Compose([
-    transforms.ConvertImageDtype(torch.float32) if hasattr(transforms, 'ConvertImageDtype') else transforms.Lambda(lambda x: x),
-])
+### 3. 변환(Transforms)
+# Grayscale 이미지를 3채널로 변환
+imagenet_mean = [0.485, 0.456, 0.406]
+imagenet_std  = [0.229, 0.224, 0.225]
 
-train_transforms = transforms.Compose([
-    FixedROICrop(ROI_RECT),
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.Grayscale(num_output_channels=3),  # 회색 → 3채널 복제
-    # 과적합 방지용 약한 증강 (필요시 조절)
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomAffine(degrees=5, translate=(0.02, 0.02), scale=(0.98, 1.02), shear=2),
-    transforms.ToTensor(),
-    transforms.Normalize(IMNET_MEAN, IMNET_STD),
-])
-
-val_test_transforms = transforms.Compose([
-    FixedROICrop(ROI_RECT),
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+train_transform = transforms.Compose([
     transforms.Grayscale(num_output_channels=3),
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomAffine(degrees=2, translate=(0.02, 0.02), scale=(0.98, 1.02)),
     transforms.ToTensor(),
-    transforms.Normalize(IMNET_MEAN, IMNET_STD),
+    transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
 ])
 
-### 4) 데이터셋 & 분할
-full_dataset = datasets.ImageFolder(root=str(data_root))
+val_transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=3),
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
+])
 
-# 라벨/인덱스 추출
-targets = np.array([full_dataset.samples[i][1] for i in range(len(full_dataset))])
-indices = np.arange(len(full_dataset))
+### 4. 데이터셋 로드 & 층화 분할
+dataset_full = datasets.ImageFolder(root=DATA_ROOT)
+idx_to_class = {v: k for k, v in dataset_full.class_to_idx.items()}
+print("[INFO] classes:", idx_to_class)
 
-# stratified split: 70/15/15
-idx_train, idx_tmp, y_train, y_tmp = train_test_split(
-    indices, targets, test_size=0.30, random_state=42, stratify=targets
-)
-idx_val, idx_test, y_val, y_test = train_test_split(
-    idx_tmp, y_tmp, test_size=0.50, random_state=42, stratify=y_tmp
-)
+targets = torch.tensor(dataset_full.targets)
 
-# 각 subset용 transform을 다르게 적용하려면 Subset 대신 커스텀으로 래핑
-class TransformSubset(Subset):
-    def __init__(self, dataset, indices, transform):
-        super().__init__(dataset, indices)
+def stratified_split_indices(y, train_ratio=0.7, val_ratio=0.15, seed=42):
+    g = {}
+    for i, c in enumerate(y):
+        g.setdefault(int(c), []).append(i)
+    rng = random.Random(seed)
+    train_idx, val_idx, test_idx = [], [], []
+    for cls, idxs in g.items():
+        rng.shuffle(idxs)
+        n = len(idxs)
+        n_train = int(round(n*train_ratio))
+        n_val   = int(round(n*val_ratio))
+        cls_train = idxs[:n_train]
+        cls_val   = idxs[n_train:n_train+n_val]
+        cls_test  = idxs[n_train+n_val:]
+        train_idx.extend(cls_train); val_idx.extend(cls_val); test_idx.extend(cls_test)
+    rng.shuffle(train_idx); rng.shuffle(val_idx); rng.shuffle(test_idx)
+    return train_idx, val_idx, test_idx
+
+train_idx, val_idx, test_idx = stratified_split_indices(targets, 0.7, 0.15, seed=42)
+
+class TransformSubset(torch.utils.data.Dataset):
+    def __init__(self, base_ds, indices, transform=None):
+        self.base_ds = base_ds
+        self.indices = indices
         self.transform = transform
-        self.base_transform = dataset.transform
-        dataset.transform = None  # 원본에 남지 않도록
-
-    def __getitem__(self, idx):
-        img, label = super().__getitem__(idx)
-        if self.transform:
+    def __len__(self): return len(self.indices)
+    def __getitem__(self, i):
+        img, label = self.base_ds[self.indices[i]]
+        if self.transform is not None:
             img = self.transform(img)
         return img, label
 
-# 변환 적용
-train_set = TransformSubset(datasets.ImageFolder(str(data_root)), idx_train, transform=train_transforms)
-val_set   = TransformSubset(datasets.ImageFolder(str(data_root)), idx_val,   transform=val_test_transforms)
-test_set  = TransformSubset(datasets.ImageFolder(str(data_root)), idx_test,  transform=val_test_transforms)
+train_ds = TransformSubset(dataset_full, train_idx, transform=train_transform)
+val_ds   = TransformSubset(dataset_full, val_idx, transform=val_transform)
+test_ds  = TransformSubset(dataset_full, test_idx, transform=val_transform)
 
-class_names = train_set.dataset.classes
-print("Classes:", class_names)
+print(f"[INFO] splits -> train:{len(train_ds)} val:{len(val_ds)} test:{len(test_ds)}")
 
-train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
-val_loader   = DataLoader(val_set,   batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
-test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+### 5. DataLoader
+NUM_WORKERS = 0
+PIN_MEMORY  = False
 
-### 5) 모델 구성 (사전학습 ViT)
-model = timm.create_model('vit_base_patch16_224', pretrained=False, num_classes=2)
-model = model.to(device)
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                          num_workers=0, pin_memory=False, drop_last=False)
+val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
+                          num_workers=0, pin_memory=False, drop_last=False)
+test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False,
+                          num_workers=0, pin_memory=False, drop_last=False)
+
+print("[INFO] train/val/test lens:", len(train_ds), len(val_ds), len(test_ds))
+
+### 6. 모델 & 옵티마 & 스케줄러 + AMP
+import math
+
+try:
+    import timm
+except ImportError as e:
+    raise SystemExit("timm가 필요합니다. 먼저 `pip install timm` 실행하세요.") from e
+
+# 모델 생성
+model = timm.create_model(
+    MODEL_NAME,
+    pretrained=USE_PRETRAINED,
+    num_classes=2,
+    drop_path_rate=DROP_PATH_RATE
+).to(device)
 
 criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS_FROZEN + EPOCHS_UNFROZEN)
+optimizer = torch.optim.AdamW(model.parameters(), lr=BASE_LR, weight_decay=WEIGHT_DECAY)
 
-scaler = GradScaler(enabled=use_cuda)
+# 워밍업 + 코사인(에폭 단위)
+def lr_lambda(current_epoch):
+    if current_epoch < WARMUP_EPOCHS:
+        return float(current_epoch + 1) / float(max(1, WARMUP_EPOCHS))
+    progress = (current_epoch - WARMUP_EPOCHS) / max(1, (EPOCHS - WARMUP_EPOCHS))
+    return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
 
-### 6) 학습/평가 루프 & 얼리스탑
-# ==== 6) 학습/평가 루프 & 얼리스탑 (tqdm: 에폭 + 배치 진행 표시) ====
-from copy import deepcopy
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+# AMP 설정
+from torch.amp import autocast, GradScaler
+
+device_type = "cuda" if torch.cuda.is_available() else "cpu"
+use_amp = (device_type == "cuda")
+scaler = GradScaler(device_type, enabled=use_amp)
+
+# 정보 출력 최소화
+print("[INFO] model params (M):", sum(p.numel() for p in model.parameters())/1e6)
+print("[INFO] AMP enabled:", use_amp)
+
+### 7. 학습/검증 루프 + Early Stopping + Best Save/Load
+from time import time
 from tqdm.auto import tqdm
-import time
+from IPython.display import clear_output, display
+import matplotlib.pyplot as plt
+from torch.amp import autocast
 
-# (안전) 전역 기본값/존재 여부 체크
-use_cuda = (device.type == 'cuda') if 'device' in globals() else False
-FAST_MODE = globals().get('FAST_MODE', False)
-MAX_STEPS_PER_EPOCH = globals().get('MAX_STEPS_PER_EPOCH', None)
-if 'scaler' not in globals():
-    from torch.amp import GradScaler
-    scaler = GradScaler(enabled=use_cuda)
+# 에폭마다 간단 라이브 플롯 업데이트 (원치 않으면 False)
+SHOW_LIVE_PLOT = False
 
-def set_backbone_trainable(m: nn.Module, trainable: bool):
-    """cls_token/pos_embed/patch_embed 포함 백본 파라미터 동결/해제"""
-    for name, p in m.named_parameters():
-        if 'head' in name:
-            continue
-        p.requires_grad = trainable
+# [MOD] AMP 설정이 셀 6에 있다면 생략 가능. 안전하게 여기서도 정의.
+device_type = "cuda" if torch.cuda.is_available() else "cpu"
+use_amp = (device_type == "cuda")
+amp_dtype = torch.float16 if device_type == "cuda" else torch.bfloat16
 
-def run_one_epoch(model, loader, train=True, max_steps=None, epoch=None, n_epochs=None):
-    """배치 단위 tqdm 진행막대 + 손실/정확도/학습률/메모리 표시"""
-    model.train(train)
-    epoch_loss, correct, total = 0.0, 0, 0
-    steps = 0
+def run_one_epoch(model, loader, optimizer=None, device="cpu",
+                  scaler=None, limit_batches=None, desc="train"):
+    is_train = optimizer is not None
+    model.train(is_train)
 
-    phase = "Train" if train else "Val"
-    desc  = f"{phase}" + (f" [{epoch}/{n_epochs}]" if (epoch and n_epochs) else "")
-    pbar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
+    total_loss, total_correct, total_samples = 0.0, 0, 0
+    pbar = tqdm(enumerate(loader),
+                total=(len(loader) if limit_batches is None else min(limit_batches, len(loader))),
+                leave=False, desc=desc)
+    for step, (x, y) in pbar:
+        if limit_batches is not None and step >= limit_batches:
+            break
+        x = x.to(device, non_blocking=True); y = y.to(device, non_blocking=True)
 
-    for images, labels in pbar:
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        if train:
+        if is_train:
             optimizer.zero_grad(set_to_none=True)
-            with autocast(device_type='cuda', enabled=use_cuda):
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            # [MOD] 최신 AMP API
+            with autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
+                logits = model(x)
+                loss = criterion(logits, y)
+            scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
         else:
             with torch.no_grad():
-                with autocast(device_type='cuda', enabled=use_cuda):
-                    outputs = model(images)
-                    loss = criterion(outputs, labels)
+                # [MOD] 검증도 autocast 적용(선택이지만 권장)
+                with autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
+                    logits = model(x)
+                    loss = criterion(logits, y)
 
-        # 통계 갱신
-        bs = images.size(0)
-        epoch_loss += loss.item() * bs
-        preds = outputs.argmax(1)
-        correct += (preds == labels).sum().item()
-        total   += bs
-        steps   += 1
+        with torch.no_grad():
+            preds = logits.argmax(dim=1)
+            correct = (preds == y).sum().item()
+            bs = y.size(0)
+            total_correct += correct
+            total_samples += bs
+            total_loss += loss.item() * bs
 
-        # 진행막대 postfix
-        postfix = {
-            'loss': f'{epoch_loss/max(total,1):.4f}',
-            'acc':  f'{correct/max(total,1):.4f}',
-        }
-        if train:
-            postfix['lr'] = f"{optimizer.param_groups[0]['lr']:.2e}"
-        if use_cuda:
-            postfix['memMB'] = f"{torch.cuda.memory_allocated()/(1024**2):.0f}"
-        pbar.set_postfix(postfix)
+        pbar.set_postfix(loss=f"{total_loss/total_samples:.4f}",
+                         acc=f"{total_correct/total_samples:.3f}")
 
-        # 빠른 확인을 위한 스텝 제한
-        if (max_steps is not None) and (steps >= max_steps):
+    avg_loss = total_loss / max(1, total_samples)
+    avg_acc  = total_correct / max(1, total_samples)
+    return avg_loss, avg_acc, total_samples
+
+
+def train_standard_with_progress(
+    model, train_loader, val_loader, epochs=10, device="cpu", scaler=None,
+    limit_train=None, limit_val=None, early_stop_patience=5, save_path="best.pth"
+):
+    best_val_acc = -1.0
+    best_state = None
+    wait = 0
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": [], "lr": [], "epoch_time": []}
+
+    # 상단 에폭 진행바
+    epoch_bar = tqdm(range(1, epochs+1), desc="Epochs", position=0, leave=True)
+    t_start_all = time()
+
+    # 라이브 플롯 준비
+    if SHOW_LIVE_PLOT:
+        plt.figure(figsize=(8,3))
+
+    for ep in epoch_bar:
+        lr_now = optimizer.param_groups[0]['lr']
+        t_ep = time()
+        # --- train ---
+        tr_loss, tr_acc, tr_seen = run_one_epoch(
+            model, train_loader, optimizer=optimizer, device=device,
+            scaler=scaler, limit_batches=limit_train, desc=f"train e{ep}"
+        )
+        # --- valid ---
+        va_loss, va_acc, va_seen = run_one_epoch(
+            model, val_loader, optimizer=None, device=device,
+            scaler=None, limit_batches=limit_val, desc=f"valid e{ep}"
+        )
+
+        # 히스토리 기록
+        history["train_loss"].append(tr_loss); history["train_acc"].append(tr_acc)
+        history["val_loss"].append(va_loss);   history["val_acc"].append(va_acc)
+        history["lr"].append(lr_now)
+        ep_time = time() - t_ep
+        history["epoch_time"].append(ep_time)
+
+        # Early stopping 로직
+        improved = va_acc > best_val_acc
+        if improved:
+            best_val_acc = va_acc
+            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            torch.save(best_state, save_path)
+            wait = 0
+        else:
+            wait += 1
+
+        # 스케줄러 스텝
+        scheduler.step()
+
+        # --- 에폭 요약 라인(콘솔) ---
+        elapsed = time() - t_start_all
+        remaining = (epochs - ep) * (elapsed / ep)
+        epoch_bar.set_postfix({
+            "lr": f"{lr_now:.2e}",
+            "t/ep": f"{ep_time:.1f}s",
+            "best": f"{best_val_acc:.3f}",
+            "wait": f"{wait}/{early_stop_patience}"
+        })
+        tqdm.write(
+            f"[Epoch {ep}/{epochs}] "
+            f"lr {lr_now:.2e} | "
+            f"train {tr_loss:.4f}/{tr_acc:.3f} "
+            f"| val {va_loss:.4f}/{va_acc:.3f} "
+            f"| best {best_val_acc:.3f} "
+            f"| time {ep_time:.1f}s | ETA ~{remaining/60:.1f}m"
+        )
+
+        # --- 라이브 플롯 업데이트(옵션) ---
+        if SHOW_LIVE_PLOT:
+            clear_output(wait=True)
+            plt.clf()
+            epochs_x = range(1, len(history["train_loss"])+1)
+            plt.subplot(1,2,1)
+            plt.plot(epochs_x, history["train_loss"], label="train")
+            plt.plot(epochs_x, history["val_loss"], label="val")
+            plt.title("Loss"); plt.legend(); plt.grid(True)
+
+            plt.subplot(1,2,2)
+            plt.plot(epochs_x, history["train_acc"], label="train")
+            plt.plot(epochs_x, history["val_acc"], label="val")
+            plt.title("Accuracy"); plt.legend(); plt.grid(True)
+            plt.tight_layout()
+            display(plt.gcf())
+
+        if wait >= early_stop_patience:
+            tqdm.write(f"[EARLY STOP] patience {early_stop_patience} 도달. 중단.")
             break
 
-    return epoch_loss/max(total,1), correct/max(total,1)
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
-# ----- 학습/평가 + 얼리스탑 -----
-best_wts = deepcopy(model.state_dict())
-best_val_acc = 0.0
-epochs_no_improve = 0
+    return history
 
-history = {'train_loss':[], 'train_acc':[], 'val_loss':[], 'val_acc':[]}
+# 실행
+history = train_standard_with_progress(
+    model, train_loader, val_loader,
+    epochs=EPOCHS, device=device, scaler=scaler,
+    limit_train=LIMIT_TRAIN_BATCHES, limit_val=LIMIT_VAL_BATCHES,
+    early_stop_patience=5, save_path=SAVE_BEST_PATH
+)
 
-# 1) 백본 동결 단계 (원하면 EPOCHS_FROZEN=0)
-set_backbone_trainable(model, trainable=False)
-for epoch in tqdm(range(1, EPOCHS_FROZEN + 1), desc="Frozen epochs", dynamic_ncols=True):
-    t0 = time.time()
-    tr_loss, tr_acc = run_one_epoch(
-        model, train_loader, train=True,
-        max_steps=(MAX_STEPS_PER_EPOCH if FAST_MODE else None),
-        epoch=epoch, n_epochs=EPOCHS_FROZEN
-    )
-    val_loss, val_acc = run_one_epoch(
-        model, val_loader, train=False,
-        max_steps=(MAX_STEPS_PER_EPOCH if FAST_MODE else None),
-        epoch=epoch, n_epochs=EPOCHS_FROZEN
-    )
-    scheduler.step()
-
-    history['train_loss'].append(tr_loss); history['train_acc'].append(tr_acc)
-    history['val_loss'].append(val_loss);  history['val_acc'].append(val_acc)
-
-    tqdm.write(f"[Frozen {epoch}/{EPOCHS_FROZEN}] "
-               f"train_acc={tr_acc:.4f} val_acc={val_acc:.4f} "
-               f"({time.time()-t0:.1f}s)")
-
-    if val_acc > best_val_acc:
-        best_val_acc = val_acc
-        best_wts = deepcopy(model.state_dict())
-        epochs_no_improve = 0
-    else:
-        epochs_no_improve += 1
-
-# 2) 전체 미세조정 단계
-set_backbone_trainable(model, trainable=True)
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS_UNFROZEN)
-
-for epoch in tqdm(range(1, EPOCHS_UNFROZEN + 1), desc="Unfrozen epochs", dynamic_ncols=True):
-    t0 = time.time()
-    tr_loss, tr_acc = run_one_epoch(
-        model, train_loader, train=True,
-        max_steps=(MAX_STEPS_PER_EPOCH if FAST_MODE else None),
-        epoch=epoch, n_epochs=EPOCHS_UNFROZEN
-    )
-    val_loss, val_acc = run_one_epoch(
-        model, val_loader, train=False,
-        max_steps=(MAX_STEPS_PER_EPOCH if FAST_MODE else None),
-        epoch=epoch, n_epochs=EPOCHS_UNFROZEN
-    )
-    scheduler.step()
-
-    history['train_loss'].append(tr_loss); history['train_acc'].append(tr_acc)
-    history['val_loss'].append(val_loss);  history['val_acc'].append(val_acc)
-
-    tqdm.write(f"[Unfrozen {epoch}/{EPOCHS_UNFROZEN}] "
-               f"train_acc={tr_acc:.4f} val_acc={val_acc:.4f} "
-               f"({time.time()-t0:.1f}s)")
-
-    if val_acc > best_val_acc:
-        best_val_acc = val_acc
-        best_wts = deepcopy(model.state_dict())
-        epochs_no_improve = 0
-    else:
-        epochs_no_improve += 1
-        if epochs_no_improve >= EARLY_STOP_PATIENCE:
-            tqdm.write("Early stopping triggered.")
-            break
-
-# Best 가중치 로드 & 저장
-model.load_state_dict(best_wts)
-torch.save(model.state_dict(), "vit_melt_icing_best.pth")
-print(f"Best val acc: {best_val_acc:.4f}  (weights saved to vit_melt_icing_best.pth)")
-
-### 7) 학습 곡선 & 테스트 성능
+### 8. 학습 곡선 & 테스트 평가
 # 학습 곡선
-epochs_range = range(1, len(history['train_acc'])+1)
-plt.figure(figsize=(10,4))
-plt.subplot(1,2,1)
-plt.plot(epochs_range, history['train_loss'], label='train')
-plt.plot(epochs_range, history['val_loss'], label='val')
-plt.title('Loss'); plt.legend(); plt.grid(True, alpha=0.3)
-
-plt.subplot(1,2,2)
-plt.plot(epochs_range, history['train_acc'], label='train')
-plt.plot(epochs_range, history['val_acc'], label='val')
-plt.title('Accuracy'); plt.legend(); plt.grid(True, alpha=0.3)
+fig, ax = plt.subplots(1, 2, figsize=(10,4))
+ax[0].plot(history["train_loss"], label="train"); ax[0].plot(history["val_loss"], label="val")
+ax[0].set_title("Loss"); ax[0].legend(); ax[0].grid(True)
+ax[1].plot(history["train_acc"], label="train"); ax[1].plot(history["val_acc"], label="val")
+ax[1].set_title("Accuracy"); ax[1].legend(); ax[1].grid(True)
 plt.show()
 
 # 테스트 평가
 model.eval()
-y_true, y_pred = [], []
-probs_all = []
+total_correct, total_samples = 0, 0
+all_preds, all_labels = [], []
 
 with torch.no_grad():
-    for images, labels in test_loader:
-        images = images.to(device, non_blocking=True)
-        outputs = model(images)
-        probs = torch.softmax(outputs, dim=1).cpu().numpy()
-        preds = outputs.argmax(1).cpu().numpy()
+    for x, y in test_loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        logits = model(x)
+        preds = logits.argmax(dim=1)
+        total_correct += (preds == y).sum().item()
+        total_samples += y.size(0)
+        all_preds.append(preds.cpu())
+        all_labels.append(y.cpu())
 
-        probs_all.append(probs)
-        y_pred.extend(preds)
-        y_true.extend(labels.numpy())
+test_acc = total_correct / max(1, total_samples)
+print(f"[TEST] Accuracy: {test_acc:.3f}")
 
-probs_all = np.concatenate(probs_all, axis=0)
+# 리포트/혼동행렬
+try:
+    from sklearn.metrics import classification_report, confusion_matrix
+    y_true = torch.cat(all_labels).numpy()
+    y_pred = torch.cat(all_preds).numpy()
+    print("\n[TEST] classification report")
+    target_names = [idx_to_class[0], idx_to_class[1]]
+    print(classification_report(y_true, y_pred, target_names=target_names))
 
-print(classification_report(y_true, y_pred, target_names=class_names, digits=4))
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(1,1, figsize=(4,4))
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_xticks([0,1]); ax.set_yticks([0,1])
+    ax.set_xticklabels(target_names); ax.set_yticklabels(target_names)
+    ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+    for (i,j), v in np.ndenumerate(cm):
+        ax.text(j, i, str(v), ha='center', va='center', color='black')
+    fig.colorbar(im, ax=ax)
+    plt.title("Confusion Matrix")
+    plt.tight_layout()
+    plt.show()
+except Exception as e:
+    print("[WARN] sklearn not available or error -> skipping report/matrix.", e)
 
-cm = confusion_matrix(y_true, y_pred)
-plt.figure(figsize=(4.8,4.2))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
-plt.xlabel('Predicted'); plt.ylabel('True'); plt.title('Confusion Matrix')
+### 9. (검증)ViT Attention Rollout
+import torch, numpy as np, matplotlib.pyplot as plt
+import torch.nn.functional as F
+
+@torch.no_grad()
+def attention_rollout_manual(x_bchw, model, device, discard_ratio=0.0):
+    """
+    x_bchw : [1, 3, H, W] normalized tensor
+    return : (heatmap[H,W] in [0,1], pred_class:int)
+    """
+    x = x_bchw.to(device)
+    model.eval()
+
+    # 예측 클래스
+    pred = int(model(x).argmax(dim=1).item())
+
+    # 토큰 준비 (patch_embed + cls + pos + drop)
+    tokens = model.patch_embed(x)
+    B, N, C = tokens.shape
+
+    if hasattr(model, "cls_token") and model.cls_token is not None:
+        cls_tok = model.cls_token.expand(B, -1, -1)  # [B,1,C]
+        tokens = torch.cat((cls_tok, tokens), dim=1) # [B, 1+N, C]
+
+    if hasattr(model, "pos_embed") and model.pos_embed is not None:
+        tokens = tokens + model.pos_embed
+
+    if hasattr(model, "pos_drop") and model.pos_drop is not None:
+        tokens = model.pos_drop(tokens)
+
+    # 각 블록의 어텐션 행렬 복원 (qkv로 계산)
+    attn_list = []
+    for blk in model.blocks:
+        t_norm = blk.norm1(tokens)
+
+        attn_mod = blk.attn
+        qkv = attn_mod.qkv(t_norm)
+        qkv = qkv.reshape(B, t_norm.shape[1], 3, attn_mod.num_heads, C // attn_mod.num_heads)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        scale = getattr(attn_mod, "scale", (q.shape[-1] ** -0.5))
+        attn = (q @ k.transpose(-2, -1)) * scale
+        attn = attn.softmax(dim=-1)
+        attn_list.append(attn.detach().cpu())
+
+        tokens = blk(tokens)
+
+    # Rollout 누적 (head 평균 -> 정규화 -> 행렬곱 누적)
+    joint = None
+    for A in attn_list:
+        A = A.mean(dim=1)[0]
+        N_all = A.size(-1)
+        A = A + torch.eye(N_all, device=A.device)
+        A = A / A.sum(dim=-1, keepdim=True)
+        joint = A if joint is None else joint @ A
+
+    cls_attn = joint[0, 1:]
+    if hasattr(model, "patch_embed") and hasattr(model.patch_embed, "grid_size"):
+        gh, gw = model.patch_embed.grid_size
+    else:
+        L = int(np.sqrt(cls_attn.numel()))
+        gh = gw = L
+
+    heat = cls_attn.reshape(int(gh), int(gw))
+    # discard_ratio로 작은 값 일부 제거
+    if discard_ratio > 0:
+        flat = heat.flatten()
+        k = int(discard_ratio * flat.numel())
+        if 0 < k < flat.numel():
+            thresh = torch.topk(flat, flat.numel()-k).values.min()
+            heat = torch.clamp(heat - thresh, min=0)
+
+    heat = heat / (heat.max() + 1e-8)
+    heat = heat.unsqueeze(0).unsqueeze(0)
+    H, W = x.shape[-2:]
+    heat_up = F.interpolate(heat, size=(H, W), mode="bilinear", align_corners=False)[0,0]
+    return heat_up.cpu().numpy(), pred
+
+### 10. Attention 컨투어맵 오버레이 플로팅
+import numpy as np, math, torch, matplotlib.pyplot as plt
+from torchvision import transforms
+from PIL import Image, ImageOps
+
+# -------- 레이아웃 / 시안성 파라미터 --------
+ROW_BLOCKS      = 20     # 행 블록 수 (각 블록은 Contour-only 1행)
+COLS_LEFT       = 5      # Melted 열 수
+COLS_RIGHT      = 5      # Icing  열 수
+PER_COL_INCH    = 3.2    # 열(컬럼) 하나당 가로 크기
+PER_ROW_INCH    = 3.0    # 한 행의 세로 크기
+
+# -------- 히트맵 전처리(컨투어에만 사용) --------
+PERC_CLIP       = 98     # 상위 퍼센타일 클리핑(짙음 완화)
+GAMMA           = 1.5    # 감마 보정 (>1이면 고값 억제)
+
+#  -------- 컨투어 설정 --------
+LOW_LEVELS      = [0.4]  # 낮은 임계 레벨(여러 값 가능)
+HIGH_LEVELS     = [0.9]  # 높은 임계 레벨
+LOW_COLOR       = "yellow"
+HIGH_COLOR      = "lime"
+CONTOUR_LW      = 1.6
+ROLL_DISCARD    = 0.0  # 내부 채움 없음
+
+# mean/std 기본값
+try:
+    imagenet_mean, imagenet_std
+except NameError:
+    imagenet_mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    imagenet_std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+# val_transform 이 없으면 동일한 변환 구성 (안전장치)
+try:
+    val_transform
+except NameError:
+    val_transform = transforms.Compose([
+        transforms.Grayscale(num_output_channels=3),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
+    ])
+
+def tensor_to_rgb(img_tensor):
+    """정규화 해제 후 [H,W,3] 0~1로 변환"""
+    img = img_tensor.detach().cpu().float().numpy()
+    img = (img * imagenet_std[:, None, None]) + imagenet_mean[:, None, None]
+    img = np.clip(img, 0, 1)
+    return np.transpose(img, (1, 2, 0))
+
+def normalize_heat(h, perc=PERC_CLIP, gamma=GAMMA, eps=1e-8):
+    """퍼센타일 클리핑 + 감마 보정 (컨투어용)"""
+    h = np.asarray(h, dtype=np.float32)
+    hi = np.percentile(h, perc)
+    h  = h / max(hi, eps)
+    h  = np.clip(h, 0, 1)
+    if gamma != 1.0: h = h ** gamma
+    return h
+
+# 클래스 인덱스 찾기
+class_to_idx = {v: k for k, v in idx_to_class.items()}
+def find_idx(name):
+    if name in class_to_idx: return class_to_idx[name]
+    for k, v in class_to_idx.items():
+        if k.lower() == name.lower(): return v
+    for k, v in class_to_idx.items():
+        if name.lower() in k.lower(): return v
+    raise KeyError(f"클래스 '{name}' 없음. 현재: {list(class_to_idx.keys())}")
+
+melted_idx = find_idx("Melted")
+icing_idx  = find_idx("Icing")
+
+# Test set에서 각 클래스의 "시간(파일명) 순" 인덱스 리스트 만들기
+base_ds = test_ds.base_ds if hasattr(test_ds, "base_ds") else dataset_full
+test_base_indices = list(test_ds.indices)
+
+def sorted_indices_by_time(base_indices, class_idx):
+    cls_idxs = [i for i in base_indices if base_ds.targets[i] == class_idx]
+    cls_sorted = sorted(cls_idxs, key=lambda i: base_ds.samples[i][0])
+    return cls_sorted
+
+melted_sorted = sorted_indices_by_time(test_base_indices, melted_idx)
+icing_sorted  = sorted_indices_by_time(test_base_indices, icing_idx)
+
+# 균등 샘플링 함수 (처음→끝 구간을 고르게 k개 선택)
+def pick_uniform(lst, k):
+    n = len(lst)
+    if k <= 0 or n == 0:
+        return []
+    if k >= n:
+        return lst[:]
+    pos = np.linspace(0, n - 1, num=k)
+    picks = []
+    prev = -1
+    for p in pos:
+        idx = int(round(p))
+        idx = max(0, min(n - 1, idx))
+        if idx == prev and idx + 1 < n:
+            idx += 1
+        picks.append(idx)
+        prev = idx
+    return [lst[i] for i in picks]
+
+need_per_class = ROW_BLOCKS * COLS_LEFT
+melted_pick = pick_uniform(melted_sorted, need_per_class)
+icing_pick  = pick_uniform(icing_sorted,  need_per_class)
+
+left_n  = len(melted_pick)
+right_n = len(icing_pick)
+
+# 실제 표시할 행 블록 수
+rows_m = math.ceil(left_n  / COLS_LEFT) if left_n  > 0 else 0
+rows_i = math.ceil(right_n / COLS_RIGHT) if right_n > 0 else 0
+row_blocks = min(ROW_BLOCKS, max(rows_m, rows_i))
+if row_blocks == 0:
+    raise RuntimeError("표시할 샘플이 부족합니다. test split/파일 정렬을 확인하세요.")
+
+COLS_TOTAL = COLS_LEFT + COLS_RIGHT
+fig_w = PER_COL_INCH * COLS_TOTAL
+fig_h = PER_ROW_INCH * row_blocks
+fig, axes = plt.subplots(row_blocks, COLS_TOTAL, figsize=(fig_w, fig_h))
+axes = np.atleast_2d(axes)
+
+# 기본 로더
+pil_loader = getattr(base_ds, "loader", None)
+
+def get_sample_tensor_by_base_idx(base_idx):
+    path = base_ds.samples[base_idx][0]
+    if pil_loader is not None:
+        img = pil_loader(path)
+    else:
+        from PIL import Image
+        img = Image.open(path).convert("RGB")
+
+    x = val_transform(img) if val_transform is not None else transforms.ToTensor()(img)
+    return x.unsqueeze(0)
+
+def draw_contour_only(ax, sample_t):
+    """Contour-only 오버레이"""
+    heat, pred = attention_rollout_manual(sample_t, model, device, discard_ratio=ROLL_DISCARD)
+    heat_n = normalize_heat(heat, perc=PERC_CLIP, gamma=GAMMA)
+    rgb    = tensor_to_rgb(sample_t[0])
+
+    ax.imshow(rgb); ax.axis("off")
+    if LOW_LEVELS:
+        ax.contour(heat_n, levels=LOW_LEVELS, colors=LOW_COLOR,
+                   linewidths=CONTOUR_LW, alpha=0.95)
+    if HIGH_LEVELS:
+        ax.contour(heat_n, levels=HIGH_LEVELS, colors=HIGH_COLOR,
+                   linewidths=CONTOUR_LW, alpha=0.95)
+
+# 좌: Melted
+for r in range(row_blocks):
+    for c in range(COLS_LEFT):
+        k = r*COLS_LEFT + c
+        if k >= left_n: break
+        base_idx = melted_pick[k]
+        x = get_sample_tensor_by_base_idx(base_idx).to(device)
+        draw_contour_only(axes[r, c], x)
+
+# 우: Icing
+for r in range(row_blocks):
+    for c in range(COLS_RIGHT):
+        k = r*COLS_RIGHT + c
+        if k >= right_n: break
+        base_idx = icing_pick[k]
+        x = get_sample_tensor_by_base_idx(base_idx).to(device)
+        draw_contour_only(axes[r, COLS_LEFT + c], x)
+
+plt.tight_layout()
 plt.show()
