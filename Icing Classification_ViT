@@ -1,0 +1,301 @@
+### 1) 기본 설정 & 유틸
+import os
+os.environ.pop('REQUESTS_CA_BUNDLE', None)
+os.environ.pop('SSL_CERT_FILE', None)
+from pathlib import Path
+import random
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import Optional, Tuple, Union
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+import torchvision.transforms.functional as F
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
+
+import timm
+from torch.amp import autocast, GradScaler
+
+use_cuda = torch.cuda.is_available()
+scaler = GradScaler(enabled=use_cuda)
+
+# 재현성
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+set_seed(42)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print("Device:", device)
+
+### 2) (선택) 고정 ROI 크롭 변환
+class FixedROICrop:
+    """고정된 픽셀 좌표 ROI로 자르는 변환"""
+    def __init__(self, roi_rect: Optional[Tuple[int,int,int,int]] = None):
+        self.roi = roi_rect  # (x, y, w, h)
+
+    def __call__(self, img):
+        if self.roi is None:
+            return img
+        x, y, w, h = self.roi
+        W, H = img.size  # PIL size = (width, height)
+        x = max(0, min(x, W-1))
+        y = max(0, min(y, H-1))
+        w = max(1, min(w, W - x))
+        h = max(1, min(h, H - y))
+        return F.crop(img, top=y, left=x, height=h, width=w)
+
+### 3) 경로/하이퍼파라미터/변환
+data_root = Path("rawdata")
+assert data_root.exists(), f"{data_root} 가 존재하지 않습니다."
+
+# (선택) 고정 ROI 지정 (모르면 None)
+ROI_RECT = None
+
+IMG_SIZE = 224
+BATCH_SIZE = 32 if torch.cuda.is_available() else 16
+LR = 5e-5               # ViT 미세조정 보편적 시작점
+WEIGHT_DECAY = 0.05
+EPOCHS_FROZEN = 3       # 백본 동결 에폭
+EPOCHS_UNFROZEN = 12    # 전체 미세조정 에폭
+EARLY_STOP_PATIENCE = 5
+
+# ViT(ImageNet) 표준 정규화
+IMNET_MEAN = (0.485, 0.456, 0.406)
+IMNET_STD  = (0.229, 0.224, 0.225)
+
+# 데이터 변환
+train_tfms = transforms.Compose([
+    transforms.ConvertImageDtype(torch.float32) if hasattr(transforms, 'ConvertImageDtype') else transforms.Lambda(lambda x: x),
+])
+
+train_transforms = transforms.Compose([
+    FixedROICrop(ROI_RECT),
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.Grayscale(num_output_channels=3),  # 회색 → 3채널 복제
+    # 과적합 방지용 약한 증강 (필요시 조절)
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomAffine(degrees=5, translate=(0.02, 0.02), scale=(0.98, 1.02), shear=2),
+    transforms.ToTensor(),
+    transforms.Normalize(IMNET_MEAN, IMNET_STD),
+])
+
+val_test_transforms = transforms.Compose([
+    FixedROICrop(ROI_RECT),
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.Grayscale(num_output_channels=3),
+    transforms.ToTensor(),
+    transforms.Normalize(IMNET_MEAN, IMNET_STD),
+])
+
+### 4) 데이터셋 & 분할
+full_dataset = datasets.ImageFolder(root=str(data_root))
+
+# 라벨/인덱스 추출
+targets = np.array([full_dataset.samples[i][1] for i in range(len(full_dataset))])
+indices = np.arange(len(full_dataset))
+
+# stratified split: 70/15/15
+idx_train, idx_tmp, y_train, y_tmp = train_test_split(
+    indices, targets, test_size=0.30, random_state=42, stratify=targets
+)
+idx_val, idx_test, y_val, y_test = train_test_split(
+    idx_tmp, y_tmp, test_size=0.50, random_state=42, stratify=y_tmp
+)
+
+# 각 subset용 transform을 다르게 적용하려면 Subset 대신 커스텀으로 래핑
+class TransformSubset(Subset):
+    def __init__(self, dataset, indices, transform):
+        super().__init__(dataset, indices)
+        self.transform = transform
+        self.base_transform = dataset.transform
+        dataset.transform = None  # 원본에 남지 않도록
+
+    def __getitem__(self, idx):
+        img, label = super().__getitem__(idx)
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+# 변환 적용
+train_set = TransformSubset(datasets.ImageFolder(str(data_root)), idx_train, transform=train_transforms)
+val_set   = TransformSubset(datasets.ImageFolder(str(data_root)), idx_val,   transform=val_test_transforms)
+test_set  = TransformSubset(datasets.ImageFolder(str(data_root)), idx_test,  transform=val_test_transforms)
+
+class_names = train_set.dataset.classes
+print("Classes:", class_names)
+
+train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+val_loader   = DataLoader(val_set,   batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+
+### 5) 모델 구성 (사전학습 ViT)
+model = timm.create_model('vit_base_patch16_224', pretrained=False, num_classes=2)
+model = model.to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS_FROZEN + EPOCHS_UNFROZEN)
+
+scaler = GradScaler(enabled=use_cuda)
+
+### 6) 학습/평가 루프 & 얼리스탑
+# ==== 6) 학습/평가 루프 & 얼리스탑 (tqdm: 에폭 + 배치 진행 표시) ====
+from copy import deepcopy
+from tqdm.auto import tqdm
+import time
+
+# (안전) 전역 기본값/존재 여부 체크
+use_cuda = (device.type == 'cuda') if 'device' in globals() else False
+FAST_MODE = globals().get('FAST_MODE', False)
+MAX_STEPS_PER_EPOCH = globals().get('MAX_STEPS_PER_EPOCH', None)
+if 'scaler' not in globals():
+    from torch.amp import GradScaler
+    scaler = GradScaler(enabled=use_cuda)
+
+def set_backbone_trainable(m: nn.Module, trainable: bool):
+    """cls_token/pos_embed/patch_embed 포함 백본 파라미터 동결/해제"""
+    for name, p in m.named_parameters():
+        if 'head' in name:
+            continue
+        p.requires_grad = trainable
+
+def run_one_epoch(model, loader, train=True, max_steps=None, epoch=None, n_epochs=None):
+    """배치 단위 tqdm 진행막대 + 손실/정확도/학습률/메모리 표시"""
+    model.train(train)
+    epoch_loss, correct, total = 0.0, 0, 0
+    steps = 0
+
+    phase = "Train" if train else "Val"
+    desc  = f"{phase}" + (f" [{epoch}/{n_epochs}]" if (epoch and n_epochs) else "")
+    pbar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
+
+    for images, labels in pbar:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        if train:
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(device_type='cuda', enabled=use_cuda):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            with torch.no_grad():
+                with autocast(device_type='cuda', enabled=use_cuda):
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+
+        # 통계 갱신
+        bs = images.size(0)
+        epoch_loss += loss.item() * bs
+        preds = outputs.argmax(1)
+        correct += (preds == labels).sum().item()
+        total   += bs
+        steps   += 1
+
+        # 진행막대 postfix
+        postfix = {
+            'loss': f'{epoch_loss/max(total,1):.4f}',
+            'acc':  f'{correct/max(total,1):.4f}',
+        }
+        if train:
+            postfix['lr'] = f"{optimizer.param_groups[0]['lr']:.2e}"
+        if use_cuda:
+            postfix['memMB'] = f"{torch.cuda.memory_allocated()/(1024**2):.0f}"
+        pbar.set_postfix(postfix)
+
+        # 빠른 확인을 위한 스텝 제한
+        if (max_steps is not None) and (steps >= max_steps):
+            break
+
+    return epoch_loss/max(total,1), correct/max(total,1)
+
+# ----- 학습/평가 + 얼리스탑 -----
+best_wts = deepcopy(model.state_dict())
+best_val_acc = 0.0
+epochs_no_improve = 0
+
+history = {'train_loss':[], 'train_acc':[], 'val_loss':[], 'val_acc':[]}
+
+# 1) 백본 동결 단계 (원하면 EPOCHS_FROZEN=0)
+set_backbone_trainable(model, trainable=False)
+for epoch in tqdm(range(1, EPOCHS_FROZEN + 1), desc="Frozen epochs", dynamic_ncols=True):
+    t0 = time.time()
+    tr_loss, tr_acc = run_one_epoch(
+        model, train_loader, train=True,
+        max_steps=(MAX_STEPS_PER_EPOCH if FAST_MODE else None),
+        epoch=epoch, n_epochs=EPOCHS_FROZEN
+    )
+    val_loss, val_acc = run_one_epoch(
+        model, val_loader, train=False,
+        max_steps=(MAX_STEPS_PER_EPOCH if FAST_MODE else None),
+        epoch=epoch, n_epochs=EPOCHS_FROZEN
+    )
+    scheduler.step()
+
+    history['train_loss'].append(tr_loss); history['train_acc'].append(tr_acc)
+    history['val_loss'].append(val_loss);  history['val_acc'].append(val_acc)
+
+    tqdm.write(f"[Frozen {epoch}/{EPOCHS_FROZEN}] "
+               f"train_acc={tr_acc:.4f} val_acc={val_acc:.4f} "
+               f"({time.time()-t0:.1f}s)")
+
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        best_wts = deepcopy(model.state_dict())
+        epochs_no_improve = 0
+    else:
+        epochs_no_improve += 1
+
+# 2) 전체 미세조정 단계
+set_backbone_trainable(model, trainable=True)
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS_UNFROZEN)
+
+for epoch in tqdm(range(1, EPOCHS_UNFROZEN + 1), desc="Unfrozen epochs", dynamic_ncols=True):
+    t0 = time.time()
+    tr_loss, tr_acc = run_one_epoch(
+        model, train_loader, train=True,
+        max_steps=(MAX_STEPS_PER_EPOCH if FAST_MODE else None),
+        epoch=epoch, n_epochs=EPOCHS_UNFROZEN
+    )
+    val_loss, val_acc = run_one_epoch(
+        model, val_loader, train=False,
+        max_steps=(MAX_STEPS_PER_EPOCH if FAST_MODE else None),
+        epoch=epoch, n_epochs=EPOCHS_UNFROZEN
+    )
+    scheduler.step()
+
+    history['train_loss'].append(tr_loss); history['train_acc'].append(tr_acc)
+    history['val_loss'].append(val_loss);  history['val_acc'].append(val_acc)
+
+    tqdm.write(f"[Unfrozen {epoch}/{EPOCHS_UNFROZEN}] "
+               f"train_acc={tr_acc:.4f} val_acc={val_acc:.4f} "
+               f"({time.time()-t0:.1f}s)")
+
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        best_wts = deepcopy(model.state_dict())
+        epochs_no_improve = 0
+    else:
+        epochs_no_improve += 1
+        if epochs_no_improve >= EARLY_STOP_PATIENCE:
+            tqdm.write("Early stopping triggered.")
+            break
+
+# Best 가중치 로드 & 저장
+model.load_state_dict(best_wts)
+torch.save(model.state_dict(), "vit_melt_icing_best.pth")
+print(f"Best val acc: {best_val_acc:.4f}  (weights saved to vit_melt_icing_best.pth)")
