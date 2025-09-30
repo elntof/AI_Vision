@@ -1,4 +1,4 @@
-### 1. 기본 설정 & 유틸
+# === [### 1. 기본 설정 & 유틸] ===
 import os, time, math, random
 from pathlib import Path
 
@@ -25,8 +25,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[INFO] device: {device} | CUDA: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"[INFO] GPU: {torch.cuda.get_device_name(0)}")
+# === [/### 1] ===
 
-### 2. 경로 & 하이퍼파라미터
+# === [### 2. 경로 & 하이퍼파라미터] ===
 from pathlib import Path
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -87,6 +88,7 @@ LIMIT_TRAIN_BATCHES = None
 LIMIT_VAL_BATCHES   = None
 
 assert Path(DATA_ROOT).exists(), f"DATA_ROOT not found: {DATA_ROOT}"
+# === [/### 2] ===
 
 # === [### 2-1. 임베딩 기반 중복 이미지 제거 (클래스별)] ===
 import os, re, math, gc, random, numpy as np, torch, logging, warnings
@@ -452,7 +454,7 @@ if torch.cuda.is_available():
     torch.cuda.empty_cache()
 # === [/### 2-1] ===
 
-### 3. 변환(Transforms)
+# === [### 3. 변환(Transforms)] ===
 from torchvision import transforms as T
 from PIL import Image
 
@@ -491,9 +493,9 @@ valtest_tfms = T.Compose([
     T.ToTensor(),
     T.Normalize(mean=imagenet_mean, std=imagenet_std),
 ])
-# === [/Cell 3] ===
+# === [/### 3] ===
 
-### 4. 데이터셋 로드 & 층화 분할
+# === [### 4. 데이터셋 로드 & 층화 분할] ===
 from torchvision import datasets
 import torch, random
 from torch.utils.data import Dataset
@@ -599,7 +601,7 @@ test_ds  = TransformSubset(dataset_full, test_idx,  transform=valtest_tfms)
 print(f"[INFO] splits(final) -> train:{len(train_ds)}  val:{len(val_ds)}  test:{len(test_ds)}")
 # === [/### 4] ===
 
-### 5. DataLoader
+# === [### 5. DataLoader] ===
 import os, torch
 
 EFFECTIVE_NUM_WORKERS = 0 if os.name == "nt" else NUM_WORKERS
@@ -613,85 +615,157 @@ val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=
 test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False, **_common)
 
 print("[INFO] train/val/test lens:", len(train_ds), len(val_ds), len(test_ds))
+# === [/### 5] ===
 
-### 6. 모델 & 옵티마 & 스케줄러 + AMP
-import math
+# === [### 6. 시각화 유틸 (Simple Rollout)] ===
+import torch, torch.nn.functional as F
 import numpy as np
-import torch
-import torch.nn.functional as F
 
-# ViT 수기 Attention Rollout
+# ----- 공통 유틸 -----
+def _get_grid_hw_from_model(model):
+    """timm ViT의 패치 그리드 크기 추출 (없으면 14x14 폴백)"""
+    if hasattr(model, "patch_embed") and hasattr(model.patch_embed, "grid_size"):
+        gh, gw = model.patch_embed.grid_size
+        if isinstance(gh, (list, tuple)):
+            gh, gw = gh
+        return int(gh), int(gw)
+    return 14, 14  # 224/16
+
+def _upsample_heat(heat_gh_gw, size_hw):
+    """(gh,gw) heatmap을 입력 텐서 해상도(H,W)로 업샘플 후 [0,1] 정규화"""
+    H, W = size_hw
+    heat = heat_gh_gw
+    heat = (heat - heat.min()) / (heat.max() - heat.min() + 1e-8)
+    heat_up = F.interpolate(
+        heat.unsqueeze(0).unsqueeze(0), size=(H, W),
+        mode="bilinear", align_corners=False
+    )[0, 0]
+    return heat_up.detach().cpu().numpy()
+
+def tensor_to_uint8_rgb(x_bchw, mean, std):
+    """정규화된 텐서를 uint8 RGB(numpy)로 되돌림 (B=1 가정)"""
+    with torch.no_grad():
+        x = x_bchw[0].detach().cpu()
+        if x.shape[0] == 1:
+            x = x.repeat(3, 1, 1)
+        mean_t = torch.as_tensor(mean).view(3, 1, 1)
+        std_t  = torch.as_tensor(std).view(3, 1, 1)
+        x = x * std_t + mean_t
+        x = (x.clamp(0, 1) * 255).byte().permute(1, 2, 0).numpy()
+        return x
+
+# ----- Simple(비-그래디언트) Rollout -----
 @torch.no_grad()
-def attention_rollout_manual(sample_t, model, device, discard_ratio=0.0):
-    """ViT 수기 Attention Rollout"""
+def attention_rollout_simple(x_bchw, model, device,
+                             head_avg=True, add_identity=True,
+                             discard_ratio=0.0):
+    """
+    기본(비-그래디언트) Attention Rollout:
+    - 각 블록의 post-softmax attn(head 평균)을 모아 레이어-롤아웃
+    - 실패 시 0 맵 반환
+    """
     model.eval()
-    x = sample_t.to(device, non_blocking=True)
+    attns, hooks = [], []
 
-    # 각 블록의 attn 입력(=norm1(x))을 pre_hook으로 수집
-    attn_inputs = []
-    hooks = []
-    attn_modules = []
-    for blk in model.blocks:
-        attn_modules.append(blk.attn)
-    def _pre_hook(module, inputs):
-        attn_inputs.append(inputs[0].detach())
-    for m in attn_modules:
-        hooks.append(m.register_forward_pre_hook(_pre_hook))
+    # attn_drop 훅 등록(없으면 바로 0 맵 반환)
+    for blk in getattr(model, "blocks", []):
+        if hasattr(blk, "attn") and hasattr(blk.attn, "attn_drop"):
+            hooks.append(blk.attn.attn_drop.register_forward_hook(
+                lambda m, i, o: attns.append(o.detach())
+            ))
+    if len(hooks) == 0:
+        H, W = x_bchw.shape[-2:]
+        return np.zeros((H, W), dtype=np.float32)
 
-    # 1회 forward: logits & attn_inputs 획득
+    # forward 한 번 흘려서 attn 수집
+    _ = model(x_bchw.to(device))
+
+    joint = None
+    try:
+        for A in attns:   # A: (B, heads, N, N)
+            if A.dim() != 4:
+                continue
+            if head_avg:
+                A = A.mean(dim=1)  # (B,N,N)
+            A = A[0]               # (N,N)
+            if add_identity:
+                N = A.size(-1)
+                A = A + torch.eye(N, device=A.device)
+            A = A / (A.sum(dim=-1, keepdim=True) + 1e-8)
+            joint = A if joint is None else joint @ A
+
+        if joint is None or joint.numel() == 0:
+            H, W = x_bchw.shape[-2:]
+            return np.zeros((H, W), dtype=np.float32)
+
+        # [CLS]→패치 중요도
+        cls_attn = joint[0, 1:]           # (L,)
+        gh, gw = _get_grid_hw_from_model(model)
+        heat = cls_attn.reshape(int(gh), int(gw))
+
+        # 낮은 비중 discard (선택)
+        if discard_ratio > 0:
+            flat = heat.flatten()
+            k = int(discard_ratio * flat.numel())
+            if 0 < k < flat.numel():
+                thr = torch.topk(flat, flat.numel() - k).values.min()
+                heat = torch.clamp(heat - thr, min=0)
+
+        return _upsample_heat(heat, x_bchw.shape[-2:])
+    finally:
+        for h in hooks:
+            h.remove()
+
+# ----- Occlusion 간단 검증 (simple 기반) -----
+@torch.no_grad()
+def occlusion_sensitivity(x_bchw, model, device, heat=None, topq=0.10, fill_mode="mean"):
+    """
+    heat 상위 topq 영역을 가려서 확신도 하락량(confidence drop) 측정
+    - heat=None이면 simple rollout으로 계산
+    """
+    model.eval()
+    x = x_bchw.to(device)
     logits = model(x)
-    pred = int(logits.argmax(dim=1).item())
+    cls = int(logits.argmax(dim=1).item())
+    base = float(torch.softmax(logits, dim=1)[0, cls].item())
 
-    for h in hooks:
-        h.remove()
+    if heat is None:
+        heat = attention_rollout_simple(x_bchw, model, device)
 
-    # 레이어별 어텐션 행렬 계산
-    A_list = []
-    for (m, xin) in zip(attn_modules, attn_inputs):
-        B, N, C = xin.shape
-        xin = xin.to(device)
-        qkv = m.qkv(xin)
-        qkv = qkv.reshape(B, N, 3, m.num_heads, C // m.num_heads)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        attn = (q @ k.transpose(-2, -1)) * m.scale
-        attn = attn.softmax(dim=-1)
-        attn = attn.mean(dim=1)
-        A_list.append(attn[0])
+    H, W = heat.shape
+    thr = np.percentile(heat, 100 * (1 - topq))
+    mask = (heat >= thr)
 
-    # Rollout (행렬 정규화 후 층별 행렬곱 누적
-    R = None
-    for A in A_list:
-        N = A.shape[-1]
-        A = A + torch.eye(N, device=A.device)
-        A = A / A.sum(dim=-1, keepdim=True)
-        R = A if R is None else (A @ R)
-
-    # CLS(0) → Patch(1:) 주의도 추출 후 입력 해상도로 업샘플
-    cls_to_patch = R[0, 1:]
-    g = int(math.sqrt(cls_to_patch.numel()))
-    heat = cls_to_patch.reshape(1, 1, g, g)
-    Ht, Wt = sample_t.shape[-2], sample_t.shape[-1]
-    heat_up = F.interpolate(heat, size=(Ht, Wt), mode="bilinear", align_corners=False)
-    heat_up = heat_up[0, 0].detach().cpu().float().numpy()
-    return heat_up, pred
-
-def normalize_heat(heat, perc=99.0, gamma=1.0):
-    """Heatmap 정규화(퍼센타일 클리핑 + 감마)"""
-    if torch.is_tensor(heat):
-        h = heat.detach().cpu().float().numpy()
+    xm = x.clone()
+    if fill_mode == "mean":
+        val = float(xm.mean().item())
+        for c in range(xm.shape[1]):
+            xm[0, c, mask] = val
+    elif isinstance(fill_mode, (int, float)):
+        for c in range(xm.shape[1]):
+            xm[0, c, mask] = float(fill_mode)
     else:
-        h = np.asarray(heat, dtype=np.float32)
-    h = np.maximum(h, 0.0)
-    vmax = np.percentile(h, perc) if perc is not None else h.max()
-    vmax = max(float(vmax), 1e-6)
-    h = np.clip(h / vmax, 0.0, 1.0)
-    if gamma is not None and gamma != 1.0:
-        h = np.power(h, gamma)
-    return h
+        xm[:, :, mask] = 0.0
+
+    conf_drop = base - float(torch.softmax(model(xm), dim=1)[0, cls].item())
+    return cls, base, conf_drop
+
+# ----- 셀10 호환용 래퍼 (항상 simple 사용) -----
+def attention_rollout_manual(x_bchw, model, device, discard_ratio=0.0):
+    """
+    (heat, meta) 튜플 반환.
+    - heat: (H,W) numpy float32 [0,1] (입력 텐서 해상도 기준)
+    - meta: {'type':'simple'}
+    셀10에서: `heat, _ = attention_rollout_manual(...)`
+    """
+    heat = attention_rollout_simple(
+        x_bchw, model, device,
+        head_avg=True, add_identity=True, discard_ratio=discard_ratio
+    )
+    return heat, {"type": "simple"}
 # === [/### 6] ===
 
-### 7. 학습/검증 루프 + Early Stopping + Best Save/Load
+# === [### 7. 학습/검증 루프 + Early Stopping + Best Save/Load] ===
 from time import time
 from tqdm.auto import tqdm
 from IPython.display import clear_output, display
@@ -1082,7 +1156,7 @@ history = train_standard_with_progress(
 )
 # === [/### 7] ===
 
-### 8. 학습 곡선 & 테스트 평가
+# === [### 8. 학습 곡선 & 테스트 평가] ===
 # 학습 곡선
 fig, ax = plt.subplots(1, 2, figsize=(10,4))
 ax[0].plot(history["train_loss"], label="train"); ax[0].plot(history["val_loss"], label="val")
@@ -1127,14 +1201,15 @@ try:
     ax.set_xlabel("Predicted"); ax.set_ylabel("True")
     for (i,j), v in np.ndenumerate(cm):
         ax.text(j, i, str(v), ha='center', va='center', color='black')
-        
+
     plt.title("Confusion Matrix")
     plt.tight_layout()
     plt.show()
 except Exception as e:
     print("[WARN] sklearn not available or error -> skipping report/matrix.", e)
+# === [/### 8] ===
 
-### 9. (검증)ViT Attention Rollout
+# === [### 9. (검증)ViT Attention Rollout] ===
 import torch, numpy as np, matplotlib.pyplot as plt
 import torch.nn.functional as F
 
@@ -1208,8 +1283,9 @@ def attention_rollout_manual(x_bchw, model, device, discard_ratio=0.0):
     H, W = x.shape[-2:]
     heat_up = F.interpolate(heat, size=(H, W), mode="bilinear", align_corners=False)[0,0]
     return heat_up.cpu().numpy(), pred
+# === [/### 9] ===
 
-### 10. Attention 컨투어맵 오버레이 플로팅
+# === [### 10. Attention 컨투어맵 오버레이 플로팅] ===
 import numpy as np, math, torch, matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from torchvision import transforms
