@@ -71,9 +71,9 @@ def show_roi_overlay(img_path: Path, roi_xywh, color=ROI_COLOR, edge_lw=ROI_EDGE
     ax.set_axis_off(); ax.set_aspect('equal', adjustable='box')
     plt.show()
 
-# 프리뷰
-demo_path = Path(DATA_ROOT) / "Icing" / "X7_WX7VP_REMELT_1_06m30s_005850.jpg"
-show_roi_overlay(demo_path, ROI_RECT)
+# 예시 (원하면 경로 지정 후 확인)
+# demo_path = Path(DATA_ROOT) / "Icing" / "X7_WX7VP_REMELT_1_06m30s_005850.jpg"
+# show_roi_overlay(demo_path, ROI_RECT)
 
 # ------- 하이퍼파라미터 -------
 IMG_SIZE       = 224
@@ -465,10 +465,6 @@ def _upsample_heat(heat_gh_gw, size_hw):
     return heat_up.detach().cpu().numpy()
 
 def _register_attn_hooks_for_block(blk, attns):
-    """
-    1차 시도: timm Attention 내부의 dropout 모듈 훅(attn_drop or drop_attn).
-    일부 버전에선 functional dropout(F.dropout)로 훅이 안 걸릴 수 있어 패치 폴백이 뒤따름.
-    """
     hooks = []
     attn_mod = getattr(blk, "attn", None)
     if attn_mod is None:
@@ -483,13 +479,7 @@ def _register_attn_hooks_for_block(blk, attns):
         hooks.append(target.register_forward_hook(_hook))
     return hooks
 
-# ----- 폴백: Attention.forward 임시 패치하여 attn 캡처 -----
 def _patch_attention_forward(attn_module, store_list):
-    """
-    timm Attention의 forward를 감싸서 softmax 직후의 attn(B,H,N,N)을 store_list에 추가.
-    - attn_mask, qk_norm, rope, rel_pos_bias 등을 보존
-    반환: 원본 forward (복구용)
-    """
     orig_forward = attn_module.forward
 
     def patched_forward(x, attn_mask=None, **kwargs):
@@ -574,11 +564,7 @@ def _restore_all_attention(patched_list):
 @torch.no_grad()
 def attention_rollout_simple(x_bchw, model, device,
                              head_avg=True, add_identity=True, discard_ratio=0.0):
-    """
-    Attention Rollout:
-    1) 모듈 훅(attn_drop/drop_attn)으로 캡처 시도
-    2) 실패 시 forward monkey-patch로 캡처
-    """
+    """Attention Rollout"""
     model.eval()
     attns, hooks = [], []
 
