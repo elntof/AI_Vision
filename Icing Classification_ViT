@@ -852,8 +852,7 @@ def train_standard(model, train_loader, val_loader, epochs=EPOCHS, save_path=SAV
 
 # === [### 9. 학습 실행] ===
 ensure_model_and_optim()
-history = train_standard(model, train_loader, val_loader,
-                         epochs=EPOCHS, save_path=SAVE_BEST_PATH, early_stop_patience=5)
+history = train_standard(model, train_loader, val_loader, epochs=EPOCHS, save_path=SAVE_BEST_PATH, early_stop_patience=5)
 # === [/### 9] ===
 
 # === [### 10. 학습 곡선 & 테스트 평가] ===
