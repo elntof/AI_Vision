@@ -23,9 +23,9 @@ mpl.rcParams['font.family'] = 'Malgun Gothic'
 mpl.rcParams['axes.unicode_minus'] = False
 
 # 환경 플래그: 경로 및 저장동작 테스트(True)/운영(False) 모드 구분
-LOAD_TEST_MODE = True
-SAVE_TEST_MODE = True
-INI_TEST_MODE  = True
+LOAD_TEST_MODE = False
+SAVE_TEST_MODE = False
+INI_TEST_MODE  = False
 
 # 이미지/CSV/그래프/이벤트 파일 경로 설정
 if LOAD_TEST_MODE:
@@ -228,7 +228,7 @@ class ParticlePlotCanvas(FigureCanvas):
 
         def shorten(label):
             """그래프 X축 날짜 레이블 단순화 (MM/DD_HH:MM)"""
-            info = parse_filename(label)  # [MOD]
+            info = parse_filename(label)
             return f"{info['date'][4:6]}/{info['date'][6:8]}_{info['time'][0:2]}:{info['time'][2:4]}"
 
         display_labels = [shorten(str(x)) for x in x_list]
@@ -481,7 +481,7 @@ class ParticleDetectionGUI(QWidget):
         self.collecting_initial = True   # 최초 10장 워밍업 플래그
 
         # 허용 모드 집합 & 래치/홀드 상태
-        self.ALLOWED_PULLER_MODES = {"NECK"}  # 허용 모드
+        self.ALLOWED_PULLER_MODES = {"SET", "NECK"}  # 허용 모드
         self.disallowed_mode_latched = False  # 비허용 모드 래치
         self.status_hold_until = 0.0          # 상태 메시지 유지 만료 시각
         self.last_image_seen_at = 0.0         # 마지막 새 이미지 관측 시각
@@ -493,19 +493,19 @@ class ParticleDetectionGUI(QWidget):
         self.crop1_y = QSpinBox(maximum=9999)
         self.crop1_y.setValue(int(self.settings.value('crop1_y', self.settings.value('crop_y', 0))))
         self.crop1_w = QSpinBox(maximum=9999)
-        self.crop1_w.setValue(int(self.settings.value('crop1_w', self.settings.value('crop_w', 80))))
+        self.crop1_w.setValue(int(self.settings.value('crop1_w', self.settings.value('crop_w', 85))))
         self.crop1_h = QSpinBox(maximum=9999)
-        self.crop1_h.setValue(int(self.settings.value('crop1_h', self.settings.value('crop_h', 130))))
+        self.crop1_h.setValue(int(self.settings.value('crop1_h', self.settings.value('crop_h', 110))))
 
         # crop2 영역 Spinbox 설정 및 저장값 로딩
         self.crop2_x = QSpinBox(maximum=9999)
-        self.crop2_x.setValue(int(self.settings.value('crop2_x', 105)))
+        self.crop2_x.setValue(int(self.settings.value('crop2_x', 118)))
         self.crop2_y = QSpinBox(maximum=9999)
-        self.crop2_y.setValue(int(self.settings.value('crop2_y', 190)))
+        self.crop2_y.setValue(int(self.settings.value('crop2_y', 110)))
         self.crop2_w = QSpinBox(maximum=9999)
-        self.crop2_w.setValue(int(self.settings.value('crop2_w', 60)))
+        self.crop2_w.setValue(int(self.settings.value('crop2_w', 40)))
         self.crop2_h = QSpinBox(maximum=9999)
-        self.crop2_h.setValue(int(self.settings.value('crop2_h', 60)))
+        self.crop2_h.setValue(int(self.settings.value('crop2_h', 120)))
 
         # CROP 영역 스핀박스 설정
         SPIN_W = 77  # 스핀박스 너비
