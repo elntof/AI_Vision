@@ -244,11 +244,11 @@ def extract_row_info(row):
         elif 20 <= puller_status <= 29:
             status_text = "STABILIZATION"
         elif 30 <= puller_status <= 39:
-            # mode 30~39 & BH Power≥10 → "REMELT" / mode 30~39 & Neck Att≥1 & Seed Lift≥0.1 → "NECK", 아니면 "NECK(STAB)"
+            # [mode 30~39 조건 下] ② BH Power≥10 → "REMELT" / ② Neck Att≥1 & Seed Lift≥0.3 → "NECK" / ③ 아니면 "NECK(STAB)"
             if bottom_heater >= 10:
                 status_text = "REMELT"
             else:
-                status_text = "NECK" if (neck_attempt >= 1 and seed_lift >= 0.1) else "NECK(STAB)"
+                status_text = "NECK" if (neck_attempt >= 1 and seed_lift >= 0.3) else "NECK(STAB)"
         elif 40 <= puller_status <= 49:
             status_text = "CROWN"
         elif 50 <= puller_status <= 59:
