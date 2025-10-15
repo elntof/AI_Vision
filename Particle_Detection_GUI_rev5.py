@@ -286,12 +286,11 @@ class ParticlePlotCanvas(FigureCanvas):
 
                 # 경계선 (왼쪽 경계만 표시)
                 if s > 0:
-                    self.ax.axvline(s - 0.5, color='#444444', linestyle='-', linewidth=1.2, alpha=0.8, zorder=1)
+                    self.ax.axvline(s - 0.5, color='#444444', linestyle='-', linewidth=0.8, alpha=0.8, zorder=1)
 
                 # att 레이블
                 mid = (s + e) / 2.0
-                self.ax.text(mid, label_y, f"Att-{int(att)}", ha='center', va='top', fontsize=9, fontweight='bold',
-                            color='#334455', zorder=2)
+                self.ax.text(mid, label_y, f"Att-{int(att)}", ha='center', va='top', fontsize=9, fontweight='bold', color='#334455', zorder=2)
 
         # X축 눈금/레이블
         self.ax.set_xticks(ticks)
