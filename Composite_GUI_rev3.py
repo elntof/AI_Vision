@@ -197,7 +197,6 @@ def extract_row_info(row):
     puller_status_raw = row.get('Puller Mode Status', '')
     neck_attempt_raw = row.get('Neck Attempts', '')
     bottom_heater_raw = row.get('Bottom Heater Set Point', '')
-    seed_lift_raw = row.get('Seed Lift Set Point', '')
 
     dt_full = parse_datetime(date_str, time_str)
     if dt_full:
@@ -224,14 +223,10 @@ def extract_row_info(row):
     except (ValueError, TypeError):
         bottom_heater = 0
 
-    try:
-        seed_lift = float(seed_lift_raw)
-    except (ValueError, TypeError):
-        seed_lift = 0
-
     status_map = {
         0: "IDLE",
         4: "TAKEOVER",
+        5: "PUMPDOWN",
         90: "PULLOUT",
         94: "POST PULLOUT"
     }
@@ -244,11 +239,11 @@ def extract_row_info(row):
         elif 20 <= puller_status <= 29:
             status_text = "STABILIZATION"
         elif 30 <= puller_status <= 39:
-            # [mode 30~39 조건 下] ② BH Power≥10 → "REMELT" / ② Neck Att≥1 & Seed Lift≥0.3 → "NECK" / ③ 아니면 "NECK(STAB)"
+            # [mode 30~39 조건 下] ② BH Power≥10 → "REMELT" / ② Neck Att≥1 → "NECK" / ③ 아니면 "NECK(STAB)"
             if bottom_heater >= 10:
                 status_text = "REMELT"
             else:
-                status_text = "NECK" if (neck_attempt >= 1 and seed_lift >= 0.3) else "NECK(STAB)"
+                status_text = "NECK" if neck_attempt >= 1 else "NECK(STAB)"
         elif 40 <= puller_status <= 49:
             status_text = "CROWN"
         elif 50 <= puller_status <= 59:
@@ -302,7 +297,7 @@ def find_closest_row_and_attempt(csv_text, target_dt):
             prev_status = None
             prev_lot = lot
 
-        # Attempt_NEW 계산 (설정된 Status 진입 시(이전과 다르면) 해당 상태 카운터 +1)
+        # Attempt_NEW 계산 (설정된 Status 진입 시 이전 row와 다르면 해당 상태 카운터 +1)
         if status_text in counters:
             if prev_status != status_text:
                 counters[status_text] += 1
