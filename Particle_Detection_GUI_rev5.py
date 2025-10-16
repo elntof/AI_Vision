@@ -23,9 +23,9 @@ mpl.rcParams['font.family'] = 'Malgun Gothic'
 mpl.rcParams['axes.unicode_minus'] = False
 
 # 환경 플래그: 경로 및 저장동작 테스트(True)/운영(False) 모드 구분
-LOAD_TEST_MODE = True
-SAVE_TEST_MODE = True
-INI_TEST_MODE  = True
+LOAD_TEST_MODE = False
+SAVE_TEST_MODE = False
+INI_TEST_MODE  = False
 
 # 이미지/CSV/그래프/이벤트 파일 경로 설정
 if LOAD_TEST_MODE:
@@ -1173,3 +1173,4 @@ def run_gui():
 
 if __name__ == "__main__":
     run_gui()
+
