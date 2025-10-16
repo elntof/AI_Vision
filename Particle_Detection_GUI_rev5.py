@@ -23,9 +23,9 @@ mpl.rcParams['font.family'] = 'Malgun Gothic'
 mpl.rcParams['axes.unicode_minus'] = False
 
 # 환경 플래그: 경로 및 저장동작 테스트(True)/운영(False) 모드 구분
-LOAD_TEST_MODE = False
-SAVE_TEST_MODE = False
-INI_TEST_MODE  = False
+LOAD_TEST_MODE = True
+SAVE_TEST_MODE = True
+INI_TEST_MODE  = True
 
 # 이미지/CSV/그래프/이벤트 파일 경로 설정
 if LOAD_TEST_MODE:
@@ -466,6 +466,7 @@ class ParticleDetectionGUI(QWidget):
 
         # CSV, Image, Graph(스냅샷) 관리 형식
         self.current_lot = None
+        self.current_attempt = None
         self.csv_path = None
         self.csv_header = ['이미지 파일명', 'Attempt 횟수', '밝기', 'adaptive_value', '파티클 발생 여부', '파티클_크기', '파티클_x', '파티클_y']
         self.processed_images: set[str] = set()
@@ -520,11 +521,12 @@ class ParticleDetectionGUI(QWidget):
                 return v
             return str(v).lower() in ('1', 'true', 'yes', 'y', 'on')
 
+        # Crop 박스 On/Off Default 설정
         self.crop1_enabled_cb = QCheckBox()
         self.crop1_enabled_cb.setChecked(_load_bool('crop1_enabled', True))
 
         self.crop2_enabled_cb = QCheckBox()
-        self.crop2_enabled_cb.setChecked(_load_bool('crop2_enabled', False))
+        self.crop2_enabled_cb.setChecked(_load_bool('crop2_enabled', True))
 
         # 위젯 초기화
         self.start_button = QPushButton('시작')
@@ -625,6 +627,16 @@ class ParticleDetectionGUI(QWidget):
             self.status_hold_until = time.monotonic() + hold_s
         else:
             self.status_hold_until = 0.0
+
+    def _reset_noise_warmup(self, status_text: str):
+        """노이즈 정의 및 워밍업 상태 초기화"""
+
+        self.collecting_initial = True
+        self.prev_particles.clear()
+        self.frame_buffer.clear()
+        self.show_noise_text = False
+        self._set_status(status_text)
+        self._update_noise_text()
 
     def _apply_crop_enable_states(self):
         """Crop 체크박스 설정에 따른 스핀박스 활성화/비활성화"""
@@ -855,6 +867,7 @@ class ParticleDetectionGUI(QWidget):
                 # 새 Lot로 전환
                 self.current_lot = lot_number
                 self.csv_path = CSV_OUTPUT_DIR / f"{lot_number}.csv"
+                self.current_attempt = attempt_value
                 self.processed_images.clear()
 
                 # 새 CSV 생성(헤더만)
@@ -879,15 +892,17 @@ class ParticleDetectionGUI(QWidget):
                         pass
 
                 # 워밍업/Noise/상태 리셋
-                self.collecting_initial = True
-                self.prev_particles = []
-                self.frame_buffer = []
-                self.show_noise_text = False
-                self.status_label.setText("LOT 변경 감지 → 워밍업 재시작 (10장)")
-                self._update_noise_text()
+                self._reset_noise_warmup("LOT 변경 감지 → 워밍업 재시작 (10장)")
 
                 # 빈 CSV 기반 그래프 즉시 초기화
                 self.update_graph()
+
+            else:
+                if self.current_attempt is None:
+                    self.current_attempt = attempt_value
+                elif self.current_attempt != attempt_value:
+                    self.current_attempt = attempt_value
+                    self._reset_noise_warmup("Attempt 변경 감지 → 워밍업 재시작 (10장)")
 
             # Lot 전환 이후 CSV 기반 중복 세트 로딩이 완료된 상태에서 중복 여부 재확인
             if img_name in self.processed_images:
