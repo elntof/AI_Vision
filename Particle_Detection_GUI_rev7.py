@@ -17,15 +17,211 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, QSettings, QRect, QThread, QObject, Signal, Slot
 from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen
 import csv
+import tempfile
+import subprocess
+import shutil
 
 # 한글 폰트 설정 (windows 한글깨짐 방지)
 mpl.rcParams['font.family'] = 'Malgun Gothic'
 mpl.rcParams['axes.unicode_minus'] = False
 
-# 환경 플래그: 경로 및 저장동작 테스트(True)/운영(False) 모드 구분
+# 환경 플래그: 경로 및 저장동작 테스트(True) / 운영(False) 모드 구분
 LOAD_TEST_MODE = False
 SAVE_TEST_MODE = False
 INI_TEST_MODE  = False
+
+# 실행파일 실행 시, "자동 시작 동작 수행" 여부 플래그 : 자동 시작(True) / 수동 시작(False)
+AUTO_START_ON_LAUNCH = True
+
+# 자동 실행(워치독) 시스템 파일 (프로세스 간 신호/락)
+APP_EXE_PREFIX = "Particle"
+APP_TAG        = "ParticleDetectionApp"
+STOP_FILE      = os.path.join(tempfile.gettempdir(), f"{APP_TAG}.stop")
+DISABLE_FILE   = os.path.join(tempfile.gettempdir(), f"{APP_TAG}.disabled")
+LOCK_FILE      = os.path.join(tempfile.gettempdir(), f"{APP_TAG}.watchdog.lock")
+RUN_BASE_DIR   = Path(tempfile.gettempdir()) / f"{APP_TAG}_run"
+ENV_APP_CWD    = "PD_APP_CWD"
+
+def _exe_path():
+    """현재 실행 중인 바이너리(혹은 .py) 경로 반환"""
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    return os.path.abspath(sys.argv[0])
+
+def _is_install_location():
+    """현재 실행 위치가 설치 경로(D:\\AI Vision)인지 여부 확인"""
+    exe_dir = os.path.normpath(os.path.dirname(_exe_path()))
+    target_dir = os.path.normpath(r'D:\AI Vision')
+    return exe_dir.upper() == target_dir.upper()
+
+def _get_app_cwd():
+    """자식/워치독이 사용할 작업 디렉터리(cwd). 스테이징 중에도 설치 경로를 유지"""
+    return os.environ.get(ENV_APP_CWD) or os.path.dirname(_exe_path())
+
+def _install_exe_available():
+    """설치 폴더에 실행 후보가 존재 감지 및 파일명 변경에도 대응"""
+    try:
+        install_dir = Path(_get_app_cwd())
+        if not install_dir.exists():
+            return False
+        for p in install_dir.glob("*.exe"):
+            if p.name.lower().startswith(APP_EXE_PREFIX.lower()):
+                return True
+        return False
+    except Exception:
+        return False
+
+def _find_candidate_install_exe():
+    """설치 폴더에서 최신 실행 후보 exe 반환"""
+    install_dir = Path(_get_app_cwd())
+    if not install_dir.exists():
+        return None
+    exes = [p for p in install_dir.glob("*.exe") if p.name.lower().startswith(APP_EXE_PREFIX.lower())]
+    if not exes:
+        return None
+    return max(exes, key=lambda p: p.stat().st_mtime)
+
+def _maybe_stage_to_temp():
+    """exe 파일 실행 시, 자신을 TEMP로 복사 / '--staged' 로 재실행 / 원본은 즉시 종료(파인 삭제/교체 가능)"""
+    if not getattr(sys, "frozen", False):
+        return
+    if ('--staged' in sys.argv) or ('--no-stage' in sys.argv):
+        return
+
+    if _is_install_location():
+        RUN_BASE_DIR.mkdir(parents=True, exist_ok=True)
+        src = Path(_exe_path())
+        sig = f"{int(src.stat().st_mtime)}_{src.stat().st_size}"
+        run_dir = RUN_BASE_DIR / sig
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        staged_exe = run_dir / src.name
+        try:
+            shutil.copy2(src, staged_exe)
+        except Exception:
+            return
+
+        env = os.environ.copy()
+        env[ENV_APP_CWD] = os.path.dirname(_exe_path())
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        subprocess.Popen([str(staged_exe), '--staged'], cwd=env[ENV_APP_CWD], env=env, creationflags=creationflags)
+        sys.exit(0)
+
+def _spawn_child_and_wait():
+    """자식 GUI 한 번 실행 후 종료 대기"""
+    exe = _exe_path()
+    if getattr(sys, "frozen", False):
+        args = [exe, "--child"]
+        cwd = _get_app_cwd()
+    else:
+        args = [sys.executable, exe, "--child"]
+        cwd = os.path.dirname(exe)
+    proc = subprocess.Popen(args, cwd=cwd)
+    return proc.wait()
+
+def _single_instance_lock():
+    """단일 워치독 보장용 락 파일 생성 시도"""
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        return fd
+    except FileExistsError:
+        return None
+
+def _release_instance_lock(fd):
+    """락 해제"""
+    try:
+        os.close(fd)
+    except Exception:
+        pass
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+    except Exception:
+        pass
+
+def _acquire_watchdog_lock_with_takeover(timeout_sec=30):
+    """takeover (새 --staged 인스턴스가 있으면 STOP_FILE을 생성하고, 락을 재시도하여 인수)"""
+    start = time.monotonic()
+    requested_stop = False
+    while True:
+        fd = _single_instance_lock()
+        if fd is not None:
+            try:
+                if os.path.exists(STOP_FILE):
+                    os.remove(STOP_FILE)
+            except Exception:
+                pass
+            return fd
+
+        if ('--staged' in sys.argv) and not requested_stop:
+            try:
+                Path(STOP_FILE).touch()
+            except Exception:
+                pass
+            requested_stop = True
+
+        if time.monotonic() - start > timeout_sec:
+            return None
+        time.sleep(0.5)
+
+def _should_enable_watchdog():
+    """실행파일이 설치 경로('D:\AI Vision') 또는 '--staged'일 때만 자동 재실행(워치독) 동작"""
+    return ('--staged' in sys.argv) or _is_install_location()
+
+def run_watchdog_loop():
+    """ 워치독 메인 루프 (자식 GUI를 감시 & 재시작 / exe 삭제 시 자동실행 일시정지 / 새 exe 등장 시 새 빌드가 수행)"""
+    lock_fd = _acquire_watchdog_lock_with_takeover(timeout_sec=30)
+    if lock_fd is None:
+        return
+
+    missing_since = None
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    try:
+        while True:
+            if os.path.exists(STOP_FILE):
+                try:
+                    os.remove(STOP_FILE)
+                except Exception:
+                    pass
+                break
+
+            # 설치본 부재 → 자식 종료 유도 + 스폰 중단(일시정지)
+            if not _install_exe_available():
+                try:
+                    Path(DISABLE_FILE).touch()
+                except Exception:
+                    pass
+                if missing_since is None:
+                    missing_since = time.monotonic()
+                time.sleep(1.5)
+                continue
+
+            # 설치 exe가 다시 등장 시, 새 바이너리를 1회 실행시켜 자동 인수 유도
+            if missing_since is not None:
+                try:
+                    if os.path.exists(DISABLE_FILE):
+                        os.remove(DISABLE_FILE)
+                except Exception:
+                    pass
+
+                candidate = _find_candidate_install_exe()
+                if candidate is not None:
+                    try:
+                        # 새 exe 1회 기동 → 자체 스테이징 & takeover
+                        subprocess.Popen([str(candidate)], cwd=str(candidate.parent), creationflags=creationflags)
+                    except Exception:
+                        pass
+
+                missing_since = None
+                time.sleep(2.0)
+
+            # 일반 루틴 자식이 종료되면 루프가 재시도/쿨다운
+            _spawn_child_and_wait()
+            time.sleep(10)
+    finally:
+        _release_instance_lock(lock_fd)
 
 # 이미지/CSV/그래프/이벤트 파일 경로 설정
 if LOAD_TEST_MODE:
@@ -66,7 +262,7 @@ os.makedirs(GRAPH_OUTPUT_DIR, exist_ok=True)
 MANUAL_THRESHOLD   = 7         # 이진화 임계값
 KERNEL_SIZE_TOPHAT = (3, 3)    # tophat 모폴로지 연산 커널 크기
 KERNEL_SIZE_MORPH  = (3, 3)    # 모폴로지 클로즈 연산 커널 크기
-PARTICLE_AREA_MIN  = 8         # 파티클 최소 면적
+PARTICLE_AREA_MIN  = 10        # 파티클 최소 면적
 PARTICLE_AREA_MAX  = 50        # 파티클 최대 면적
 
 # 파티클 표기 원 파라미터 (유효/노이즈)
@@ -94,7 +290,6 @@ def safe_image_load(image_path, max_retries=5, delay=0.2):
             pass
         time.sleep(delay)
     return None
-
 
 def compute_anchor_brightness(gray_img):
     """70% 최빈 구간 앵커 밝기 계산"""
@@ -141,7 +336,6 @@ def compute_anchor_brightness(gray_img):
         return int(mode_idx)
     anchor = int(round(float((bins * weights).sum() / denom)))
     return max(0, min(anchor, 255))
-
 
 def compute_adaptive_threshold(anchor_current: int | float | None) -> int:
     """앵커 밝기에 따라 동적으로 조정된 이진화 임계값 계산"""
@@ -263,7 +457,7 @@ class ParticlePlotCanvas(FigureCanvas):
             y_val = y_list[latest_index]
             self.ax.scatter(latest_index, y_val, marker='o', s=80, facecolors='lightgreen', edgecolors='black', linewidths=1.5)
 
-        # === Attempt 그룹 밴딩/경계선/레이블 ===
+        # Attempt 그룹 밴딩/경계선/레이블
         if attempt_list is not None and len(attempt_list) == n:
             groups = []
             start = 0
@@ -536,6 +730,7 @@ class ParticleDetectionGUI(QWidget):
         self.status_label = QLabel('- 대기 중 -')
         self.preview_label = ImagePreviewLabel()
         self.plot_canvas = ParticlePlotCanvas()
+        self.auto_start_on_launch = AUTO_START_ON_LAUNCH
 
         # 레이아웃 구성
         main_hbox = QHBoxLayout(self)
@@ -585,7 +780,7 @@ class ParticleDetectionGUI(QWidget):
         main_hbox.addLayout(left_panel)
         main_hbox.addLayout(right_panel)
 
-        # 시그널 연결 (미리보기 즉시 반영)        
+        # 시그널 연결 (미리보기 즉시 반영)
         for s in [self.crop1_x, self.crop1_y, self.crop1_w, self.crop1_h,
                   self.crop2_x, self.crop2_y, self.crop2_w, self.crop2_h]:
             s.valueChanged.connect(self.update_preview)
@@ -616,6 +811,12 @@ class ParticleDetectionGUI(QWidget):
             self.update_graph()
         else:
             self.plot_canvas.update_plot([], [], latest_index=None)
+
+        # STOP/DISABLE 파일 감시 (업데이트/정지/삭제-일시정지 시 GUI 즉시 종료)
+        self._stop_timer = QTimer(self)
+        self._stop_timer.setInterval(1000)  # 1초마다
+        self._stop_timer.timeout.connect(self._check_stop_or_disable_and_quit)
+        self._stop_timer.start()
 
     def _set_status(self, text: str, hold_s: float = 0.0):
         """상태 텍스트 세터 (동일 텍스트 중복 세팅 방지 + 홀드 지원)"""
@@ -654,7 +855,6 @@ class ParticleDetectionGUI(QWidget):
             return
         self.processed_images.add(filename)
         self.session_processed_images.add(filename)
-
 
     @Slot(bool)
     def _on_crop1_toggled(self, checked: bool):
@@ -725,7 +925,6 @@ class ParticleDetectionGUI(QWidget):
 
         except Exception:
             self.preview_label.clear()
-
 
     def start_realtime(self):
         """실시간 파티클 판정 시작 (백로그 → 라이브 테일 순)"""
@@ -952,7 +1151,7 @@ class ParticleDetectionGUI(QWidget):
             # 현재 Noise 정보 텍스트 갱신
             adaptive_value = compute_adaptive_threshold(anchor_current)
             self._update_noise_text()
-            
+
             # 워밍업 구간 (최초 10장 동안은 '판정/CSV/그래프' 수행하지 않음)
             if self.collecting_initial:
                 self.status_label.setText(f"초기 워밍업 수집 중... ({len(self.frame_buffer) + 1} / 10)")
@@ -1164,13 +1363,33 @@ class ParticleDetectionGUI(QWidget):
         except RuntimeError:
             pass
 
+    def _check_stop_or_disable_and_quit(self):
+        """STOP/DISABLE 감지 시 GUI 자발 종료 (업데이트 인수 & 삭제 후 멈춤 즉시 반영)"""
+        if os.path.exists(STOP_FILE) or os.path.exists(DISABLE_FILE):
+            QApplication.quit()
+
 def run_gui():
     """GUI 실행"""
     app = QApplication.instance() or QApplication(sys.argv)
     gui = ParticleDetectionGUI()
     gui.show()
+    if AUTO_START_ON_LAUNCH:
+        QTimer.singleShot(0, gui.start_realtime)
     app.exec()
 
 if __name__ == "__main__":
-    run_gui()
+    # 즉시 워치독/자식 중지 (--stop 인자로 실행하면 STOP_FILE 생성 후 종료)
+    if '--stop' in sys.argv:
+        Path(STOP_FILE).touch()
+        sys.exit(0)
 
+    _maybe_stage_to_temp()
+
+    # 워치독 조건 (설치 경로이거나 --staged 일 때만)
+    if ('--no-watchdog' in sys.argv) or (not _should_enable_watchdog()):
+        run_gui()
+    else:
+        if '--child' in sys.argv:
+            run_gui()
+        else:
+            run_watchdog_loop()
