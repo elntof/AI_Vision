@@ -709,11 +709,35 @@ class AlertPopup(QWidget):
         self.ignore_min_spin.setFont(small_font)
         self.ignore_cb.setChecked(False)
 
+        # 확인/오탐지 버튼 (우측 상단 배치)
+        self.btn_false = QPushButton('오탐지')
+        self.btn_ok = QPushButton('확인')
+
+        # 상단 텍스트 영역 구성
         topbar = QHBoxLayout()
+        topbar.setContentsMargins(0, 0, 0, 0)
         topbar.addWidget(self.title_label, 1)
-        topbar.addStretch(1)
-        topbar.addWidget(self.ignore_cb)
-        topbar.addWidget(self.ignore_min_spin)
+
+        top_right = QVBoxLayout()
+        top_right.setContentsMargins(0, 0, 0, 0)
+        top_right.setSpacing(6)
+
+        ignore_layout = QHBoxLayout()
+        ignore_layout.setContentsMargins(0, 0, 0, 0)
+        ignore_layout.addWidget(self.ignore_cb)
+        ignore_layout.addWidget(self.ignore_min_spin)
+        ignore_layout.setAlignment(Qt.AlignRight)
+        top_right.addLayout(ignore_layout)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.btn_false)
+        btn_layout.addWidget(self.btn_ok)
+        top_right.addLayout(btn_layout)
+        top_right.addStretch()
+
+        topbar.addLayout(top_right)
         self.ignore_cb.toggled.connect(self._update_ignore_checkbox_text)
         self.ignore_min_spin.valueChanged.connect(self._update_ignore_checkbox_text)
         self._update_ignore_checkbox_text()
@@ -733,11 +757,30 @@ class AlertPopup(QWidget):
             lab.setAlignment(Qt.AlignLeft)
         self.elapsed_label.setText('- [경과 시간] -')
 
-        info_box = QVBoxLayout()
-        info_box.addWidget(self.info_label)
-        info_box.addWidget(self.time_label)
-        info_box.addWidget(self.elapsed_label)
-        info_box.addWidget(self.count_label)
+        info_inner = QVBoxLayout()
+        info_inner.setContentsMargins(0, 0, 0, 0)
+        info_inner.setSpacing(4)
+        info_inner.addWidget(self.info_label)
+        info_inner.addWidget(self.time_label)
+        info_inner.addWidget(self.elapsed_label)
+        info_inner.addWidget(self.count_label)
+
+        self.info_frame = QFrame()
+        self.info_frame.setFrameShape(QFrame.StyledPanel)
+        self.info_frame.setFrameShadow(QFrame.Plain)
+        info_frame_layout = QVBoxLayout(self.info_frame)
+        info_frame_layout.setContentsMargins(12, 8, 12, 8)
+        info_frame_layout.setSpacing(6)
+        info_frame_layout.addLayout(info_inner)
+
+        self.text_section = QFrame()
+        self.text_section.setFrameShape(QFrame.StyledPanel)
+        self.text_section.setFrameShadow(QFrame.Plain)
+        text_section_layout = QVBoxLayout(self.text_section)
+        text_section_layout.setContentsMargins(12, 12, 12, 12)
+        text_section_layout.setSpacing(10)
+        text_section_layout.addLayout(topbar)
+        text_section_layout.addWidget(self.info_frame)
 
         # 그래프 스냅샷
         self.graph_view = QLabel()
@@ -748,32 +791,15 @@ class AlertPopup(QWidget):
         self.graph_view.installEventFilter(self)
         self._graph_pixmap = QPixmap()
 
-        # 섹션 라벨/구분선
-        section_font = self.title_label.font()
-        section_font.setPointSize(13)
-        section_font.setBold(True)
-        self.graph_label = QLabel('그래프 (GUI 그래프 스냅샷 활용)')
-        self.graph_label.setFont(section_font)
-        self.graph_label.setAlignment(Qt.AlignLeft)
-        self.image_label = QLabel('이미지 (Particle 탐지 시 저장되는 파티클 마킹 이미지)')
-        self.image_label.setFont(section_font)
-        self.image_label.setAlignment(Qt.AlignLeft)
-        self.log_label = QLabel('로그 기록 (탐지/종료 등 주요 사항)')
-        log_font = self.log_label.font()
-        log_font.setPointSize(11)
-        self.log_label.setFont(log_font)
-        self.log_label.setAlignment(Qt.AlignLeft)
-
-        def _make_separator():
-            lab = QLabel('==============================================')
-            lab.setAlignment(Qt.AlignCenter)
-            lab.setStyleSheet("font-size: 13pt; font-weight: bold;")
-            return lab
+        graph_section = QGroupBox('그래프 (GUI 그래프 스냅샷 활용)')
+        graph_layout = QVBoxLayout(graph_section)
+        graph_layout.setContentsMargins(12, 12, 12, 12)
+        graph_layout.addWidget(self.graph_view)
 
         # 이미지 영역(가로 스크롤)
         self.img_container = QHBoxLayout()
         self.img_container.setSpacing(8)
-        self.img_container.setContentsMargins(6, 6, 6, 6)
+        self.img_container.setContentsMargins(8, 8, 8, 8)
         self.img_container.addStretch()
         self.img_widget = QWidget()
         self.img_widget.setLayout(self.img_container)
@@ -784,37 +810,30 @@ class AlertPopup(QWidget):
         self.img_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.img_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
+        image_section = QGroupBox('이미지 (Particle 탐지 시 저장되는 파티클 마킹 이미지)')
+        image_layout = QVBoxLayout(image_section)
+        image_layout.setContentsMargins(12, 12, 12, 12)
+        image_layout.addWidget(self.img_scroll)
+
         # 로그 영역
         self.log_edit = QTextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.setStyleSheet("QTextEdit{font-size:10pt}")
-        self.log_edit.setFixedHeight(100)
+        self.log_edit.setFixedHeight(120)
 
-        # 버튼
-        self.btn_false = QPushButton('오탐지')
-        self.btn_ok = QPushButton('확인')
-        btn_bar = QHBoxLayout()
-        btn_bar.addStretch()
-        btn_bar.addWidget(self.btn_false)
-        btn_bar.addWidget(self.btn_ok)
+        log_section = QGroupBox('로그 기록 (탐지/종료 등 주요 사항)')
+        log_layout = QVBoxLayout(log_section)
+        log_layout.setContentsMargins(12, 12, 12, 12)
+        log_layout.addWidget(self.log_edit)
 
         # 메인 레이아웃
         main = QVBoxLayout(self)
-        main.addLayout(topbar)
-        main.addSpacing(6)
-        main.addLayout(info_box)
-        main.addSpacing(6)
-        main.addWidget(_make_separator())
-        main.addWidget(self.graph_label)
-        main.addWidget(self.graph_view)
-        main.addSpacing(6)
-        main.addWidget(self.image_label)
-        main.addWidget(self.img_scroll)
-        main.addWidget(_make_separator())
-        main.addWidget(self.log_label)
-        main.addWidget(self.log_edit)
-        main.addWidget(_make_separator())
-        main.addLayout(btn_bar)
+        main.setContentsMargins(12, 12, 12, 12)
+        main.setSpacing(12)
+        main.addWidget(self.text_section)
+        main.addWidget(graph_section)
+        main.addWidget(image_section)
+        main.addWidget(log_section)
 
         # 시그널 연결
         self.btn_ok.clicked.connect(lambda: self._close_with('ok'))
@@ -841,14 +860,14 @@ class AlertPopup(QWidget):
     def stop_blink(self):
         self._blink_timer.stop()
         self._blink_red = False
-        self.setStyleSheet("")
+        self.text_section.setStyleSheet("")
 
     def _toggle_blink(self):
         self._blink_red = not self._blink_red
         if self._blink_red:
-            self.setStyleSheet("background-color: rgba(255,30,30,0.25);")
+            self.text_section.setStyleSheet("QFrame {background-color: rgba(255,30,30,0.25);}")
         else:
-            self.setStyleSheet("")
+            self.text_section.setStyleSheet("")
 
     def _update_ignore_checkbox_text(self):
         value = self.ignore_min_spin.value()
@@ -867,14 +886,22 @@ class AlertPopup(QWidget):
         secs = self._first_dt.secsTo(QDateTime.currentDateTime())
         if secs < 0:
             secs = 0
-        mm = secs // 60
+        hh = secs // 3600
+        mm = (secs % 3600) // 60
         ss = secs % 60
-        self.elapsed_label.setText(f"- [경과 시간] {mm:02d}분 {ss:02d}초")
+        self.elapsed_label.setText(f"- [경과 시간] {hh:02d}시간 {mm:02d}분 {ss:02d}초")
 
     def set_info(self, base_info_text: str, when_text: str, count_text: str):
-        self.info_label.setText(f"- [기본 정보] Puller / Lot# / Process : {base_info_text}")
+        display_text = self._format_base_info(base_info_text)
+        self.info_label.setText(f"- [기본 정보] {display_text}")
         self.time_label.setText(f"- [발생 시각] {when_text}")
         self.count_label.setText(f"- [누적 횟수] {count_text}")
+
+    def _format_base_info(self, text: str) -> str:
+        parts = text.split('_')
+        if len(parts) >= 4:
+            return '_'.join(parts[:4])
+        return text
 
     def set_graph_pixmap(self, pm: QPixmap):
         if pm is None or pm.isNull():
