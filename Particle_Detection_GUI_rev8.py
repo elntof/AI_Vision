@@ -3,6 +3,7 @@ import sys
 import io
 from pathlib import Path
 import time
+import re
 import numpy as np
 import cv2
 import pandas as pd
@@ -788,15 +789,15 @@ class AlertPopup(QWidget):
         self.graph_view.installEventFilter(self)
         self._graph_pixmap = QPixmap()
 
-        graph_section = QGroupBox('그래프 (GUI 그래프 스냅샷 활용)')
+        graph_section = QGroupBox('그래프')
         graph_layout = QVBoxLayout(graph_section)
         graph_layout.setContentsMargins(12, 12, 12, 12)
         graph_layout.addWidget(self.graph_view)
 
         # 이미지 영역(가로 스크롤)
         self.img_container = QHBoxLayout()
-        self.img_container.setSpacing(8)
-        self.img_container.setContentsMargins(8, 8, 8, 8)
+        self.img_container.setSpacing(4)
+        self.img_container.setContentsMargins(6, 6, 6, 6)
         self.img_container.addStretch()
         self.img_widget = QWidget()
         self.img_widget.setLayout(self.img_container)
@@ -807,7 +808,7 @@ class AlertPopup(QWidget):
         self.img_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.img_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
-        image_section = QGroupBox('이미지 (Particle 탐지 시 저장되는 파티클 마킹 이미지)')
+        image_section = QGroupBox('탐지 이미지')
         image_layout = QVBoxLayout(image_section)
         image_layout.setContentsMargins(12, 12, 12, 12)
         image_layout.addWidget(self.img_scroll)
@@ -817,8 +818,9 @@ class AlertPopup(QWidget):
         self.log_edit.setReadOnly(True)
         self.log_edit.setStyleSheet("QTextEdit{font-size:10pt}")
         self.log_edit.setMinimumHeight(260)
+        self.log_edit.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
-        log_section = QGroupBox('로그 기록 (탐지/종료 등 주요 사항)')
+        log_section = QGroupBox('로그 히스토리')
         log_layout = QVBoxLayout(log_section)
         log_layout.setContentsMargins(12, 12, 12, 12)
         log_layout.addWidget(self.log_edit)
@@ -829,7 +831,7 @@ class AlertPopup(QWidget):
         graph_log_layout = QHBoxLayout()
         graph_log_layout.setContentsMargins(0, 0, 0, 0)
         graph_log_layout.setSpacing(12)
-        graph_log_layout.addWidget(graph_section, 2)
+        graph_log_layout.addWidget(graph_section, 1)
         graph_log_layout.addWidget(log_section, 1)
 
         # 메인 레이아웃
@@ -855,7 +857,7 @@ class AlertPopup(QWidget):
         self._elapsed_timer.timeout.connect(self._update_elapsed)
 
         # 이미지 관리
-        self._pix_labels: list[QLabel] = []
+        self._pix_labels: list[QWidget] = []
 
     def start_blink(self):
         self._blink_timer.start(500)  # 0.5초 주기
@@ -876,7 +878,7 @@ class AlertPopup(QWidget):
 
     def _update_ignore_checkbox_text(self):
         value = self.ignore_min_spin.value()
-        self.ignore_cb.setText(f"{value:02d}분간 팝업 무시")
+        self.ignore_cb.setText(f"{value:02d}분 팝업 무시")
 
     def set_first_detect_time(self, qdt: QDateTime):
         self._first_dt = qdt
@@ -916,9 +918,13 @@ class AlertPopup(QWidget):
         self._graph_pixmap = QPixmap(pm)
         self._refresh_graph_view()
 
-    def append_log(self, text: str):
-        ts = time.strftime('%H:%M:%S')
+    def append_log(self, text: str, when: QDateTime | None = None):
+        if when is None:
+            when = QDateTime.currentDateTime()
+        ts = when.toString('yy/MM/dd_HH:mm')
         self.log_edit.append(f"[{ts}] {text}")
+        if self.log_edit.verticalScrollBar() is not None:
+            self.log_edit.verticalScrollBar().setValue(self.log_edit.verticalScrollBar().maximum())
 
     def set_images(self, image_paths: list[Path]):
         # 기존 라벨 제거
@@ -930,13 +936,26 @@ class AlertPopup(QWidget):
         # 최대 5장, 좌->우
         for p in image_paths[:5]:
             pix = self._load_pix(p)
-            lab = QLabel()
-            lab.setPixmap(pix)
-            lab.setAlignment(Qt.AlignCenter)
-            lab.setFixedSize(180, 240)
-            lab.setToolTip(p.name)
-            self.img_container.insertWidget(self.img_container.count()-1, lab)
-            self._pix_labels.append(lab)
+            image_label = QLabel()
+            image_label.setPixmap(pix)
+            image_label.setAlignment(Qt.AlignCenter)
+            image_label.setFixedSize(180, 240)
+            image_label.setToolTip(p.name)
+
+            ts_label = QLabel(f"[{self._format_image_timestamp(p)}]")
+            ts_label.setAlignment(Qt.AlignCenter)
+            ts_label.setStyleSheet("color: #333; font-size: 10pt;")
+
+            wrapper = QWidget()
+            wrapper_layout = QVBoxLayout(wrapper)
+            wrapper_layout.setContentsMargins(2, 2, 2, 2)
+            wrapper_layout.setSpacing(4)
+            wrapper_layout.addWidget(ts_label)
+            wrapper_layout.addWidget(image_label)
+            wrapper_layout.addStretch()
+
+            self.img_container.insertWidget(self.img_container.count()-1, wrapper)
+            self._pix_labels.append(wrapper)
 
     def _load_pix(self, p: Path) -> QPixmap:
         img = safe_image_load(str(p))
@@ -946,6 +965,32 @@ class AlertPopup(QWidget):
         h, w, _ = img.shape
         qimg = QImage(img.data, w, h, 3*w, QImage.Format_RGB888)
         return QPixmap.fromImage(qimg).scaled(180, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+    def _format_image_timestamp(self, path: Path) -> str:
+        qdt = self._extract_image_datetime(path)
+        return qdt.toString('yy/MM/dd_HH:mm')
+
+    def _extract_image_datetime(self, path: Path) -> QDateTime:
+        stem = path.stem
+        m = re.search(r'(\d{4})(\d{2})(\d{2})[_-]?(\d{2})(\d{2})(\d{0,2})', stem)
+        if m:
+            yyyy = int(m.group(1))
+            mm = int(m.group(2))
+            dd = int(m.group(3))
+            hh = int(m.group(4))
+            mi = int(m.group(5))
+            ss = int(m.group(6)) if m.group(6) else 0
+            qdt = QDateTime(yyyy, mm, dd, hh, mi, ss)
+            if qdt.isValid():
+                return qdt
+        try:
+            stat = path.stat()
+            qdt = QDateTime.fromSecsSinceEpoch(int(stat.st_mtime), Qt.LocalTime)
+            if qdt.isValid():
+                return qdt
+        except Exception:
+            pass
+        return QDateTime.currentDateTime()
 
     def _refresh_graph_view(self):
         if self._graph_pixmap.isNull():
@@ -973,6 +1018,15 @@ class AlertPopup(QWidget):
         self._elapsed_timer.stop()
         self._first_dt = None
         snooze_min = self.ignore_min_spin.value() if self.ignore_cb.isChecked() else 0
+        now = QDateTime.currentDateTime()
+        if snooze_min > 0:
+            self.append_log(f"{snooze_min:02d}분 팝업 무시 체크", now)
+        if reason == 'false':
+            self.append_log('오탐지 종료', now)
+        elif reason == 'ok':
+            self.append_log('확인 종료', now)
+        else:
+            self.append_log('창 종료', now)
         self.closedWithAction.emit(reason, snooze_min)
         self.close()
 
@@ -1738,7 +1792,7 @@ class ParticleDetectionGUI(QWidget):
         self._popup_detect_dt = event_dt
 
         # 머릿글/정보/그래프/이미지 세팅
-        base_info_text = info['stem']  # 예: A6_WY6NQ_NECK_1
+        base_info_text = info['stem']
         when_text = self._when_text(event_dt)
         count_text = f"{self.lot_event_count}회"
 
@@ -1746,7 +1800,7 @@ class ParticleDetectionGUI(QWidget):
         pop.set_first_detect_time(event_dt)
         pop.set_graph_pixmap(self._graph_pixmap())
         pop.set_images(list(self._popup_images))
-        pop.append_log(f"탐지 반영: {event_image_path.name} ({when_text})")
+        pop.append_log(f"Particle 탐지 {self.lot_event_count}회", event_dt)
         pop.start_blink()
 
         # 이미 떠 있으면 내용만 갱신, 없으면 표시
