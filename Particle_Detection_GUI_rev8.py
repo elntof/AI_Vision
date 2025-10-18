@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QSizePolicy, QLineEdit, QLayout, QCheckBox, QTextEdit, QScrollArea,
     QFrame, QSpacerItem
 )
-from PySide6.QtCore import Qt, QTimer, QSettings, QRect, QThread, QObject, Signal, Slot, QDateTime
+from PySide6.QtCore import Qt, QTimer, QSettings, QRect, QThread, QObject, Signal, Slot, QDateTime, QEvent
 from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen
 import csv
 import tempfile
@@ -698,23 +698,25 @@ class AlertPopup(QWidget):
         self.title_label.setAlignment(Qt.AlignCenter)
 
         # 우측 상단: 팝업 무시 옵션
-        self.ignore_cb = QCheckBox('팝업 무시')
+        self.ignore_cb = QCheckBox()
         self.ignore_min_spin = QSpinBox()
         self.ignore_min_spin.setRange(1, 120)
         self.ignore_min_spin.setValue(5)  # Default 5분
-        self.ignore_suffix = QLabel('분간')
+        self.ignore_min_spin.setFixedWidth(60)
         small_font = self.ignore_cb.font()
         small_font.setPointSize(9)
         self.ignore_cb.setFont(small_font)
         self.ignore_min_spin.setFont(small_font)
-        self.ignore_suffix.setFont(small_font)
+        self.ignore_cb.setChecked(False)
 
         topbar = QHBoxLayout()
         topbar.addWidget(self.title_label, 1)
         topbar.addStretch(1)
         topbar.addWidget(self.ignore_cb)
         topbar.addWidget(self.ignore_min_spin)
-        topbar.addWidget(self.ignore_suffix)
+        self.ignore_cb.toggled.connect(self._update_ignore_checkbox_text)
+        self.ignore_min_spin.valueChanged.connect(self._update_ignore_checkbox_text)
+        self._update_ignore_checkbox_text()
 
         # 기본 정보/시간/누적
         self.info_label = QLabel('')
@@ -727,6 +729,9 @@ class AlertPopup(QWidget):
         self.time_label.setFont(info_font)
         self.elapsed_label.setFont(info_font)
         self.count_label.setFont(info_font)
+        for lab in (self.info_label, self.time_label, self.elapsed_label, self.count_label):
+            lab.setAlignment(Qt.AlignLeft)
+        self.elapsed_label.setText('- [경과 시간] -')
 
         info_box = QVBoxLayout()
         info_box.addWidget(self.info_label)
@@ -739,10 +744,36 @@ class AlertPopup(QWidget):
         self.graph_view.setFixedHeight(260)
         self.graph_view.setFrameShape(QFrame.Box)
         self.graph_view.setAlignment(Qt.AlignCenter)
+        self.graph_view.setStyleSheet("background-color: white;")
+        self.graph_view.installEventFilter(self)
+        self._graph_pixmap = QPixmap()
+
+        # 섹션 라벨/구분선
+        section_font = self.title_label.font()
+        section_font.setPointSize(13)
+        section_font.setBold(True)
+        self.graph_label = QLabel('그래프 (GUI 그래프 스냅샷 활용)')
+        self.graph_label.setFont(section_font)
+        self.graph_label.setAlignment(Qt.AlignLeft)
+        self.image_label = QLabel('이미지 (Particle 탐지 시 저장되는 파티클 마킹 이미지)')
+        self.image_label.setFont(section_font)
+        self.image_label.setAlignment(Qt.AlignLeft)
+        self.log_label = QLabel('로그 기록 (탐지/종료 등 주요 사항)')
+        log_font = self.log_label.font()
+        log_font.setPointSize(11)
+        self.log_label.setFont(log_font)
+        self.log_label.setAlignment(Qt.AlignLeft)
+
+        def _make_separator():
+            lab = QLabel('==============================================')
+            lab.setAlignment(Qt.AlignCenter)
+            lab.setStyleSheet("font-size: 13pt; font-weight: bold;")
+            return lab
 
         # 이미지 영역(가로 스크롤)
         self.img_container = QHBoxLayout()
         self.img_container.setSpacing(8)
+        self.img_container.setContentsMargins(6, 6, 6, 6)
         self.img_container.addStretch()
         self.img_widget = QWidget()
         self.img_widget.setLayout(self.img_container)
@@ -750,6 +781,8 @@ class AlertPopup(QWidget):
         self.img_scroll.setWidgetResizable(True)
         self.img_scroll.setWidget(self.img_widget)
         self.img_scroll.setFixedHeight(260)
+        self.img_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.img_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         # 로그 영역
         self.log_edit = QTextEdit()
@@ -771,16 +804,16 @@ class AlertPopup(QWidget):
         main.addSpacing(6)
         main.addLayout(info_box)
         main.addSpacing(6)
-        main.addWidget(QLabel('=============================================='))
-        main.addWidget(QLabel('그래프'))
+        main.addWidget(_make_separator())
+        main.addWidget(self.graph_label)
         main.addWidget(self.graph_view)
         main.addSpacing(6)
-        main.addWidget(QLabel('이미지'))
+        main.addWidget(self.image_label)
         main.addWidget(self.img_scroll)
-        main.addWidget(QLabel('=============================================='))
-        main.addWidget(QLabel('로그 기록 (탐지/종료 등 주요 사항)'))
+        main.addWidget(_make_separator())
+        main.addWidget(self.log_label)
         main.addWidget(self.log_edit)
-        main.addWidget(QLabel('=============================================='))
+        main.addWidget(_make_separator())
         main.addLayout(btn_bar)
 
         # 시그널 연결
@@ -802,9 +835,12 @@ class AlertPopup(QWidget):
 
     def start_blink(self):
         self._blink_timer.start(500)  # 0.5초 주기
+        self._blink_red = False
+        self._toggle_blink()
 
     def stop_blink(self):
         self._blink_timer.stop()
+        self._blink_red = False
         self.setStyleSheet("")
 
     def _toggle_blink(self):
@@ -814,32 +850,39 @@ class AlertPopup(QWidget):
         else:
             self.setStyleSheet("")
 
+    def _update_ignore_checkbox_text(self):
+        value = self.ignore_min_spin.value()
+        self.ignore_cb.setText(f"{value:02d}분간 팝업 무시")
+
     def set_first_detect_time(self, qdt: QDateTime):
         self._first_dt = qdt
+        self._elapsed_timer.stop()
         self._elapsed_timer.start(1000)
         self._update_elapsed()
 
     def _update_elapsed(self):
         if not self._first_dt:
-            self.elapsed_label.setText('[경과 시간] -')
+            self.elapsed_label.setText('- [경과 시간] -')
             return
         secs = self._first_dt.secsTo(QDateTime.currentDateTime())
         if secs < 0:
             secs = 0
         mm = secs // 60
         ss = secs % 60
-        self.elapsed_label.setText(f"[경과 시간] {mm:02d}분 {ss:02d}초")
+        self.elapsed_label.setText(f"- [경과 시간] {mm:02d}분 {ss:02d}초")
 
     def set_info(self, base_info_text: str, when_text: str, count_text: str):
-        self.info_label.setText(f"[기본 정보] Puller / Lot# / Process : {base_info_text}")
-        self.time_label.setText(f"[발생 시각] {when_text}")
-        self.count_label.setText(f"[누적 횟수] {count_text}")
+        self.info_label.setText(f"- [기본 정보] Puller / Lot# / Process : {base_info_text}")
+        self.time_label.setText(f"- [발생 시각] {when_text}")
+        self.count_label.setText(f"- [누적 횟수] {count_text}")
 
     def set_graph_pixmap(self, pm: QPixmap):
-        if pm is None:
+        if pm is None or pm.isNull():
+            self._graph_pixmap = QPixmap()
             self.graph_view.clear()
             return
-        self.graph_view.setPixmap(pm.scaled(self.graph_view.width(), self.graph_view.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self._graph_pixmap = QPixmap(pm)
+        self._refresh_graph_view()
 
     def append_log(self, text: str):
         ts = time.strftime('%H:%M:%S')
@@ -860,6 +903,7 @@ class AlertPopup(QWidget):
             lab.setAlignment(Qt.AlignCenter)
             lab.setFixedSize(180, 240)
             lab.setFrameShape(QFrame.Box)
+            lab.setToolTip(p.name)
             self.img_container.insertWidget(self.img_container.count()-1, lab)
             self._pix_labels.append(lab)
 
@@ -872,8 +916,31 @@ class AlertPopup(QWidget):
         qimg = QImage(img.data, w, h, 3*w, QImage.Format_RGB888)
         return QPixmap.fromImage(qimg).scaled(180, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
+    def _refresh_graph_view(self):
+        if self._graph_pixmap.isNull():
+            self.graph_view.clear()
+            return
+        size = self.graph_view.size()
+        w = max(1, size.width())
+        h = max(1, size.height())
+        scaled = self._graph_pixmap.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.graph_view.setPixmap(scaled)
+
+    def eventFilter(self, obj, event):
+        if obj is self.graph_view and event.type() == QEvent.Resize:
+            self._refresh_graph_view()
+        return super().eventFilter(obj, event)
+
+    def closeEvent(self, event):
+        self.stop_blink()
+        self._elapsed_timer.stop()
+        self._first_dt = None
+        super().closeEvent(event)
+
     def _close_with(self, reason: str):
         self.stop_blink()
+        self._elapsed_timer.stop()
+        self._first_dt = None
         snooze_min = self.ignore_min_spin.value() if self.ignore_cb.isChecked() else 0
         self.closedWithAction.emit(reason, snooze_min)
         self.close()
@@ -925,7 +992,7 @@ class ParticleDetectionGUI(QWidget):
         self.popup_snooze_until = 0.0
         self.lot_event_count = 0
         self._popup_images = deque(maxlen=5)  # 최근 탐지 이미지 경로 (좌->우)
-        self._popup_first_dt: QDateTime | None = None
+        self._popup_detect_dt: QDateTime | None = None  # 팝업 표시 중 가장 최근 발생 시각
 
         # crop1 영역 Spinbox 설정 및 저장값 로딩
         self.crop1_x = QSpinBox(maximum=9999)
@@ -1324,7 +1391,7 @@ class ParticleDetectionGUI(QWidget):
                 self.processed_images.clear()
                 self.lot_event_count = 0  # 누적 횟수 리셋
                 self._popup_images.clear()
-                self._popup_first_dt = None
+                self._popup_detect_dt = None
                 if self.alert_popup:
                     self.alert_popup.close()
                     self.alert_popup = None
@@ -1635,21 +1702,20 @@ class ParticleDetectionGUI(QWidget):
         self._push_popup_image(event_image_path)
         pop = self._ensure_popup()
 
-        # 최초 발생 시각(팝업 세션 기준)
-        if self._popup_first_dt is None:
-            self._popup_first_dt = self._parse_info_datetime(info)
-        first_dt = self._popup_first_dt
+        # 발생 시각(팝업 세션 기준: 최신 탐지 시간으로 갱신)
+        event_dt = self._parse_info_datetime(info)
+        self._popup_detect_dt = event_dt
 
         # 머릿글/정보/그래프/이미지 세팅
         base_info_text = info['stem']  # 예: A6_WY6NQ_NECK_1
-        when_text = self._when_text(first_dt)
+        when_text = self._when_text(event_dt)
         count_text = f"{self.lot_event_count}회"
 
         pop.set_info(base_info_text, when_text, count_text)
-        pop.set_first_detect_time(first_dt)
+        pop.set_first_detect_time(event_dt)
         pop.set_graph_pixmap(self._graph_pixmap())
         pop.set_images(list(self._popup_images))
-        pop.append_log(f"탐지 반영: {event_image_path.name}")
+        pop.append_log(f"탐지 반영: {event_image_path.name} ({when_text})")
         pop.start_blink()
 
         # 이미 떠 있으면 내용만 갱신, 없으면 표시
@@ -1670,7 +1736,7 @@ class ParticleDetectionGUI(QWidget):
             pass
         # 팝업 세션 초기화 (다음 탐지 시 새 세션으로 경과 시간/이미지 시작)
         self._popup_images.clear()
-        self._popup_first_dt = None
+        self._popup_detect_dt = None
         self.alert_popup = None
 
     # =========================
