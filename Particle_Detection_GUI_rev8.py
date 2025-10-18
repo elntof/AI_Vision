@@ -695,7 +695,7 @@ class AlertPopup(QWidget):
         f.setPointSize(24)
         f.setBold(True)
         self.title_label.setFont(f)
-        self.title_label.setAlignment(Qt.AlignCenter)
+        self.title_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
         # 우측 상단: 팝업 무시 옵션
         self.ignore_cb = QCheckBox()
@@ -765,27 +765,24 @@ class AlertPopup(QWidget):
         info_inner.addWidget(self.elapsed_label)
         info_inner.addWidget(self.count_label)
 
-        self.info_frame = QFrame()
-        self.info_frame.setFrameShape(QFrame.StyledPanel)
-        self.info_frame.setFrameShadow(QFrame.Plain)
-        info_frame_layout = QVBoxLayout(self.info_frame)
-        info_frame_layout.setContentsMargins(12, 8, 12, 8)
-        info_frame_layout.setSpacing(6)
-        info_frame_layout.addLayout(info_inner)
+        self.info_group_container = QWidget()
+        self.info_group_container.setObjectName('infoGroupBody')
+        container_layout = QVBoxLayout(self.info_group_container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(10)
+        container_layout.addLayout(topbar)
+        container_layout.addLayout(info_inner)
 
-        self.text_section = QFrame()
-        self.text_section.setFrameShape(QFrame.StyledPanel)
-        self.text_section.setFrameShadow(QFrame.Plain)
-        text_section_layout = QVBoxLayout(self.text_section)
-        text_section_layout.setContentsMargins(12, 12, 12, 12)
-        text_section_layout.setSpacing(10)
-        text_section_layout.addLayout(topbar)
-        text_section_layout.addWidget(self.info_frame)
+        self.info_group = QGroupBox('발생 정보')
+        info_group_layout = QVBoxLayout()
+        info_group_layout.setContentsMargins(12, 16, 12, 12)
+        info_group_layout.setSpacing(8)
+        info_group_layout.addWidget(self.info_group_container)
+        self.info_group.setLayout(info_group_layout)
 
         # 그래프 스냅샷
         self.graph_view = QLabel()
         self.graph_view.setFixedHeight(260)
-        self.graph_view.setFrameShape(QFrame.Box)
         self.graph_view.setAlignment(Qt.AlignCenter)
         self.graph_view.setStyleSheet("background-color: white;")
         self.graph_view.installEventFilter(self)
@@ -819,21 +816,29 @@ class AlertPopup(QWidget):
         self.log_edit = QTextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.setStyleSheet("QTextEdit{font-size:10pt}")
-        self.log_edit.setFixedHeight(120)
+        self.log_edit.setMinimumHeight(260)
 
         log_section = QGroupBox('로그 기록 (탐지/종료 등 주요 사항)')
         log_layout = QVBoxLayout(log_section)
         log_layout.setContentsMargins(12, 12, 12, 12)
         log_layout.addWidget(self.log_edit)
 
+        graph_section.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        log_section.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        graph_log_layout = QHBoxLayout()
+        graph_log_layout.setContentsMargins(0, 0, 0, 0)
+        graph_log_layout.setSpacing(12)
+        graph_log_layout.addWidget(graph_section, 2)
+        graph_log_layout.addWidget(log_section, 1)
+
         # 메인 레이아웃
         main = QVBoxLayout(self)
         main.setContentsMargins(12, 12, 12, 12)
         main.setSpacing(12)
-        main.addWidget(self.text_section)
-        main.addWidget(graph_section)
+        main.addWidget(self.info_group)
+        main.addLayout(graph_log_layout)
         main.addWidget(image_section)
-        main.addWidget(log_section)
 
         # 시그널 연결
         self.btn_ok.clicked.connect(lambda: self._close_with('ok'))
@@ -860,14 +865,14 @@ class AlertPopup(QWidget):
     def stop_blink(self):
         self._blink_timer.stop()
         self._blink_red = False
-        self.text_section.setStyleSheet("")
+        self.info_group_container.setStyleSheet("")
 
     def _toggle_blink(self):
         self._blink_red = not self._blink_red
         if self._blink_red:
-            self.text_section.setStyleSheet("QFrame {background-color: rgba(255,30,30,0.25);}")
+            self.info_group_container.setStyleSheet("#infoGroupBody {background-color: rgba(255,30,30,0.25); border-radius:8px;}")
         else:
-            self.text_section.setStyleSheet("")
+            self.info_group_container.setStyleSheet("")
 
     def _update_ignore_checkbox_text(self):
         value = self.ignore_min_spin.value()
@@ -929,7 +934,6 @@ class AlertPopup(QWidget):
             lab.setPixmap(pix)
             lab.setAlignment(Qt.AlignCenter)
             lab.setFixedSize(180, 240)
-            lab.setFrameShape(QFrame.Box)
             lab.setToolTip(p.name)
             self.img_container.insertWidget(self.img_container.count()-1, lab)
             self._pix_labels.append(lab)
@@ -1761,8 +1765,7 @@ class ParticleDetectionGUI(QWidget):
         if reason == 'false':
             # 오탐지 로그만 (데이터 롤백은 요구사항에 명시X)
             pass
-        # 팝업 세션 초기화 (다음 탐지 시 새 세션으로 경과 시간/이미지 시작)
-        self._popup_images.clear()
+        # 팝업 세션 초기화 (다음 탐지 시 새 세션으로 경과 시간 시작)
         self._popup_detect_dt = None
         self.alert_popup = None
 
