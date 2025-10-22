@@ -281,11 +281,13 @@ os.makedirs(GRAPH_OUTPUT_DIR, exist_ok=True)
 # ===========================
 # 파티클 탐지 파라미터
 # ===========================
+WARMUP_FRAMES      = 10        # 워밍업 프레임 수
 MANUAL_THRESHOLD   = 7         # 이진화 임계값
 KERNEL_SIZE_TOPHAT = (3, 3)    # tophat 모폴로지 연산 커널 크기
 KERNEL_SIZE_MORPH  = (3, 3)    # 모폴로지 클로즈 연산 커널 크기
 PARTICLE_AREA_MIN  = 8         # 파티클 최소 면적
 PARTICLE_AREA_MAX  = 50        # 파티클 최대 면적
+WARMUP_NOISE_AREA_MIN = 6      # 워밍업 노이즈 판별 전용 최소 면적
 
 # 파티클 표기 원 파라미터 (유효/노이즈)
 VALID_CIRCLE_RADIUS    = 25    # 유효(빨강) 원 반지름
@@ -372,7 +374,7 @@ def compute_adaptive_threshold(anchor_current: int | float | None) -> int:
     return int(round(adaptive_value))
 
 
-def particle_detection(image_path, exclude_boxes, threshold=None):
+def particle_detection(image_path, exclude_boxes, threshold=None, area_min=PARTICLE_AREA_MIN, area_max=PARTICLE_AREA_MAX):
     """파티클 탐지 (OpenCV 파이프라인)"""
     img = safe_image_load(image_path)
     if img is None:
@@ -401,7 +403,7 @@ def particle_detection(image_path, exclude_boxes, threshold=None):
         for i in range(1, num_labels):
             area = stats[i, cv2.CC_STAT_AREA]
             cx, cy = int(centroids[i][0]), int(centroids[i][1])
-            if PARTICLE_AREA_MIN <= area <= PARTICLE_AREA_MAX:
+            if area_min <= area <= area_max:
                 particle_info.append((cx, cy, area))
         return gray, vis_img, particle_info
     except Exception as e:
@@ -1090,11 +1092,11 @@ class ParticleDetectionGUI(QWidget):
 
         # crop2 영역 Spinbox 설정 및 저장값 로딩
         self.crop2_x = QSpinBox(maximum=9999)
-        self.crop2_x.setValue(int(self.settings.value('crop2_x', 118)))
+        self.crop2_x.setValue(int(self.settings.value('crop2_x', 113)))
         self.crop2_y = QSpinBox(maximum=9999)
         self.crop2_y.setValue(int(self.settings.value('crop2_y', 110)))
         self.crop2_w = QSpinBox(maximum=9999)
-        self.crop2_w.setValue(int(self.settings.value('crop2_w', 40)))
+        self.crop2_w.setValue(int(self.settings.value('crop2_w', 50)))
         self.crop2_h = QSpinBox(maximum=9999)
         self.crop2_h.setValue(int(self.settings.value('crop2_h', 120)))
 
@@ -1144,7 +1146,7 @@ class ParticleDetectionGUI(QWidget):
         btns.addWidget(self.save_opt_button)
         left_panel.addLayout(btns)
 
-        crop_box = QGroupBox('제외 영역 설정')
+        crop_box = QGroupBox(' 제외 영역 설정 ')
         crop_vbox = QVBoxLayout()
 
         crop_hbox1 = QHBoxLayout()
@@ -1336,7 +1338,8 @@ class ParticleDetectionGUI(QWidget):
         self.show_noise_text = False
         self._update_noise_text()
 
-        self.status_label.setText("초기 워밍업 중... (최초 10장 데이터 수집)")
+        # ▼ 변경: 하드코딩된 '10장'을 상수 사용으로 변경
+        self.status_label.setText(f"초기 워밍업 중... (최초 {WARMUP_FRAMES}장 데이터 수집)")
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
 
@@ -1502,7 +1505,7 @@ class ParticleDetectionGUI(QWidget):
                         pass
 
                 # 워밍업/Noise/상태 리셋
-                self._reset_noise_warmup("LOT 변경 감지 → 워밍업 재시작 (10장)")
+                self._reset_noise_warmup(f"LOT 변경 감지 → 워밍업 재시작 ({WARMUP_FRAMES}장)")
 
                 # 빈 CSV 기반 그래프 즉시 초기화
                 self.update_graph()
@@ -1512,7 +1515,7 @@ class ParticleDetectionGUI(QWidget):
                     self.current_attempt = attempt_value
                 elif self.current_attempt != attempt_value:
                     self.current_attempt = attempt_value
-                    self._reset_noise_warmup("Attempt 변경 감지 → 워밍업 재시작 (10장)")
+                    self._reset_noise_warmup(f"Attempt 변경 감지 → 워밍업 재시작 ({WARMUP_FRAMES}장)")
 
             # Lot 전환 이후 CSV 기반 중복 세트 로딩이 완료된 상태에서 중복 여부 재확인
             if img_name in self.processed_images:
@@ -1550,6 +1553,7 @@ class ParticleDetectionGUI(QWidget):
                     self.disallowed_mode_latched = False
 
             # 현재 처리 대상 파일 기준으로 이미지 미리보기 표기 + 앵커값
+            anchor_current = None
             img_preview = safe_image_load(str(img_path))
             if img_preview is not None:
                 gray_prev = cv2.cvtColor(img_preview, cv2.COLOR_BGR2GRAY)
@@ -1559,18 +1563,18 @@ class ParticleDetectionGUI(QWidget):
             else:
                 self.preview_label.set_anchor_value(None)
 
-            # 현재 Noise 정보 텍스트 갱신
+            # 현재 Noise 정보 텍스트 갱신 및 임계값 계산
             adaptive_value = compute_adaptive_threshold(anchor_current)
             self._update_noise_text()
 
             # 워밍업 구간 (최초 10장 동안은 '판정/CSV/그래프' 수행하지 않음)
             if self.collecting_initial:
-                self.status_label.setText(f"초기 워밍업 수집 중... ({len(self.frame_buffer) + 1} / 10)")
+                self.status_label.setText(f"초기 워밍업 수집 중... ({len(self.frame_buffer) + 1} / {WARMUP_FRAMES})")
                 self.show_noise_text = False
                 self._update_noise_text()
 
                 # 후보 파티클만 수집(판정/CSV/그래프/이벤트 저장 없음)
-                _, _, particle_info = particle_detection(str(img_path), [self.get_box1(), self.get_box2()], adaptive_value)
+                _, _, particle_info = particle_detection(str(img_path), [self.get_box1(), self.get_box2()], adaptive_value, area_min=WARMUP_NOISE_AREA_MIN, area_max=PARTICLE_AREA_MAX)
                 if particle_info is None:
                     # 로딩/후보 추출 실패 시 스킵
                     self.status_label.setText(f"오류: {img_path.name} 로딩/후보 추출 실패 (워밍업)")
@@ -1579,14 +1583,16 @@ class ParticleDetectionGUI(QWidget):
 
                 self.frame_buffer.append(particle_info)
 
-                if len(self.frame_buffer) >= 10:
+                if len(self.frame_buffer) >= WARMUP_FRAMES:
                     # (x,y,area) 빈도 집계: 2회 이상 등장 좌표를 노이즈 기준으로 채택
                     freq = {}
                     for frame_particles in self.frame_buffer:
                         for (x, y, area) in frame_particles:
                             key = (x, y, area)
                             freq[key] = freq.get(key, 0) + 1
-                    self.prev_particles = [k for k, v in freq.items() if v >= 2] or (self.frame_buffer[-1] if self.frame_buffer else [])
+                    self.prev_particles = [k for k, v in freq.items() if v >= 2] or (
+                        self.frame_buffer[-1] if self.frame_buffer else []
+                    )
 
                     # 워밍업 종료 이후부터 '허용 모드의 판정 이미지'에서 [Noise] 표기/적용
                     self.collecting_initial = False
