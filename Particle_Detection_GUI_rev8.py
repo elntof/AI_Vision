@@ -1217,9 +1217,7 @@ class ParticleDetectionGUI(QWidget):
         self._stop_timer.timeout.connect(self._check_stop_or_disable_and_quit)
         self._stop_timer.start()
 
-    # =========================
-    # 내부 헬퍼
-    # =========================
+
     def _set_status(self, text: str, hold_s: float = 0.0):
         """상태 텍스트 세터 (동일 텍스트 중복 세팅 방지 + 홀드 지원)"""
         if hold_s <= 0.0 and self.status_label.text() == text:
@@ -1324,9 +1322,7 @@ class ParticleDetectionGUI(QWidget):
         except Exception:
             self.preview_label.clear()
 
-    # =========================
-    # 시작/중지/옵션 저장
-    # =========================
+
     def start_realtime(self):
         """실시간 파티클 판정 시작 (백로그 → 라이브 테일 순)"""
         # 워밍업 초기화
@@ -1403,9 +1399,7 @@ class ParticleDetectionGUI(QWidget):
         self.settings.sync()
         self.status_label.setText("설정 저장됨.")
 
-    # =========================
-    # 라이브 테일링/백로그 완료
-    # =========================
+
     def process_new_images_tick(self):
         """(실시간)신규 이미지 처리"""
         new_images = find_new_images(IMG_INPUT_DIR, self.session_processed_images)
@@ -1431,9 +1425,7 @@ class ParticleDetectionGUI(QWidget):
         self.update_preview()
         self.tail_timer.start(200)
 
-    # =========================
-    # 메인 처리 루틴
-    # =========================
+
     @Slot(object)
     def process_single_image(self, img_path):
         """단일 이미지 처리 루틴 (메인 스레드에서 실행 → 모든 UI 요소 매 이미지 갱신)"""
@@ -1689,9 +1681,7 @@ class ParticleDetectionGUI(QWidget):
         except Exception as e:
             self.status_label.setText(f"오류: {e}")
 
-    # =========================
-    # CSV & 그래프
-    # =========================
+
     def save_csv(self, row, max_retries=5, delay=0.2):
         """결과 CSV 저장"""
         if not self.csv_path:
@@ -1742,9 +1732,7 @@ class ParticleDetectionGUI(QWidget):
             attempt_list=attempt_list
         )
 
-    # =========================
-    # 팝업/그래프 스냅샷/무시 로직
-    # =========================
+
     def _push_popup_image(self, path: Path, event_count: int):
         # 발생 시점 순서대로(좌->우) 유지, 최대 7장
         self._popup_images.append((path, event_count))
@@ -1827,10 +1815,10 @@ class ParticleDetectionGUI(QWidget):
         if reason not in {'false', 'ok'}:
             self.alert_popup = None
 
-    # =========================
+
     # 기타
-    # =========================
     def _check_stop_or_disable_and_quit(self):
+        """기타"""
         try:
             if os.path.exists(STOP_FILE) or os.path.exists(DISABLE_FILE):
                 QApplication.quit()
@@ -1838,10 +1826,8 @@ class ParticleDetectionGUI(QWidget):
             pass
 
 
-# =========================
-# 진입점
-# =========================
 def main():
+    """진입점"""
     if ('--child' in sys.argv) or (not _should_enable_watchdog()):
         app = QApplication(sys.argv)
         gui = ParticleDetectionGUI()
