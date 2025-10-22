@@ -3,15 +3,221 @@ import sys
 from pathlib import Path
 from PIL import Image, ImageQt
 from datetime import datetime, timedelta
-from PySide6.QtWidgets import (QApplication, QWidget, QPushButton, QVBoxLayout, QLabel, QHBoxLayout, QSpinBox,
-                               QSlider, QCheckBox, QGroupBox, QGridLayout, QLineEdit, QSizePolicy)
-from PySide6.QtCore import QThread, Signal, Qt, QSettings
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QPushButton, QVBoxLayout, QLabel, QHBoxLayout, QSpinBox,
+    QSlider, QCheckBox, QGroupBox, QGridLayout, QLineEdit, QSizePolicy
+)
+from PySide6.QtCore import QThread, Signal, Qt, QSettings, QTimer
 from PySide6.QtGui import QPixmap, QPainter, QColor, QPen
 import socket
 import csv
 import io
 from smb.SMBConnection import SMBConnection
 import traceback
+import time
+import subprocess
+import tempfile
+import shutil
+
+STOP_FILE = os.path.join(tempfile.gettempdir(), "CompositeImageApp.stop")
+LOCK_FILE = os.path.join(tempfile.gettempdir(), "CompositeImageApp.watchdog.lock")
+DISABLE_FILE = os.path.join(tempfile.gettempdir(), "CompositeImageApp.disabled")
+RUN_BASE_DIR = Path(tempfile.gettempdir()) / "CompositeImageApp_run"
+
+
+def _exe_path():
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    return os.path.abspath(sys.argv[0])
+
+
+def _is_install_location():
+    """현재 실행 위치가 설치 경로(D:\AI Vision)인지 여부 판정"""
+    exe_dir = os.path.normpath(os.path.dirname(_exe_path()))
+    target_dir = os.path.normpath(r'D:\AI Vision')
+    return exe_dir.upper() == target_dir.upper()
+
+
+def _get_app_cwd():
+    """자식/워치독이 사용할 작업 디렉터리(cwd) 반환"""
+    return os.environ.get('COMPOSITE_APP_CWD') or os.path.dirname(_exe_path())
+
+
+def _install_exe_available():
+    """설치 경로에 실행 후보(exe)의 존재 여부 확인"""
+    try:
+        install_dir = Path(_get_app_cwd())
+        if not install_dir.exists():
+            return False
+        for p in install_dir.glob("*.exe"):
+            if p.name.lower().startswith("composite"):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _find_candidate_install_exe():
+    """설치 폴더에서 최신 실행 후보 exe 반환"""
+    install_dir = Path(_get_app_cwd())
+    if not install_dir.exists():
+        return None
+    exes = [p for p in install_dir.glob("*.exe") if p.name.lower().startswith("composite")]
+    if not exes:
+        return None
+    return max(exes, key=lambda p: p.stat().st_mtime)
+
+
+def _maybe_stage_to_temp():
+    """exe 파일 실행 시, 자신을 TEMP로 복사 / '--staged' 로 재실행 / 원본은 즉시 종료(파인 삭제/교체 가능)"""
+    if not getattr(sys, "frozen", False):
+        return
+    if ('--staged' in sys.argv) or ('--no-stage' in sys.argv):
+        return
+
+    if _is_install_location():
+        RUN_BASE_DIR.mkdir(parents=True, exist_ok=True)
+        src = Path(_exe_path())
+        sig = f"{int(src.stat().st_mtime)}_{src.stat().st_size}"
+        run_dir = RUN_BASE_DIR / sig
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        staged_exe = run_dir / src.name
+        try:
+            shutil.copy2(src, staged_exe)
+        except Exception:
+            return
+
+        env = os.environ.copy()
+        env['COMPOSITE_APP_CWD'] = os.path.dirname(_exe_path())
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        subprocess.Popen([str(staged_exe), '--staged'], cwd=env['COMPOSITE_APP_CWD'], env=env, creationflags=creationflags)
+        sys.exit(0)
+
+
+def _spawn_child_and_wait():
+    """자식 GUI 한 번 실행 후 종료 대기"""
+    exe = _exe_path()
+    if getattr(sys, "frozen", False):
+        args = [exe, "--child"]
+        cwd = _get_app_cwd()
+    else:
+        args = [sys.executable, exe, "--child"]
+        cwd = os.path.dirname(exe)
+    proc = subprocess.Popen(args, cwd=cwd)
+    return proc.wait()
+
+
+def _single_instance_lock():
+    """단일 워치독 보장용 락 파일 생성 시도"""
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        return fd
+    except FileExistsError:
+        return None
+
+
+def _release_instance_lock(fd):
+    """락 해제"""
+    try:
+        os.close(fd)
+    except Exception:
+        pass
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+    except Exception:
+        pass
+
+
+def _acquire_watchdog_lock_with_takeover(timeout_sec=30):
+    """takeover (새 --staged 인스턴스가 있으면 STOP_FILE을 생성하고, 락을 재시도하여 인수)"""
+    start = time.monotonic()
+    requested_stop = False
+    while True:
+        fd = _single_instance_lock()
+        if fd is not None:
+            try:
+                if os.path.exists(STOP_FILE):
+                    os.remove(STOP_FILE)
+            except Exception:
+                pass
+            return fd
+
+        if ('--staged' in sys.argv) and not requested_stop:
+            try:
+                Path(STOP_FILE).touch()
+            except Exception:
+                pass
+            requested_stop = True
+
+        if time.monotonic() - start > timeout_sec:
+            return None
+
+        time.sleep(0.5)
+
+
+def _should_enable_watchdog():
+    """실행파일이 설치 경로('D:\AI Vision') 또는 '--staged'일 때만 자동 재실행(워치독) 동작"""
+    return ('--staged' in sys.argv) or _is_install_location()
+
+
+def run_watchdog_loop():
+    """ 워치독 메인 루프 (자식 GUI를 감시 & 재시작 / exe 삭제 시 자동실행 일시정지 / 새 exe 등장 시 새 빌드가 수행)"""
+    lock_fd = _acquire_watchdog_lock_with_takeover(timeout_sec=30)
+    if lock_fd is None:
+        return
+
+    missing_since = None
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    try:
+        while True:
+            if os.path.exists(STOP_FILE):
+                try:
+                    os.remove(STOP_FILE)
+                except Exception:
+                    pass
+                break
+
+            # 설치본 부재 → 자식 종료 유도 + 스폰 중단(일시정지)
+            if not _install_exe_available():
+                try:
+                    Path(DISABLE_FILE).touch()
+                except Exception:
+                    pass
+                if missing_since is None:
+                    missing_since = time.monotonic()
+                time.sleep(1.5)
+                continue
+
+            # 설치 exe가 다시 등장 시, 새 바이너리를 1회 실행시켜 자동 인수 유도
+            if missing_since is not None:
+                # 자동실행 재개: DISABLE 해제
+                try:
+                    if os.path.exists(DISABLE_FILE):
+                        os.remove(DISABLE_FILE)
+                except Exception:
+                    pass
+
+                candidate = _find_candidate_install_exe()
+                if candidate is not None:
+                    try:
+                        # 새 exe 1회 기동 → 자체 스테이징 & takeover
+                        subprocess.Popen([str(candidate)], cwd=str(candidate.parent), creationflags=creationflags)
+                    except Exception:
+                        pass
+
+                missing_since = None
+                time.sleep(2.0)
+
+            # 일반 루틴 자식이 종료되면 루프가 재시도/쿨다운
+            _spawn_child_and_wait()
+            time.sleep(10)
+    finally:
+        _release_instance_lock(lock_fd)
+
 
 # ======== SMB 연결 정보 (카메라PC의 호스트명으로 장비PC와의 네트워크 자동 설정) ========
 host_name = socket.gethostname()
@@ -51,7 +257,8 @@ equipment_ip_map = {
     "PU-U9": "172.28.37.239" , "PU-V0": "172.28.37.240" , "PU-V1": "172.28.37.241" , "PU-V2": "172.28.37.242" ,
     "PU-V3": "172.28.37.243" , "PU-V4": "172.28.37.244" , "PU-V5": "172.28.37.245" , "PU-V6": "172.28.37.246" ,
     "PU-V7": "172.28.37.247" , "PU-V8": "172.28.37.248" , "PU-V9": "172.28.37.249" , "PU-W0": "172.28.37.250" ,
-    "PU-W1": "172.28.37.251" , "PU-W2": "172.28.37.252"}
+    "PU-W1": "172.28.37.251" , "PU-W2": "172.28.37.252"
+}
 
 server_ip = equipment_ip_map.get(lookup_username, None)
 
@@ -108,6 +315,7 @@ def find_latest_csv_file():
                     pass
     return None
 
+
 def retrieve_csv_text(filename):
     """SMB에서 지정한 CSV 파일 내용을 cp949 인코딩으로 읽어 반환"""
     conn = None
@@ -137,6 +345,7 @@ def retrieve_csv_text(filename):
                     pass
     return None
 
+
 def parse_datetime(date_str, time_str):
     """CSV의 'Date'와 'Time' 칼럼 값을 활용하여 datetime 객체로 변환"""
     try:
@@ -160,6 +369,7 @@ def parse_datetime(date_str, time_str):
         return dt_full
     except Exception:
         return None
+
 
 def find_closest_row(csv_text, target_dt):
     """주어진 CSV 텍스트에서 target_dt에 가장 가까운 날짜/시간을 가진 row를 반환"""
@@ -197,6 +407,7 @@ def extract_row_info(row):
     puller_status_raw = row.get('Puller Mode Status', '')
     neck_attempt_raw = row.get('Neck Attempts', '')
     bottom_heater_raw = row.get('Bottom Heater Set Point', '')
+    seed_lift_raw = row.get('Seed Lift Set Point', '')
 
     dt_full = parse_datetime(date_str, time_str)
     if dt_full:
@@ -223,6 +434,11 @@ def extract_row_info(row):
     except (ValueError, TypeError):
         bottom_heater = 0
 
+    try:
+        seed_lift = float(seed_lift_raw)
+    except (ValueError, TypeError):
+        seed_lift = 0
+
     status_map = {
         0: "IDLE",
         4: "TAKEOVER",
@@ -239,11 +455,11 @@ def extract_row_info(row):
         elif 20 <= puller_status <= 29:
             status_text = "STABILIZATION"
         elif 30 <= puller_status <= 39:
-            # [mode 30~39 조건 下] ② BH Power≥10 → "REMELT" / ② Neck Att≥1 → "NECK" / ③ 아니면 "NECK(STAB)"
+            # [mode 30~39 조건 下] ② BH Power≥10 → "REMELT" / ② Neck Att≥1 & Seed Lift≥0.1 → "NECK" / ③ 아니면 "NECK(STAB)"
             if bottom_heater >= 10:
                 status_text = "REMELT"
             else:
-                status_text = "NECK" if neck_attempt >= 1 else "NECK(STAB)"
+                status_text = "NECK" if (neck_attempt >= 1 and seed_lift >= 0.1) else "NECK(STAB)"
         elif 40 <= puller_status <= 49:
             status_text = "CROWN"
         elif 50 <= puller_status <= 59:
@@ -269,8 +485,10 @@ def extract_row_info(row):
         "status_text": status_text
     }
 
-# ======== Attempt_NEW 계산 (온라인/스트리밍) ========
+
+# Attempt_NEW 계산 (온라인/스트리밍)
 INTEREST_STATUSES = ("NECK", "CROWN", "SHOULDER", "BODY")
+
 
 def find_closest_row_and_attempt(csv_text, target_dt):
     """Attempt_NEW를 온라인 방식으로 계산하여 반환"""
@@ -347,6 +565,8 @@ class ImageSaverThread(QThread):
         """이미지 저장 루프(Interval 이미지 파일 로드/크롭/저장, 최신 CSV 파일에서 이미지 저장 시각과 가장 가까운 row를 찾아 파일명에 반영)"""
         self.running = True
         while self.running:
+            loop_start = time.monotonic()
+
             if not self.output_folder.exists():
                 try:
                     self.output_folder.mkdir(parents=True, exist_ok=True)
@@ -424,11 +644,22 @@ class ImageSaverThread(QThread):
             else:
                 self.update_status.emit('소스 파일이 존재하지 않음!')
 
-            current_interval = self.get_interval()
-            for _ in range(int(current_interval * 10)):
+            # 고정 레이트 수면: 처리시간 포함해 간격 맞추기
+            target = float(self.get_interval())
+            elapsed = time.monotonic() - loop_start
+            sleep_left = max(0.0, target - elapsed)
+
+            # 100ms 단위로 잘게 잠자면서 종료 신호 체크
+            ticks = int(sleep_left / 0.1)
+            for _ in range(ticks):
                 if not self.running:
                     return
                 self.msleep(100)
+            rem_ms = int((sleep_left - ticks * 0.1) * 1000)
+            if rem_ms > 0:
+                if not self.running:
+                    return
+                self.msleep(rem_ms)
 
     def stop(self):
         """이미지 저장 루프 종료"""
@@ -647,7 +878,7 @@ class MainWindow(QWidget):
         self.quality_slider.valueChanged.connect(self.set_quality)
         self.quality_slider.valueChanged.connect(self.update_preview)
 
-       # 저장/삭제 Interval 변경 시 설정 저장
+        # 저장/삭제 Interval 변경 시 설정 저장
         self.interval_spin.valueChanged.connect(self.save_options)
         self.delete_interval_spin.valueChanged.connect(self.save_options)
 
@@ -656,6 +887,19 @@ class MainWindow(QWidget):
         self.set_quality(self.quality_slider.value())
         self.on_format_check()
         self.update_preview()
+
+        # 실행파일 실행 시, "자동 시작 동작 수행" 여부 플래그 : 자동 시작(True) / 수동 시작(False)
+        self.auto_start_enabled = True
+        self.auto_start_triggered = False
+
+        if self.auto_start_enabled:
+            QTimer.singleShot(0, self.handle_auto_start)
+
+        # STOP/DISABLE 파일 감시 (업데이트/정지/삭제-일시정지 시 GUI 즉시 종료)
+        self._stop_timer = QTimer(self)
+        self._stop_timer.setInterval(1000)  # 1초마다
+        self._stop_timer.timeout.connect(self._check_stop_or_disable_and_quit)
+        self._stop_timer.start()
 
     def start_saving(self):
         """이미지 저장 쓰레드 시작"""
@@ -676,6 +920,12 @@ class MainWindow(QWidget):
         self.image_thread.update_preview.connect(self.update_preview)
         self.image_thread.update_device_name.connect(self.update_device_name_from_thread)
         self.image_thread.start()
+
+    def handle_auto_start(self):
+        """실행 파일 실행 시 자동으로 시작 버튼을 눌러주는 핸들러"""
+        if self.auto_start_enabled and not self.auto_start_triggered:
+            self.auto_start_triggered = True
+            self.start_saving()
 
     def stop_saving(self):
         """이미지 저장 쓰레드 중지"""
@@ -781,8 +1031,14 @@ class MainWindow(QWidget):
         """ImageSaverThread에서 보낸 최신 장비명으로 GUI 장비명 입력란 갱신"""
         self.device_edit.setText(full_device_name)
 
-# QApplication 인스턴스의 중복 실행 문제 방지
-if __name__ == '__main__':
+    def _check_stop_or_disable_and_quit(self):
+        """STOP/DISABLE 감지 시 GUI 자발 종료 (업데이트 인수 & 삭제 후 멈춤 즉시 반영)"""
+        if os.path.exists(STOP_FILE) or os.path.exists(DISABLE_FILE):
+            QApplication.quit()
+
+
+def run_gui():
+    """QApplication 인스턴스의 중복 실행 문제 방지"""
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
@@ -802,3 +1058,21 @@ if __name__ == '__main__':
 
     window.show()
     app.exec()
+
+
+if __name__ == '__main__':
+    # 즉시 워치독/자식 중지 (--stop 인자로 실행하면 STOP_FILE 생성 후 종료)
+    if '--stop' in sys.argv:
+        Path(STOP_FILE).touch()
+        sys.exit(0)
+
+    _maybe_stage_to_temp()
+
+    # 워치독 조건 (설치 경로이거나 --staged 일 때만)
+    if ('--no-watchdog' in sys.argv) or (not _should_enable_watchdog()):
+        run_gui()
+    else:
+        if '--child' in sys.argv:
+            run_gui()
+        else:
+            run_watchdog_loop()
