@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QFrame, QSpacerItem
 )
 from PySide6.QtCore import Qt, QTimer, QSettings, QRect, QThread, QObject, Signal, Slot, QDateTime, QEvent
-from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen
+from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QGuiApplication
 import csv
 from collections import deque
 
@@ -64,15 +64,15 @@ if INI_TEST_MODE:
 else:
     INI_SETTINGS_PATH = Path(r'D:/AI Vision/ParticleDetectionApp.ini')
 
+
 # 폴더 미리 생성
 os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
 os.makedirs(EVENT_OUTPUT_DIR, exist_ok=True)
 os.makedirs(GRAPH_OUTPUT_DIR, exist_ok=True)
 
-# ===========================
 # 파티클 탐지 파라미터
-# ===========================
-WARMUP_FRAMES      = 10        # 워밍업 프레임 수
+WARMUP_FRAMES = 10             # 워밍업 프레임 수
+MIN_NOISE_REPEAT = 2           # 워밍업 구간 내 몇 회 이상 등장 좌표를 노이즈로 설정
 MANUAL_THRESHOLD   = 7         # 이진화 임계값
 KERNEL_SIZE_TOPHAT = (3, 3)    # tophat 모폴로지 연산 커널 크기
 KERNEL_SIZE_MORPH  = (3, 3)    # 모폴로지 클로즈 연산 커널 크기
@@ -92,6 +92,10 @@ REF_ROI = (70, 90, 20, 20)
 # 앵커 밝기 기반 동적 임계값 파라미터
 ANCHOR_BRIGHTNESS_REF = 48          # 기준 앵커 밝기
 ADAPTIVE_THRESHOLD_GAIN = 0.2       # 적응 임계 보정계수
+
+# 메인 윈도우 기본 위치 (모니터 좌측 하단 기준 offset)
+WINDOW_OFFSET_X = 100
+WINDOW_OFFSET_Y = 200
 
 
 def safe_image_load(image_path, max_retries=5, delay=0.2):
@@ -834,6 +838,7 @@ class ParticleDetectionGUI(QWidget):
         self.setWindowTitle('Real-time Particle Detection GUI')
         self.resize(500, 400)
         self.settings = QSettings(str(INI_SETTINGS_PATH), QSettings.IniFormat)
+        self._window_position_restored = False
 
         # 텍스트 박스 ('장비명_Lot#_Process' 표기)
         self.device_info_box = QLineEdit()
@@ -851,8 +856,8 @@ class ParticleDetectionGUI(QWidget):
         self.saved_graph_lots: set[str] = set()
 
         # Noise Particle 판정 파라미터
-        self.prev_particles = []         # 2회 이상 반복 좌표 및 크기 기억
-        self.frame_buffer = []           # 최근 10장 파티클 리스트 버퍼
+        self.prev_particles = []         # 워밍 업 시, 반복 좌표 및 크기 기억
+        self.frame_buffer = []           # 워밍 업 시, 파티클 리스트 버퍼
         self.distance_threshold = 10     # 거리 임계값
         self.area_threshold = 20         # 면적 임계값
         self.collecting_initial = True   # 최초 10장 워밍업 플래그
@@ -1001,6 +1006,68 @@ class ParticleDetectionGUI(QWidget):
             self.update_graph()
         else:
             self.plot_canvas.update_plot([], [], latest_index=None)
+
+    def showEvent(self, event):
+        """"메인 창 최초 표시 시 INI 저장 좌표 복원 또는 좌하단 오프셋 기본 위치 적용"""
+        super().showEvent(event)
+        if not self._window_position_restored:
+            self._window_position_restored = True
+            self._restore_window_position()
+
+    def _restore_window_position(self):
+        """INI(QSettings)에 저장된 메안 창 좌표를 복원"""
+        saved_x = self.settings.value('main_window_pos_x', None)
+        saved_y = self.settings.value('main_window_pos_y', None)
+        try:
+            x_val = None if saved_x is None else int(float(saved_x))
+            y_val = None if saved_y is None else int(float(saved_y))
+        except (TypeError, ValueError):
+            x_val = y_val = None
+
+        if x_val is not None and y_val is not None:
+            x_val, y_val = self._adjust_position_to_screen(x_val, y_val)
+            self.move(x_val, y_val)
+            return
+
+        self._move_to_default_position()
+
+    def _move_to_default_position(self):
+        """저장 값이 없을 때, 기본 위치로 메인 창을 이동"""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+
+        available = screen.availableGeometry()
+        frame_geo = self.frameGeometry()
+        window_width = frame_geo.width()
+        window_height = frame_geo.height()
+        target_x = available.x() + WINDOW_OFFSET_X
+        target_y = available.y() + available.height() - WINDOW_OFFSET_Y - window_height
+        target_x, target_y = self._adjust_position_to_screen(target_x, target_y, window_width, window_height)
+        self.move(target_x, target_y)
+
+    def _adjust_position_to_screen(self, x, y, window_width=None, window_height=None):
+        """메인 창의 좌표가 현재 모니터의 표시 가능한 영역을 벗어나지 않도록 보정"""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return int(round(x)), int(round(y))
+
+        available = screen.availableGeometry()
+        if window_width is None or window_height is None:
+            frame_geo = self.frameGeometry()
+            if window_width is None:
+                window_width = frame_geo.width()
+            if window_height is None:
+                window_height = frame_geo.height()
+
+        min_x = available.x()
+        min_y = available.y()
+        max_x = max(min_x, available.x() + available.width() - window_width)
+        max_y = max(min_y, available.y() + available.height() - window_height)
+
+        clamped_x = max(min_x, min(int(round(x)), max_x))
+        clamped_y = max(min_y, min(int(round(y)), max_y))
+        return clamped_x, clamped_y
 
     def _set_status(self, text: str, hold_s: float = 0.0):
         """상태 텍스트 세터 (동일 텍스트 중복 세팅 방지 + 홀드 지원)"""
@@ -1166,7 +1233,7 @@ class ParticleDetectionGUI(QWidget):
         self.status_label.setText("- 중지 -")
 
     def save_options(self):
-        """crop 영역 설정값 저장"""
+        """crop 영역 및 메인 창 위치 설정값 저장"""
         # crop1
         self.settings.setValue('crop1_x', self.crop1_x.value())
         self.settings.setValue('crop1_y', self.crop1_y.value())
@@ -1180,9 +1247,22 @@ class ParticleDetectionGUI(QWidget):
         self.settings.setValue('crop2_h', self.crop2_h.value())
         self.settings.setValue('crop2_enabled', bool(self.crop2_enabled_cb.isChecked()))
 
+        # 메인 창 위치 저장
+        top_left = self.frameGeometry().topLeft()
+        self.settings.setValue('main_window_pos_x', int(top_left.x()))
+        self.settings.setValue('main_window_pos_y', int(top_left.y()))
+
         self.settings.sync()
         self.status_label.setText("설정 저장됨.")
-
+    
+    def closeEvent(self, event):
+        """윈도우 종료 시 현재 설정을 .ini에 자동 저장"""
+        try:
+            self.save_options()
+        except Exception:
+            pass
+        finally:
+            super().closeEvent(event)
 
     def process_new_images_tick(self):
         """(실시간)신규 이미지 처리"""
@@ -1231,6 +1311,7 @@ class ParticleDetectionGUI(QWidget):
                     prev_csv = self.csv_path
                     if (
                         prev_lot
+                        and prev_lot != "LotUnknown"
                         and prev_csv
                         and prev_csv.exists()
                         and prev_lot not in self.saved_graph_lots
@@ -1249,10 +1330,13 @@ class ParticleDetectionGUI(QWidget):
 
                 # 새 Lot로 전환
                 self.current_lot = lot_number
-                self.csv_path = CSV_OUTPUT_DIR / f"{lot_number}.csv"
+
+                new_lot_valid = bool(lot_number) and (lot_number != "LotUnknown")
+                self.csv_path = (CSV_OUTPUT_DIR / f"{lot_number}.csv") if new_lot_valid else None
+
                 self.current_attempt = attempt_value
                 self.processed_images.clear()
-                self.lot_event_count = 0  # 누적 횟수 리셋
+                self.lot_event_count = 0
                 self._popup_images.clear()
                 self._popup_detect_dt = None
                 if self.alert_popup:
@@ -1261,7 +1345,7 @@ class ParticleDetectionGUI(QWidget):
 
                 # 새 CSV 생성(헤더만)
                 try:
-                    if (not self.csv_path.exists()) or (self.csv_path.stat().st_size == 0):
+                    if self.csv_path and ((not self.csv_path.exists()) or (self.csv_path.stat().st_size == 0)):
                         with open(self.csv_path, 'w', newline='', encoding='utf-8-sig') as f:
                             writer = csv.writer(f)
                             writer.writerow(self.csv_header)
@@ -1269,7 +1353,7 @@ class ParticleDetectionGUI(QWidget):
                     self._set_status(f"CSV 초기화 오류: {e}", hold_s=3.0)
 
                 # 기존 CSV가 있으면 중복 방지 세트 재로딩
-                if self.csv_path.exists():
+                if self.csv_path and self.csv_path.exists():
                     try:
                         with open(self.csv_path, 'r', encoding='utf-8-sig', newline='') as f:
                             reader = csv.reader(f)
@@ -1360,15 +1444,13 @@ class ParticleDetectionGUI(QWidget):
                 self.frame_buffer.append(particle_info)
 
                 if len(self.frame_buffer) >= WARMUP_FRAMES:
-                    # (x,y,area) 빈도 집계: 2회 이상 등장 좌표를 노이즈 기준으로 채택
+                    # MIN_NOISE_REPEAT회 이상 등장 좌표를 노이즈 기준으로 채택
                     freq = {}
                     for frame_particles in self.frame_buffer:
                         for (x, y, area) in frame_particles:
                             key = (x, y, area)
                             freq[key] = freq.get(key, 0) + 1
-                    self.prev_particles = [k for k, v in freq.items() if v >= 2] or (
-                        self.frame_buffer[-1] if self.frame_buffer else []
-                    )
+                    self.prev_particles = [k for k, v in freq.items() if v >= MIN_NOISE_REPEAT] or (self.frame_buffer[-1] if self.frame_buffer else [])
 
                     # 워밍업 종료 이후부터 '허용 모드의 판정 이미지'에서 [Noise] 표기/적용
                     self.collecting_initial = False
@@ -1518,7 +1600,7 @@ class ParticleDetectionGUI(QWidget):
 
 
     def _push_popup_image(self, path: Path, event_count: int):
-        # 발생 시점 순서대로(좌->우) 유지, 최대 7장
+        """팝업창 이미지 출력"""
         self._popup_images.append((path, event_count))
 
     def _parse_info_datetime(self, info: dict) -> QDateTime:
@@ -1538,7 +1620,7 @@ class ParticleDetectionGUI(QWidget):
         return qdt.toString('yy/MM/dd_HH:mm:ss')
 
     def _graph_pixmap(self) -> QPixmap:
-        # 현재 Matplotlib Figure를 PNG로 렌더링 후 QPixmap 반환
+        """현재 Matplotlib Figure를 PNG로 렌더링 후 QPixmap 반환"""
         buf = io.BytesIO()
         try:
             self.plot_canvas.fig.savefig(buf, format='png', dpi=self.plot_canvas.fig.dpi, bbox_inches='tight')
@@ -1550,7 +1632,7 @@ class ParticleDetectionGUI(QWidget):
         return pm
 
     def _ensure_popup(self):
-        # 독립된 최상위 창으로 생성(메인 GUI와 별개 윈도우)
+        """팝업 창이 독립된 최상위 창으로 생성"""
         if self.alert_popup is None:
             self.alert_popup = AlertPopup(None)
             self.alert_popup.setWindowModality(Qt.NonModal)
@@ -1558,11 +1640,11 @@ class ParticleDetectionGUI(QWidget):
         return self.alert_popup
 
     def _maybe_open_or_update_popup(self, info: dict, event_image_path: Path):
-        # 팝업 이미지 큐 갱신
+        """팝업 이미지 큐 갱신"""
         self._push_popup_image(event_image_path, self.lot_event_count)
         pop = self._ensure_popup()
 
-        # 발생 시각(팝업 세션 기준: 최신 탐지 시간으로 갱신)
+        # 발생 시각 (최신 탐지 시간으로 갱신)
         event_dt = self._parse_info_datetime(info)
         self._popup_detect_dt = event_dt
 
@@ -1586,15 +1668,14 @@ class ParticleDetectionGUI(QWidget):
 
     @Slot(str, int)
     def _on_popup_closed(self, reason: str, snooze_min: int):
-        # 팝업 종료 사유에 따른 로그/무시 설정
+        """팝업 종료 사유에 따른 로그/무시 설정"""
         if snooze_min > 0:
             self.popup_snooze_until = time.monotonic() + snooze_min * 60
         else:
             self.popup_snooze_until = 0.0
         if reason == 'false':
-            # 오탐지 로그만 (데이터 롤백은 요구사항에 명시X)
             pass
-        # 팝업 세션 초기화 (다음 탐지 시 새 세션으로 경과 시간 시작)
+
         self._popup_detect_dt = None
         if reason not in {'false', 'ok'}:
             self.alert_popup = None
