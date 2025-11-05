@@ -1,0 +1,1038 @@
+# === [### 2. 기본 설정 & 유틸] ===
+import os, re, gc, time, math, random, logging, warnings
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, Subset
+from torchvision import transforms as T, datasets
+
+from tqdm.auto import tqdm
+from PIL import Image, ImageOps, ImageDraw
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from IPython.display import display, clear_output
+
+def seed_everything(seed: int = 42):
+    random.seed(seed); np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+seed_everything(42)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[INFO] device: {device} | CUDA: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"[INFO] GPU: {torch.cuda.get_device_name(0)}")
+
+# 공용 변환 유틸
+class CropROI:
+    """(x,y,w,h)로 원본 이미지를 안정적으로 자르는 변환"""
+    def __init__(self, xywh):
+        self.x, self.y, self.w, self.h = map(int, xywh)
+    def __call__(self, img: Image.Image):
+        img = ImageOps.exif_transpose(img)
+        W, H = img.size
+        x = max(0, min(self.x, W-1)); y = max(0, min(self.y, H-1))
+        w = max(1, min(self.w, W-x));  h = max(1, min(self.h, H-y))
+        return img.crop((x, y, x+w, y+h))
+
+# ImageNet 정규화 (공용)
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
+# === [/### 2] ===
+
+# === [### 3. 경로 & 하이퍼파라미터] ===
+# ------- ROI 지정 -------
+ROI_RECT    = (57, 0, 175, 555)   # (x, y, w, h)
+ROI_COLOR   = "lime"
+ROI_EDGE_LW = 2.0
+
+DATA_ROOT = r"D:\Python\3. Deep Learning\1. Icing Classification_ViT\rawdata"
+assert Path(DATA_ROOT).exists(), f"DATA_ROOT not found: {DATA_ROOT}"
+
+def show_roi_overlay(img_path: Path, roi_xywh, color=ROI_COLOR, edge_lw=ROI_EDGE_LW):
+    """ROI 사각형 프리뷰 (원본 위에 오버레이)"""
+    if not Path(img_path).exists():
+        print(f"[WARN] ROI demo image not found: {img_path}")
+        return
+    img = Image.open(img_path).convert("RGB"); W, H = img.size
+    x, y, w, h = map(int, roi_xywh)
+    x = max(0, min(x, W - 1)); y = max(0, min(y, H - 1))
+    w = max(1, min(w, W - x)); h = max(1, min(h, H - y))
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.imshow(img)
+    ax.add_patch(patches.Rectangle((x, y), w, h, linewidth=edge_lw,
+                                   edgecolor=color, facecolor='none'))
+    ax.set_title(f"ROI [x={x}, y={y}, w={w}, h={h}]")
+    ax.set_axis_off(); ax.set_aspect('equal', adjustable='box')
+    plt.show()
+
+# 예시 (원하면 경로 지정 후 확인)
+# demo_path = Path(DATA_ROOT) / "Icing" / "X7_WX7VP_REMELT_1_06m30s_005850.jpg"
+# show_roi_overlay(demo_path, ROI_RECT)
+
+# ------- 하이퍼파라미터 -------
+IMG_SIZE       = 224
+EPOCHS         = 20
+WARMUP_EPOCHS  = 2
+BATCH_SIZE     = 32
+BASE_LR        = 5e-5
+WEIGHT_DECAY   = 0.05
+NUM_WORKERS    = 0                           # Windows 권장
+PIN_MEMORY     = torch.cuda.is_available()
+
+# ------- 모델 -------
+MODEL_NAME     = "vit_small_patch16_224"
+USE_PRETRAINED = True
+DROP_PATH_RATE = 0.1
+
+# 체크포인트
+SAVE_BEST_PATH = "vit_icing_melted_standard_best.pth"
+# 디버그용 배치 제한(사용 안 하면 None)
+LIMIT_TRAIN_BATCHES = None
+LIMIT_VAL_BATCHES   = None
+
+# === [/### 3] ===
+
+# === [### 4. 임베딩 기반 중복 이미지 제거 (클래스별)] ===
+import timm
+warnings.filterwarnings("ignore", message=".*Unexpected keys.*")
+logging.getLogger("timm").setLevel(logging.ERROR)
+logging.getLogger("timm.models").setLevel(logging.ERROR)
+
+# 클래스 목록 확보
+CLASSES = [d.name for d in Path(DATA_ROOT).iterdir() if d.is_dir()]
+CLASSES = [c for c in CLASSES if (Path(DATA_ROOT) / c).exists()]
+CLASSES.sort()
+
+# per-class 설정 (정책/기본값은 원본과 동일)
+SIM_THR_DEFAULT = 0.992
+NN_K_DEFAULT    = 10
+K_PER_CLUSTER   = 1
+
+PER_CLASS_PARAM_POLICY = "inline"  # inline|external|merge_external_over_inline
+INLINE_PER_CLASS_SIM_THR = {"Icing": 0.979, "Melted": 0.994}
+INLINE_PER_CLASS_NN_K    = {"Icing": 10,    "Melted": 10}
+USER_PER_CLASS_SIM_THR   = globals().get("PER_CLASS_SIM_THR", None) or {}
+USER_PER_CLASS_NN_K      = globals().get("PER_CLASS_NN_K", None) or {}
+
+def _canon_label(s): return re.sub(r"\s+", "", str(s)).lower()
+def _norm_map(d, cast): 
+    out={}; 
+    out.update({ _canon_label(k): cast(v) for k,v in (d or {}).items() })
+    return out
+_inline_sim = _norm_map(INLINE_PER_CLASS_SIM_THR, float)
+_inline_nnk = _norm_map(INLINE_PER_CLASS_NN_K,    int)
+_user_sim   = _norm_map(USER_PER_CLASS_SIM_THR,   float)
+_user_nnk   = _norm_map(USER_PER_CLASS_NN_K,      int)
+
+def _select_per_class(key_norm, default_v, inline_map, user_map, policy, cast):
+    if policy == "inline":
+        return cast(inline_map.get(key_norm, user_map.get(key_norm, default_v)))
+    if policy == "external":
+        return cast(user_map.get(key_norm, inline_map.get(key_norm, default_v)))
+    # merge_external_over_inline
+    merged = {**inline_map, **user_map}
+    return cast(merged.get(key_norm, default_v))
+
+# 임베딩 추출용 변환
+tfm_embed = T.Compose([
+    CropROI(ROI_RECT),
+    T.Grayscale(num_output_channels=3),
+    T.Resize((IMG_SIZE, IMG_SIZE), interpolation=T.InterpolationMode.BILINEAR),
+    T.ToTensor(),
+    T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+])
+
+def _natural_key(s: str):
+    base = os.path.basename(str(s))
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", base)]
+
+# 파일 수집
+EXTS = {".jpg",".jpeg",".png",".bmp",".tif",".tiff"}
+by_class = {}
+for cls in CLASSES:
+    paths = [str(p.resolve()) for p in (Path(DATA_ROOT)/cls).rglob("*") 
+             if p.is_file() and p.suffix.lower() in EXTS]
+    paths.sort(key=_natural_key)
+    by_class[cls] = paths
+
+print("[INFO] files per class:")
+ordered_cls = [c for c in ["Icing", "Melted"] if c in CLASSES] + [c for c in CLASSES if c not in ["Icing","Melted"]]
+for cls in ordered_cls:
+    print(f"- {cls}: {len(by_class.get(cls, []))}")
+
+# ViT feature extractor (global_pool='avg' → 384-D)
+DEVICE = device
+BATCH_EMB = 64 if torch.cuda.is_available() else 16
+feat_model = timm.create_model('vit_small_patch16_224', pretrained=True,
+                               num_classes=0, global_pool='avg').to(DEVICE).eval()
+
+@torch.no_grad()
+def embed_paths(path_list):
+    if len(path_list) == 0:
+        return np.empty((0, 384), dtype=np.float32)
+    feats = []
+    for s in range(0, len(path_list), BATCH_EMB):
+        chunk = path_list[s:s+BATCH_EMB]
+        xs = []
+        for p in chunk:
+            with Image.open(p) as img:
+                xs.append(tfm_embed(img))
+        x = torch.stack(xs, 0).to(DEVICE)
+        f = feat_model(x).float().cpu()
+        feats.append(f); del x, f, xs
+    feats = torch.cat(feats, 0).numpy()
+    feats = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-12)
+    return feats.astype(np.float32)
+
+def union_find_clusters(feats, sim_thr=SIM_THR_DEFAULT, nn_k=NN_K_DEFAULT):
+    """코사인 유사도 기반 근접-이웃 연결 → UF로 병합"""
+    N = feats.shape[0]; parent = list(range(N))
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]; a = parent[a]
+        return a
+    def union(a,b):
+        ra, rb = find(a), find(b)
+        if ra != rb: parent[rb] = ra
+    if N == 0: return parent, {}
+    try:
+        from sklearn.neighbors import NearestNeighbors
+        n_neighbors = min(max(int(nn_k), 2), N)
+        nbrs = NearestNeighbors(n_neighbors=n_neighbors, metric='cosine').fit(feats)
+        dist, idxs = nbrs.kneighbors(feats, return_distance=True)
+        sims = 1.0 - dist
+        for i in range(N):
+            for j, sim in zip(idxs[i], sims[i]):
+                if i != j and sim >= sim_thr:
+                    union(i, j)
+    except Exception:
+        blk = 2048
+        for s in range(0, N, blk):
+            e = min(N, s+blk)
+            sim_blk = feats[s:e] @ feats.T
+            for ii in range(s, e):
+                js = np.where(sim_blk[ii-s] >= sim_thr)[0]
+                for j in js:
+                    if j != ii: union(ii, j)
+        del sim_blk; gc.collect()
+    clusters = {}
+    for i in range(N):
+        r = find(i); clusters.setdefault(r, []).append(i)
+    return parent, clusters
+
+def pick_keep_indices(paths, clusters, k=K_PER_CLUSTER):
+    keep = []
+    for _, members in clusters.items():
+        ms = sorted(members, key=lambda m: _natural_key(paths[m]))
+        keep.extend(ms[:k])
+    return sorted(set(keep))
+
+def parse_time_seconds_from_name(path: str):
+    base = os.path.basename(path)
+    m = re.search(r'(\d{1,2})m(\d{1,2})s', base, flags=re.IGNORECASE)
+    if m: return int(m.group(1))*60 + int(m.group(2))
+    m2 = re.search(r'(\d{5,})\D*$', base)
+    if m2:
+        try: return float(m2.group(1))
+        except: pass
+    try: return Path(path).stat().st_mtime
+    except: return float('inf')
+
+# 간단 클러스터 프리뷰(Ref 1 + Drop 3 샘플)
+COLS, TILE_W, TILE_H, BG_COLOR, SHEET_MAX_ROWS = 20, 120, 180, (0,0,0), 40
+def make_tile(path, label_text=None, tw=TILE_W, th=TILE_H):
+    with Image.open(path) as im:
+        im = ImageOps.exif_transpose(im)
+        x,y,w,h = ROI_RECT; W,H = im.size
+        x = max(0, min(x,W-1)); y = max(0, min(y,H-1))
+        w = max(1, min(w, W-x)); h = max(1, min(h, H-y))
+        crop = im.crop((x,y,x+w,y+h)).convert("RGB")
+        crop.thumbnail((tw, th))
+        cell = Image.new("RGB", (tw, th), BG_COLOR)
+        off_x = (tw - crop.width)//2; off_y = (th - crop.height)//2
+        cell.paste(crop, (off_x, off_y))
+        if label_text:
+            d = ImageDraw.Draw(cell); txt = label_text
+            try:
+                bbox = d.textbbox((0,0), txt); txt_w, txt_h = bbox[2]-bbox[0], bbox[3]-bbox[1]
+            except Exception:
+                txt_w, txt_h = d.textsize(txt)
+            pad_l, pad_r, pad_t, pad_b = 2,2,0,2
+            x1 = max(0, (cell.width - (txt_w + pad_l + pad_r)) // 2); y1 = 0
+            x2 = min(cell.width-1, x1 + txt_w + pad_l + pad_r - 1); y2 = y1 + txt_h + pad_t + pad_b - 1
+            d.rectangle([x1,y1,x2,y2], fill=(0,255,0)); d.text((x1+pad_l, y1+pad_t), txt, fill=(0,0,0))
+        return cell
+
+def show_contact_sheet_flat(items, cols=COLS, tw=TILE_W, th=TILE_H, max_rows=SHEET_MAX_ROWS):
+    if not items: return
+    cols = max(1, cols); rows_per_sheet = max_rows if max_rows is not None else math.ceil(len(items)/cols)
+    per_sheet = cols * rows_per_sheet; total = len(items); pages = math.ceil(total / per_sheet)
+    for pg in range(pages):
+        chunk = items[pg*per_sheet:(pg+1)*per_sheet]
+        rows = math.ceil(len(chunk)/cols)
+        sheet = Image.new("RGB", (cols*tw, rows*th), BG_COLOR)
+        for i, (p, lab) in enumerate(chunk):
+            r, c = divmod(i, cols)
+            try: cell = make_tile(p, lab, tw, th)
+            except Exception: cell = Image.new("RGB", (tw, th), (60,60,60))
+            sheet.paste(cell, (c*tw, r*th))
+        display(sheet)
+
+# KEEP/DROP 생성 + 요약/프리뷰
+KEEP_PATHS_SET, DROP_PATHS_SET = set(), set()
+summary_rows, flat_items_by_cls = [], {}
+
+for cls in CLASSES:
+    paths = by_class[cls]; N = len(paths)
+    if N == 0:
+        summary_rows.append(f"[{cls}] clusters: 0 | images: 0 | keep-images: 0 | Drop-images: 0 | (SIM_THR={SIM_THR_DEFAULT:.3f}, NN_K={max(2, NN_K_DEFAULT)})")
+        flat_items_by_cls[cls] = []; continue
+
+    key = _canon_label(cls)
+    sim_thr_cls = _select_per_class(key, SIM_THR_DEFAULT, _inline_sim, _user_sim, PER_CLASS_PARAM_POLICY, float)
+    nn_k_cls    = max(2, _select_per_class(key, NN_K_DEFAULT,    _inline_nnk, _user_nnk, PER_CLASS_PARAM_POLICY, int))
+
+    feats = embed_paths(paths)
+    _, clusters = union_find_clusters(feats, sim_thr=sim_thr_cls, nn_k=nn_k_cls)
+    keep_idx = pick_keep_indices(paths, clusters, k=K_PER_CLUSTER)
+    keep_set = set(keep_idx)
+    keep_paths = [paths[i] for i in keep_idx]
+    drop_paths = [paths[i] for i in range(N) if i not in keep_set]
+    KEEP_PATHS_SET.update(keep_paths); DROP_PATHS_SET.update(drop_paths)
+
+    # 시간 기준 정렬된 대표 + 랜덤 일부 드랍 미리보기
+    cl_list = list(clusters.items())
+    def _ref_idx_time(members):
+        ref_i = min(members, key=lambda m: parse_time_seconds_from_name(paths[m]))
+        ref_t = parse_time_seconds_from_name(paths[ref_i])
+        return ref_i, ref_t
+    cl_list.sort(key=lambda kv: _ref_idx_time(kv[1])[1])
+
+    flat_items = []; shown_rank = 0
+    for _, members in cl_list:
+        if not members: continue
+        ref_idx = min(members, key=lambda m: parse_time_seconds_from_name(paths[m]))
+        drops = [m for m in members if m != ref_idx]
+        if not drops: continue
+        shown_rank += 1
+        ref_path = paths[ref_idx]; ref_label = f"C#{shown_rank}_Drop_{int(len(drops))}"
+        flat_items.append((ref_path, ref_label))
+        drop_paths_show = drops if len(drops) <= 3 else random.sample(drops, k=3)
+        flat_items.extend([(paths[i], None) for i in drop_paths_show])
+
+    summary_rows.append(
+        f"[{cls}] clusters: {len(clusters)} | images: {N} | keep-images: {len(keep_idx)} | Drop-images: {len(drop_paths)} | (SIM_THR={sim_thr_cls:.3f}, NN_K={nn_k_cls})"
+    )
+    flat_items_by_cls[cls] = flat_items
+
+# 요약/프리뷰 출력
+for name in ordered_cls: 
+    print(summary_rows[[r.startswith(f"[{name}]") for r in summary_rows].index(True)])
+for name in ordered_cls:
+    show_contact_sheet_flat(flat_items_by_cls[name], cols=COLS, tw=TILE_W, th=TILE_H, max_rows=SHEET_MAX_ROWS)
+
+# 정리
+del feat_model; gc.collect()
+if torch.cuda.is_available(): torch.cuda.empty_cache()
+# === [/### 4] ===
+
+# === [### 5. 변환(Transforms)] ===
+train_tfms = T.Compose([
+    CropROI(ROI_RECT),
+    T.Grayscale(num_output_channels=3),
+    T.Resize((IMG_SIZE, IMG_SIZE), interpolation=T.InterpolationMode.BILINEAR),
+    T.RandomHorizontalFlip(p=0.5),
+    T.RandomAffine(degrees=4, translate=(0.02,0.02), scale=(0.98,1.02)),
+    T.ToTensor(),
+    T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+])
+
+valtest_tfms = T.Compose([
+    CropROI(ROI_RECT),
+    T.Grayscale(num_output_channels=3),
+    T.Resize((IMG_SIZE, IMG_SIZE), interpolation=T.InterpolationMode.BILINEAR),
+    T.ToTensor(),
+    T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+])
+# === [/### 5] ===
+
+# === [### 6. 데이터셋 로드 & 층화 분할] ===
+from collections import defaultdict, Counter
+
+def _norm_path(p) -> str: return str(Path(p).resolve())
+
+dataset_full = datasets.ImageFolder(root=DATA_ROOT)
+idx_to_class = {v: k for k, v in dataset_full.class_to_idx.items()}
+print("[INFO] classes:", idx_to_class)
+
+N = len(dataset_full.samples)
+base_paths_norm = [_norm_path(p) for p, _ in dataset_full.samples]
+base_targets = [int(c) for _, c in dataset_full.samples]
+
+# 중복 제거 결과 반영
+keep_paths_set = set(map(_norm_path, KEEP_PATHS_SET)) if len(KEEP_PATHS_SET)>0 else None
+drop_paths_set = set(map(_norm_path, DROP_PATHS_SET)) if len(DROP_PATHS_SET)>0 else None
+
+if keep_paths_set:
+    filtered_indices = [i for i,p in enumerate(base_paths_norm) if p in keep_paths_set]
+    if len(filtered_indices) == 0:
+        raise RuntimeError("[ERR] 중복 제거 결과가 비어 있습니다. SIM_THR/K_PER_CLUSTER를 완화하세요.")
+    print(f"[FILTER] keep {len(filtered_indices)}/{N} images after near-duplicate removal (KEEP set).")
+elif drop_paths_set:
+    filtered_indices = [i for i,p in enumerate(base_paths_norm) if p not in drop_paths_set]
+    print(f"[FILTER] keep {len(filtered_indices)}/{N} images after excluding DROP set ({len(drop_paths_set)} drops).")
+else:
+    filtered_indices = list(range(N))
+    print(f"[FILTER] KEEP/DROP sets not provided → using all {N} samples.")
+
+filtered_targets = [base_targets[i] for i in filtered_indices]
+cnt = Counter(filtered_targets)
+print("[INFO] class counts after filter:", {idx_to_class[k]: v for k, v in cnt.items()})
+missing = [idx_to_class[k] for k in idx_to_class if k not in cnt or cnt[k] == 0]
+if missing:
+    raise RuntimeError(f"[ERR] 필터링 후 다음 클래스가 0개입니다: {missing}.")
+
+def stratified_split_indices(indices, targets_list, train_ratio=0.7, val_ratio=0.15, seed=42):
+    by_cls = defaultdict(list)
+    for idx, y in zip(indices, targets_list):
+        by_cls[int(y)].append(idx)
+    rng = random.Random(seed)
+    train_idx, val_idx, test_idx = [], [], []
+    for cls, idxs in by_cls.items():
+        rng.shuffle(idxs); n = len(idxs)
+        n_train = int(round(n * train_ratio))
+        n_val   = int(round(n * val_ratio))
+        train_idx.extend(idxs[:n_train])
+        val_idx.extend(idxs[n_train:n_train+n_val])
+        test_idx.extend(idxs[n_train+n_val:])
+    rng.shuffle(train_idx); rng.shuffle(val_idx); rng.shuffle(test_idx)
+    return train_idx, val_idx, test_idx
+
+train_idx, val_idx, test_idx = stratified_split_indices(filtered_indices, filtered_targets, 0.7, 0.15, seed=42)
+print(f"[SPLIT] train={len(train_idx)}  val={len(val_idx)}  test={len(test_idx)}")
+
+class TransformSubset(Dataset):
+    """기존 ImageFolder에 셀4 변환을 적용하기 위한 래퍼"""
+    def __init__(self, base_ds, indices, transform=None):
+        self.base_ds = base_ds
+        self.indices = list(indices)
+        self.transform = transform
+    def __len__(self): return len(self.indices)
+    def __getitem__(self, i):
+        img, label = self.base_ds[self.indices[i]]
+        if self.transform is not None: img = self.transform(img)
+        return img, label
+
+train_ds = TransformSubset(dataset_full, train_idx, transform=train_tfms)
+val_ds   = TransformSubset(dataset_full, val_idx,   transform=valtest_tfms)
+test_ds  = TransformSubset(dataset_full, test_idx,  transform=valtest_tfms)
+print(f"[INFO] splits(final) -> train:{len(train_ds)}  val:{len(val_ds)}  test:{len(test_ds)}")
+# === [/### 6] ===
+
+# === [### 7. DataLoader] ===
+EFFECTIVE_NUM_WORKERS = 0 if os.name == "nt" else NUM_WORKERS
+PIN_MEMORY_EFF = bool(torch.cuda.is_available())
+PERSISTENT = EFFECTIVE_NUM_WORKERS > 0
+
+dl_common = dict(num_workers=EFFECTIVE_NUM_WORKERS, pin_memory=PIN_MEMORY_EFF, persistent_workers=PERSISTENT)
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  drop_last=False, **dl_common)
+val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, drop_last=False, **dl_common)
+test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, drop_last=False, **dl_common)
+print("[INFO] train/val/test lens:", len(train_ds), len(val_ds), len(test_ds))
+# === [/### 7] ===
+
+# === [### 8. 시각화 유틸 (Simple Rollout + Occlusion)] ===
+import warnings, math
+
+def _get_grid_hw_from_model(model):
+    if hasattr(model, "patch_embed") and hasattr(model.patch_embed, "grid_size"):
+        gh, gw = model.patch_embed.grid_size
+        gh = int(gh[0] if isinstance(gh, (list,tuple)) else gh)
+        gw = int(gw[0] if isinstance(gw, (list,tuple)) else gw)
+        return gh, gw
+    return 14, 14  # 224/16
+
+def _upsample_heat(heat_gh_gw, size_hw):
+    H, W = size_hw
+    heat = (heat_gh_gw - heat_gh_gw.min()) / (heat_gh_gw.max() - heat_gh_gw.min() + 1e-8)
+    heat_up = F.interpolate(heat.unsqueeze(0).unsqueeze(0), size=(H, W),
+                            mode="bilinear", align_corners=False)[0,0]
+    return heat_up.detach().cpu().numpy()
+
+def _register_attn_hooks_for_block(blk, attns):
+    hooks = []
+    attn_mod = getattr(blk, "attn", None)
+    if attn_mod is None:
+        return hooks
+
+    target = getattr(attn_mod, "attn_drop", None) or getattr(attn_mod, "drop_attn", None)
+    if target is not None:
+        def _hook(_m, _inp, out):
+            # out: (B, heads, N, N) 예상
+            if isinstance(out, torch.Tensor):
+                attns.append(out.detach())
+        hooks.append(target.register_forward_hook(_hook))
+    return hooks
+
+def _patch_attention_forward(attn_module, store_list):
+    orig_forward = attn_module.forward
+
+    def patched_forward(x, attn_mask=None, **kwargs):
+        B, N, C = x.shape
+        num_heads = getattr(attn_module, "num_heads", None)
+        assert num_heads is not None, "Attention module missing num_heads"
+        head_dim = C // num_heads
+        scale = getattr(attn_module, "scale", head_dim ** -0.5)
+
+        # qkv 경로 우선, 없으면 q/k/v 개별 경로
+        if hasattr(attn_module, "qkv") and attn_module.qkv is not None:
+            qkv = attn_module.qkv(x).reshape(B, N, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+        elif all(hasattr(attn_module, n) for n in ("q", "k", "v")):
+            q = attn_module.q(x).reshape(B, N, num_heads, head_dim).permute(0,2,1,3)
+            k = attn_module.k(x).reshape(B, N, num_heads, head_dim).permute(0,2,1,3)
+            v = attn_module.v(x).reshape(B, N, num_heads, head_dim).permute(0,2,1,3)
+        else:
+            # 알 수 없는 변형 → 원본으로 폴백(이 경우 캡처 불가)
+            return orig_forward(x, attn_mask=attn_mask, **kwargs)
+
+        # qk-norm
+        if getattr(attn_module, "q_norm", None) is not None:
+            q = attn_module.q_norm(q)
+        if getattr(attn_module, "k_norm", None) is not None:
+            k = attn_module.k_norm(k)
+
+        # rotary embedding
+        if getattr(attn_module, "rope", None) is not None:
+            q, k = attn_module.rope(q, k)
+
+        # 어텐션 산출
+        attn = (q @ k.transpose(-2, -1)) * scale
+
+        # 상대 위치 바이어스
+        rel = getattr(attn_module, "rel_pos_bias", None)
+        if rel is not None:
+            rel_bias = rel()
+            attn = attn + (rel_bias.unsqueeze(0) if rel_bias.dim() == 3 else rel_bias)
+
+        # 마스크
+        if attn_mask is not None:
+            attn = attn + attn_mask
+
+        # softmax 직후 캡처
+        attn = attn.softmax(dim=-1)
+        store_list.append(attn.detach())
+
+        # dropout & proj
+        attn_drop = getattr(attn_module, "attn_drop", None) or getattr(attn_module, "drop_attn", None)
+        if attn_drop is not None:
+            attn = attn_drop(attn)
+        x_out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+
+        if getattr(attn_module, "proj", None) is not None:
+            x_out = attn_module.proj(x_out)
+        proj_drop = getattr(attn_module, "proj_drop", None)
+        if proj_drop is not None:
+            x_out = proj_drop(x_out)
+        return x_out
+
+    attn_module.forward = patched_forward
+    return orig_forward
+
+def _monkeypatch_all_attention(model, store_list):
+    patched = []
+    for blk in getattr(model, "blocks", []):
+        attn_mod = getattr(blk, "attn", None)
+        if attn_mod is None:
+            continue
+        orig = _patch_attention_forward(attn_mod, store_list)
+        patched.append((attn_mod, orig))
+    return patched
+
+def _restore_all_attention(patched_list):
+    for m, orig in patched_list:
+        try:
+            m.forward = orig
+        except Exception:
+            pass
+
+@torch.no_grad()
+def attention_rollout_simple(x_bchw, model, device,
+                             head_avg=True, add_identity=True, discard_ratio=0.0):
+    """Attention Rollout"""
+    model.eval()
+    attns, hooks = [], []
+
+    # 1차: 훅 방식
+    for blk in getattr(model, "blocks", []):
+        hooks.extend(_register_attn_hooks_for_block(blk, attns))
+    _ = model(x_bchw.to(device))
+
+    # 훅 실패 → 2차: monkey-patch
+    if len(attns) == 0:
+        for h in hooks:
+            try: h.remove()
+            except: pass
+        attns = []
+        patched = _monkeypatch_all_attention(model, attns)
+        try:
+            _ = model(x_bchw.to(device))
+        finally:
+            _restore_all_attention(patched)
+
+    # 후킹/패치 모두 실패 시 zero heat
+    if len(attns) == 0:
+        warnings.warn("[Attention] No attention maps captured from hooks/patch. Returning zeros.")
+        H, W = x_bchw.shape[-2:]
+        return np.zeros((H, W), dtype=np.float32)
+
+    # Rollout
+    attns = [a.detach().cpu() for a in attns]
+    joint = None
+    for A in attns:  # (B, heads, N, N)
+        if A.dim() != 4:
+            continue
+        if head_avg:
+            A = A.mean(dim=1)  # (B,N,N)
+        A = A[0]  # batch 1 가정
+        if add_identity:
+            N = A.size(-1)
+            A = A + torch.eye(N, device=A.device)
+        A = A / (A.sum(dim=-1, keepdim=True) + 1e-8)
+        joint = A if joint is None else joint @ A
+
+    if joint is None or joint.numel() == 0:
+        H, W = x_bchw.shape[-2:]
+        return np.zeros((H, W), dtype=np.float32)
+
+    # CLS(0) → patch(1:) 유입 주의집중
+    cls_attn = joint[0, 1:]
+
+    gh, gw = _get_grid_hw_from_model(model)
+    if int(gh) * int(gw) != cls_attn.numel():
+        L = int(round(math.sqrt(cls_attn.numel())))
+        gh, gw = L, max(1, cls_attn.numel() // max(1, L))
+
+    heat = cls_attn.reshape(int(gh), int(gw))
+    if discard_ratio > 0:
+        flat = heat.flatten()
+        k = int(discard_ratio * flat.numel())
+        if 0 < k < flat.numel():
+            thr = torch.topk(flat, flat.numel() - k).values.min()
+            heat = torch.clamp(heat - thr, min=0)
+
+    return _upsample_heat(heat, x_bchw.shape[-2:])
+
+@torch.no_grad()
+def occlusion_sensitivity(x_bchw, model, device, heat=None, topq=0.10, fill_mode="mean"):
+    """heat 상위 topq 가림 → 확신도 하락량 측정"""
+    model.eval(); x = x_bchw.to(device)
+    logits = model(x); cls = int(logits.argmax(dim=1).item())
+    base = float(torch.softmax(logits, dim=1)[0, cls].item())
+    if heat is None: heat = attention_rollout_simple(x_bchw, model, device)
+    H, W = heat.shape; thr = np.percentile(heat, 100*(1-topq)); mask = (heat >= thr)
+    xm = x.clone()
+    if fill_mode == "mean":
+        val = float(xm.mean().item())
+        for c in range(xm.shape[1]): xm[0, c, mask] = val
+    elif isinstance(fill_mode, (int, float)):
+        for c in range(xm.shape[1]): xm[0, c, mask] = float(fill_mode)
+    else:
+        xm[:, :, mask] = 0.0
+    conf_drop = base - float(torch.softmax(model(xm), dim=1)[0, cls].item())
+    return cls, base, conf_drop
+
+# 셀10 호환용 래퍼 (항상 simple 사용)
+def attention_rollout_manual(x_bchw, model, device, discard_ratio=0.0):
+    heat = attention_rollout_simple(
+        x_bchw, model, device, head_avg=True, add_identity=True, discard_ratio=discard_ratio
+    )
+    return heat, {"type": "simple"}
+# === [/### 8] ===
+
+# === [### 9. 학습/검증 루프 + Early Stopping + Best Save/Load] ===
+from torch.amp import autocast, GradScaler
+import copy
+
+SAVE_CRITERION = 'val_loss'   # 'val_loss' 또는 'val_acc'
+USE_TIE_BREAKERS = True
+MIN_DELTA = 1e-4
+
+USE_EMA = True
+EMA_DECAY = 0.999
+SAVE_BEST_EMA_PATH = 'vit_icing_melted_best_ema.pth'
+
+use_amp = torch.cuda.is_available()
+amp_dtype = torch.float16 if use_amp else torch.bfloat16
+scaler = GradScaler(device='cuda', enabled=use_amp)
+
+def _infer_num_classes_from_loader(loader):
+    try:
+        _, ytmp = next(iter(loader)); return int(ytmp.max().item()) + 1
+    except Exception:
+        return None
+
+def _infer_num_classes_from_ds():
+    try:
+        ds = train_ds.base_ds if hasattr(train_ds, "base_ds") else dataset_full
+        return len(ds.classes)
+    except Exception:
+        return 2
+
+def ensure_model_and_optim():
+    global model, criterion, optimizer, scheduler
+    num_classes = _infer_num_classes_from_loader(train_loader) or _infer_num_classes_from_ds() or 2
+    if 'model' not in globals():
+        import timm
+        model = timm.create_model(MODEL_NAME, pretrained=USE_PRETRAINED,
+                                  num_classes=num_classes, drop_path_rate=DROP_PATH_RATE).to(device)
+    else:
+        model.to(device)
+    criterion = criterion if 'criterion' in globals() else nn.CrossEntropyLoss()
+    if 'optimizer' not in globals():
+        optimizer = torch.optim.AdamW(model.parameters(), lr=BASE_LR, weight_decay=WEIGHT_DECAY)
+    if 'scheduler' not in globals():
+        T_max = max(1, EPOCHS - WARMUP_EPOCHS)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max)
+
+@torch.no_grad()
+def evaluate_full(m, loader, device, n_bins_ece=15):
+    m.eval()
+    total_loss, total_samples, total_correct = 0.0, 0, 0
+    all_probs, all_targets = [], []
+    nc = _infer_num_classes_from_loader(loader) or _infer_num_classes_from_ds()
+    conf = torch.zeros(nc, nc, dtype=torch.long)
+    for xb, yb in loader:
+        xb = xb.to(device, non_blocking=True); yb = yb.to(device, non_blocking=True)
+        with autocast(device_type="cuda", dtype=amp_dtype, enabled=False):
+            logits = m(xb); loss = criterion(logits, yb)
+        probs = torch.softmax(logits, dim=1); preds = probs.argmax(dim=1)
+        total_loss += loss.item() * yb.size(0)
+        total_correct += (preds == yb).sum().item()
+        total_samples += yb.size(0)
+        all_probs.append(probs.detach().cpu()); all_targets.append(yb.detach().cpu())
+        for t,p in zip(yb.view(-1), preds.view(-1)): conf[t.long(), p.long()] += 1
+    loss = total_loss / max(1, total_samples)
+    acc  = total_correct / max(1, total_samples)
+    probs = torch.cat(all_probs, 0) if all_probs else torch.empty(0, nc)
+    targets = torch.cat(all_targets, 0) if all_targets else torch.empty(0, dtype=torch.long)
+    tp = conf.diag().float()
+    per_cls_pred = conf.sum(dim=0).float().clamp(min=1)
+    per_cls_true = conf.sum(dim=1).float().clamp(min=1)
+    precision = tp / per_cls_pred; recall = tp / per_cls_true
+    f1_per = (2 * precision * recall / (precision + recall).clamp(min=1e-12))
+    macro_f1 = float(torch.nan_to_num(f1_per, nan=0.0).mean().item())
+    min_recall = float(torch.nan_to_num(recall, nan=0.0).min().item())
+    ece = 0.0
+    if probs.numel() > 0:
+        confidences, pred_labels = probs.max(dim=1)
+        correctness = (pred_labels == targets).float()
+        bins = torch.linspace(0,1,n_bins_ece+1)
+        ece_total = 0.0
+        for i in range(n_bins_ece):
+            lo, hi = bins[i].item(), bins[i+1].item()
+            mask = (confidences >= lo) & (confidences < hi) if i < n_bins_ece-1 else (confidences >= lo) & (confidences <= hi)
+            if mask.any():
+                conf_mean = confidences[mask].mean().item()
+                acc_bin   = correctness[mask].mean().item()
+                ece_total += (mask.float().mean().item()) * abs(conf_mean - acc_bin)
+        ece = float(ece_total)
+    return {"loss":loss, "acc":acc, "macro_f1":macro_f1, "min_recall":min_recall, "ece":ece, "confusion":conf.cpu().numpy()}
+
+def ema_update(ema_model, model, decay=EMA_DECAY):
+    with torch.no_grad():
+        for p_ema, p in zip(ema_model.parameters(), model.parameters()):
+            p_ema.data.mul_(decay).add_(p.data, alpha=1.0 - decay)
+
+def run_one_epoch(model, loader, optimizer=None, desc="train", limit_batches=None, ema_model=None):
+    is_train = optimizer is not None; model.train(is_train)
+    total_loss, total_correct, total_samples = 0.0, 0, 0
+    pbar = tqdm(enumerate(loader), total=(len(loader) if limit_batches is None else min(limit_batches, len(loader))), leave=False, desc=desc)
+    for step, (x, y) in pbar:
+        if limit_batches is not None and step >= limit_batches: break
+        x = x.to(device, non_blocking=True); y = y.to(device, non_blocking=True)
+        if is_train:
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                logits = model(x); loss = criterion(logits, y)
+            scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
+            if ema_model is not None: ema_update(ema_model, model, decay=EMA_DECAY)
+        else:
+            with torch.no_grad():
+                with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                    logits = model(x); loss = criterion(logits, y)
+        with torch.no_grad():
+            preds = logits.argmax(dim=1); correct = (preds == y).sum().item(); bs = y.size(0)
+            total_correct += correct; total_samples += bs; total_loss += loss.item() * bs
+        pbar.set_postfix(loss=f"{total_loss/max(1,total_samples):.4f}", acc=f"{total_correct/max(1,total_samples):.3f}")
+    avg_loss = total_loss / max(1, total_samples); avg_acc  = total_correct / max(1, total_samples)
+    return avg_loss, avg_acc, total_samples
+
+def _is_improved(best_primary, cur_primary, mode='min', eps=MIN_DELTA):
+    if best_primary is None: return True
+    return (best_primary - cur_primary) > eps if mode=='min' else (cur_primary - best_primary) > eps
+
+def _tie_break_is_better(best_metrics, cur_metrics):
+    if not USE_TIE_BREAKERS: return False
+    keys = [('min_recall', +1), ('ece', -1), ('macro_f1', +1)]
+    for k, sign in keys:
+        a = best_metrics.get(k, None); b = cur_metrics.get(k, None)
+        if a is None or b is None: continue
+        if abs(a - b) > 1e-8: return (b - a) * sign > 0
+    return False
+
+def train_standard(model, train_loader, val_loader, epochs=EPOCHS, save_path=SAVE_BEST_PATH, early_stop_patience=5):
+    ema_model = copy.deepcopy(model).to(device) if USE_EMA else None
+    if ema_model is not None:
+        for p in ema_model.parameters(): p.requires_grad_(False)
+    best_primary, best_metrics, best_source, wait = None, None, 'base', 0
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": [], "lr": [], "epoch_time": []}
+    ep_bar = tqdm(range(1, epochs+1), desc="Epochs", position=0, leave=True)
+    t_all = time.time()
+    for ep in ep_bar:
+        t_ep = time.time(); lr_now = optimizer.param_groups[0]['lr']
+        tr_loss, tr_acc, _ = run_one_epoch(model, train_loader, optimizer=optimizer, desc=f"train e{ep}", limit_batches=LIMIT_TRAIN_BATCHES, ema_model=ema_model)
+        base_metrics = evaluate_full(model, val_loader, device)
+        if USE_EMA and ema_model is not None:
+            ema_metrics = evaluate_full(ema_model, val_loader, device)
+            chosen_metrics, chosen_source = ema_metrics, 'ema'
+            if SAVE_CRITERION == 'val_acc':
+                cur_primary, mode = ema_metrics['acc'], 'max'
+            else:
+                cur_primary, mode = ema_metrics['loss'], 'min'
+        else:
+            chosen_metrics, chosen_source = base_metrics, 'base'
+            if SAVE_CRITERION == 'val_acc':
+                cur_primary, mode = base_metrics['acc'], 'max'
+            else:
+                cur_primary, mode = base_metrics['loss'], 'min'
+        improved = _is_improved(best_primary, cur_primary, mode=mode, eps=MIN_DELTA)
+        if not improved and best_metrics is not None and abs((best_primary if best_primary is not None else cur_primary)-cur_primary) <= MIN_DELTA:
+            if _tie_break_is_better(best_metrics, chosen_metrics): improved = True
+        if improved:
+            best_primary, best_metrics, best_source = cur_primary, chosen_metrics, chosen_source
+            try:
+                if best_source == 'ema' and ema_model is not None:
+                    torch.save(ema_model.state_dict(), save_path)
+                    torch.save(ema_model.state_dict(), SAVE_BEST_EMA_PATH)
+                else:
+                    torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, save_path)
+                tqdm.write(f"[INFO] (epoch {ep}) Saved BEST by {SAVE_CRITERION} [{best_source}] → {save_path}")
+            except Exception as e: tqdm.write(f"[WARN] Could not save checkpoint: {e}")
+            wait = 0
+        else:
+            wait += 1
+        try:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                monitor = base_metrics['acc'] if SAVE_CRITERION == 'val_acc' else -base_metrics['loss']
+                scheduler.step(monitor)
+            else:
+                scheduler.step()
+        except NameError: pass
+        history["train_loss"].append(tr_loss); history["train_acc"].append(tr_acc)
+        history["val_loss"].append(base_metrics['loss']); history["val_acc"].append(base_metrics['acc'])
+        history["lr"].append(lr_now); history["epoch_time"].append(time.time()-t_ep)
+        ep_bar.set_postfix({"lr": f"{lr_now:.2e}", "best_src": best_source, SAVE_CRITERION: f"{best_primary:.4f}" if isinstance(best_primary, float) else str(best_primary), "wait": f"{wait}/{early_stop_patience}"})
+        tqdm.write(f"[Epoch {ep}/{epochs}] lr {lr_now:.2e} | train {tr_loss:.4f}/{tr_acc:.3f} | val(base) loss {base_metrics['loss']:.4f} acc {base_metrics['acc']:.3f}" + (f" | val(ema) loss {ema_metrics['loss']:.4f} acc {ema_metrics['acc']:.3f}" if USE_EMA and ema_model is not None else "") + f" | best[{best_source}] {SAVE_CRITERION} {best_primary:.4f}")
+        if early_stop_patience is not None and wait >= early_stop_patience:
+            tqdm.write(f"[EARLY STOP] patience {early_stop_patience} 도달. 중단."); break
+    # 저장된 best 로드
+    try:
+        state = torch.load(save_path, map_location='cpu'); model.load_state_dict(state); model.to(device)
+        tqdm.write(f"[INFO] Loaded best weights from {save_path} ({best_source}).")
+    except Exception as e:
+        tqdm.write(f"[WARN] Could not reload best model: {e}")
+    return history
+# === [/### 9] ===
+
+# === [### 10. 학습 실행] ===
+ensure_model_and_optim()
+history = train_standard(model, train_loader, val_loader, epochs=EPOCHS, save_path=SAVE_BEST_PATH, early_stop_patience=5)
+# === [/### 10] ===
+
+# === [### 11. 학습 곡선 & 테스트 평가] ===
+# 곡선
+fig, ax = plt.subplots(1, 2, figsize=(10,4))
+ax[0].plot(history["train_loss"], label="train"); ax[0].plot(history["val_loss"], label="val")
+ax[0].set_title("Loss"); ax[0].legend(); ax[0].grid(True)
+ax[1].plot(history["train_acc"], label="train"); ax[1].plot(history["val_acc"], label="val")
+ax[1].set_title("Accuracy"); ax[1].legend(); ax[1].grid(True)
+plt.show()
+
+# 테스트
+model.eval(); total_correct, total_samples = 0, 0
+all_preds, all_labels = [], []
+with torch.no_grad():
+    for x, y in test_loader:
+        x = x.to(device, non_blocking=True); y = y.to(device, non_blocking=True)
+        logits = model(x); preds = logits.argmax(dim=1)
+        total_correct += (preds == y).sum().item(); total_samples += y.size(0)
+        all_preds.append(preds.cpu()); all_labels.append(y.cpu())
+test_acc = total_correct / max(1, total_samples)
+print(f"[TEST] Accuracy: {test_acc:.3f}")
+
+# 리포트/혼동행렬
+try:
+    from sklearn.metrics import classification_report, confusion_matrix
+    y_true = torch.cat(all_labels).numpy(); y_pred = torch.cat(all_preds).numpy()
+    target_names = [idx_to_class[0], idx_to_class[1]]
+    print("\n[TEST] classification report")
+    print(classification_report(y_true, y_pred, target_names=target_names))
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(1,1, figsize=(4,4))
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_xticks([0,1]); ax.set_yticks([0,1])
+    ax.set_xticklabels(target_names); ax.set_yticklabels(target_names)
+    ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+    for (i,j), v in np.ndenumerate(cm):
+        ax.text(j, i, str(v), ha='center', va='center', color='black')
+    plt.title("Confusion Matrix"); plt.tight_layout(); plt.show()
+except Exception as e:
+    print("[WARN] sklearn not available or error -> skipping report/matrix.", e)
+# === [/### 11] ===
+
+# === [### 12. Attention 컨투어맵 오버레이 플로팅] ===
+import matplotlib.gridspec as gridspec
+
+# ------- Grid / Layout -------
+GRID_ROWS   = 7
+COLS_LEFT   = 7   # Melted
+COLS_RIGHT  = 7   # Icing
+COLS_TOTAL  = COLS_LEFT + COLS_RIGHT
+ROW_HEIGHT_IN = 2.8
+COL_WIDTH_IN  = None
+WSPACE, HSPACE = 0.02, 0.015
+PAD_LEFT, PAD_RIGHT, PAD_TOP, PAD_BOTTOM = 0.005, 0.995, 0.995, 0.005
+GUTTER_COL_RATIO = 0.3
+
+# ------- Contour / Heatmap -------
+PERC_CLIP  = 98
+GAMMA      = 1.5
+LOW_LEVELS = [0.30]
+HIGH_LEVELS= [0.95]
+LOW_COLOR  = "yellow"
+HIGH_COLOR = "lime"
+CONTOUR_LW = 1.0
+ROLL_DISCARD = 0.0
+
+# val/test 변환 재사용
+val_transform = valtest_tfms
+
+def normalize_heat(h, perc=PERC_CLIP, gamma=GAMMA, eps=1e-8):
+    h = np.asarray(h, dtype=np.float32)
+    hi = np.percentile(h, perc); h = h / max(hi, eps)
+    h = np.clip(h, 0, 1)
+    return h if gamma == 1.0 else h ** gamma
+
+class_to_idx = {v: k for k, v in idx_to_class.items()}
+def _find_idx(name: str):
+    if name in class_to_idx: return class_to_idx[name]
+    for k in class_to_idx:
+        if k.lower() == name.lower(): return class_to_idx[k]
+    for k in class_to_idx:
+        if name.lower() in k.lower():  return class_to_idx[k]
+    raise KeyError(f"클래스 '{name}' 없음. 현재: {list(class_to_idx.keys())}")
+
+melted_idx = _find_idx("Melted"); icing_idx = _find_idx("Icing")
+base_ds = test_ds.base_ds if hasattr(test_ds, "base_ds") else dataset_full
+test_base_indices = list(test_ds.indices)
+
+def _sorted_by_time(base_indices, class_idx):
+    idxs = [i for i in base_indices if base_ds.targets[i] == class_idx]
+    # 원본 파일명 순서(시간 흐름 대표)로 정렬
+    return sorted(idxs, key=lambda i: base_ds.samples[i][0])
+
+melted_sorted = _sorted_by_time(test_base_indices, melted_idx)
+icing_sorted  = _sorted_by_time(test_base_indices, icing_idx)
+
+def _pick_uniform(lst, k):
+    n = len(lst)
+    if k <= 0 or n == 0: return []
+    if k >= n: return lst[:]
+    picks, prev = [], -1
+    for p in np.linspace(0, n-1, num=k):
+        idx = int(round(p)); idx = max(0, min(n-1, idx))
+        if idx == prev and idx+1 < n: idx += 1
+        picks.append(idx); prev = idx
+    return [lst[i] for i in picks]
+
+need_per_class = GRID_ROWS * COLS_LEFT
+melted_pick = _pick_uniform(melted_sorted, need_per_class)
+icing_pick  = _pick_uniform(icing_sorted,  need_per_class)
+
+left_n, right_n = len(melted_pick), len(icing_pick)
+row_blocks = min(GRID_ROWS, max(math.ceil(left_n/COLS_LEFT), math.ceil(right_n/COLS_RIGHT)))
+if row_blocks == 0:
+    raise RuntimeError("표시할 샘플이 부족합니다. test split/파일 정렬을 확인하세요.")
+
+def _infer_aspect_for_column():
+    idx = (melted_pick + icing_pick)[0] if (melted_pick + icing_pick) else test_base_indices[0]
+    path = base_ds.samples[idx][0]
+    with Image.open(path) as pil:
+        pil = ImageOps.exif_transpose(pil); W0, H0 = pil.size
+    return max(0.1, W0 / H0)
+
+col_aspect = _infer_aspect_for_column()
+col_w_in   = COL_WIDTH_IN if COL_WIDTH_IN is not None else (ROW_HEIGHT_IN * col_aspect)
+fig_w = col_w_in * (COLS_TOTAL + GUTTER_COL_RATIO); fig_h = ROW_HEIGHT_IN * row_blocks
+
+fig = plt.figure(figsize=(fig_w, fig_h), constrained_layout=False)
+widths = [1]*COLS_LEFT + [GUTTER_COL_RATIO] + [1]*COLS_RIGHT
+gs = gridspec.GridSpec(row_blocks, COLS_TOTAL + 1, figure=fig, width_ratios=widths, wspace=WSPACE, hspace=HSPACE)
+fig.subplots_adjust(left=PAD_LEFT, right=PAD_RIGHT, top=PAD_TOP, bottom=PAD_BOTTOM)
+
+axes = np.empty((row_blocks, COLS_TOTAL), dtype=object)
+for r in range(row_blocks):
+    for c in range(COLS_LEFT): axes[r, c] = fig.add_subplot(gs[r, c])
+    for c in range(COLS_RIGHT): axes[r, COLS_LEFT + c] = fig.add_subplot(gs[r, COLS_LEFT + 1 + c])
+
+pil_loader = getattr(base_ds, "loader", None)
+def _get_input_and_path(base_idx):
+    path = base_ds.samples[base_idx][0]
+    img  = pil_loader(path) if pil_loader is not None else Image.open(path).convert("RGB")
+    img  = ImageOps.exif_transpose(img); x = val_transform(img)
+    return x.unsqueeze(0), path
+
+def _draw_on_original(ax, sample_t, orig_path, roi_xywh):
+    heat, _ = attention_rollout_manual(sample_t, model, device, discard_ratio=ROLL_DISCARD)
+    # normalize & ROI로 리사이즈 후 원본에 컨투어
+    heat = normalize_heat(heat, perc=PERC_CLIP, gamma=GAMMA)
+    with Image.open(orig_path) as pil:
+        pil = ImageOps.exif_transpose(pil).convert("RGB"); W0, H0 = pil.size
+        extent = (0, W0, H0, 0)
+        x, y, w, h = map(int, roi_xywh)
+        x = max(0, min(x, W0-1)); y = max(0, min(y, H0-1))
+        w = max(1, min(w, W0-x));  h = max(1, min(h, H0-y))
+        heat_t = torch.from_numpy(heat)[None, None]
+        heat_roi = F.interpolate(heat_t, size=(h, w), mode='bilinear', align_corners=False)[0,0].numpy()
+        canvas = np.zeros((H0, W0), dtype=np.float32); canvas[y:y+h, x:x+w] = heat_roi
+        ax.imshow(pil, origin='upper', extent=extent, aspect='equal')
+        if LOW_LEVELS:
+            ax.contour(canvas, levels=LOW_LEVELS, colors=LOW_COLOR, linewidths=CONTOUR_LW, alpha=0.95, origin='upper', extent=extent)
+        if HIGH_LEVELS:
+            ax.contour(canvas, levels=HIGH_LEVELS, colors=HIGH_COLOR, linewidths=CONTOUR_LW, alpha=0.95, origin='upper', extent=extent)
+        ax.set_xlim(0, W0); ax.set_ylim(H0, 0); ax.set_axis_off()
+
+# Render grid
+for r in range(row_blocks):
+    for c in range(COLS_LEFT):
+        k = r*COLS_LEFT + c
+        if k >= left_n: break
+        base_idx = melted_pick[k]; sample_t, path = _get_input_and_path(base_idx)
+        _draw_on_original(axes[r, c], sample_t.to(device), path, ROI_RECT)
+
+for r in range(row_blocks):
+    for c in range(COLS_RIGHT):
+        k = r*COLS_RIGHT + c
+        if k >= right_n: break
+        base_idx = icing_pick[k]; sample_t, path = _get_input_and_path(base_idx)
+        _draw_on_original(axes[r, COLS_LEFT + c], sample_t.to(device), path, ROI_RECT)
+
+plt.show()
+# === [/### 12] ===
