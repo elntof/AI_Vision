@@ -8,215 +8,40 @@ from PySide6.QtWidgets import (
     QSlider, QCheckBox, QGroupBox, QGridLayout, QLineEdit, QSizePolicy
 )
 from PySide6.QtCore import QThread, Signal, Qt, QSettings, QTimer
-from PySide6.QtGui import QPixmap, QPainter, QColor, QPen
+from PySide6.QtGui import QPixmap, QPainter, QColor, QPen, QGuiApplication
 import socket
 import csv
 import io
 from smb.SMBConnection import SMBConnection
 import traceback
 import time
-import subprocess
-import tempfile
-import shutil
+import numpy as np
+import cv2
 
-STOP_FILE = os.path.join(tempfile.gettempdir(), "CompositeImageApp.stop")
-LOCK_FILE = os.path.join(tempfile.gettempdir(), "CompositeImageApp.watchdog.lock")
-DISABLE_FILE = os.path.join(tempfile.gettempdir(), "CompositeImageApp.disabled")
-RUN_BASE_DIR = Path(tempfile.gettempdir()) / "CompositeImageApp_run"
-
-
-def _exe_path():
-    if getattr(sys, "frozen", False):
-        return sys.executable
-    return os.path.abspath(sys.argv[0])
-
-
-def _is_install_location():
-    """현재 실행 위치가 설치 경로(D:\AI Vision)인지 여부 판정"""
-    exe_dir = os.path.normpath(os.path.dirname(_exe_path()))
-    target_dir = os.path.normpath(r'D:\AI Vision')
-    return exe_dir.upper() == target_dir.upper()
-
-
-def _get_app_cwd():
-    """자식/워치독이 사용할 작업 디렉터리(cwd) 반환"""
-    return os.environ.get('COMPOSITE_APP_CWD') or os.path.dirname(_exe_path())
-
-
-def _install_exe_available():
-    """설치 경로에 실행 후보(exe)의 존재 여부 확인"""
+def set_low_process_priority():
+    """프로세스/스레드 우선순위 낮추기 (장비 제어 프로그램과의 경합 감소)"""
     try:
-        install_dir = Path(_get_app_cwd())
-        if not install_dir.exists():
-            return False
-        for p in install_dir.glob("*.exe"):
-            if p.name.lower().startswith("composite"):
-                return True
-        return False
-    except Exception:
-        return False
-
-
-def _find_candidate_install_exe():
-    """설치 폴더에서 최신 실행 후보 exe 반환"""
-    install_dir = Path(_get_app_cwd())
-    if not install_dir.exists():
-        return None
-    exes = [p for p in install_dir.glob("*.exe") if p.name.lower().startswith("composite")]
-    if not exes:
-        return None
-    return max(exes, key=lambda p: p.stat().st_mtime)
-
-
-def _maybe_stage_to_temp():
-    """exe 파일 실행 시, 자신을 TEMP로 복사 / '--staged' 로 재실행 / 원본은 즉시 종료(파인 삭제/교체 가능)"""
-    if not getattr(sys, "frozen", False):
+        import psutil, os as _os
+        p = psutil.Process(_os.getpid())
+        p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
         return
-    if ('--staged' in sys.argv) or ('--no-stage' in sys.argv):
-        return
-
-    if _is_install_location():
-        RUN_BASE_DIR.mkdir(parents=True, exist_ok=True)
-        src = Path(_exe_path())
-        sig = f"{int(src.stat().st_mtime)}_{src.stat().st_size}"
-        run_dir = RUN_BASE_DIR / sig
-        run_dir.mkdir(parents=True, exist_ok=True)
-
-        staged_exe = run_dir / src.name
-        try:
-            shutil.copy2(src, staged_exe)
-        except Exception:
-            return
-
-        env = os.environ.copy()
-        env['COMPOSITE_APP_CWD'] = os.path.dirname(_exe_path())
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-        subprocess.Popen([str(staged_exe), '--staged'], cwd=env['COMPOSITE_APP_CWD'], env=env, creationflags=creationflags)
-        sys.exit(0)
-
-
-def _spawn_child_and_wait():
-    """자식 GUI 한 번 실행 후 종료 대기"""
-    exe = _exe_path()
-    if getattr(sys, "frozen", False):
-        args = [exe, "--child"]
-        cwd = _get_app_cwd()
-    else:
-        args = [sys.executable, exe, "--child"]
-        cwd = os.path.dirname(exe)
-    proc = subprocess.Popen(args, cwd=cwd)
-    return proc.wait()
-
-
-def _single_instance_lock():
-    """단일 워치독 보장용 락 파일 생성 시도"""
-    try:
-        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-        return fd
-    except FileExistsError:
-        return None
-
-
-def _release_instance_lock(fd):
-    """락 해제"""
-    try:
-        os.close(fd)
     except Exception:
         pass
     try:
-        if os.path.exists(LOCK_FILE):
-            os.remove(LOCK_FILE)
+        # ctypes 폴백
+        import ctypes
+        BELOW_NORMAL_PRIORITY_CLASS = 0x4000
+        ctypes.windll.kernel32.SetPriorityClass(
+            ctypes.windll.kernel32.GetCurrentProcess(),
+            BELOW_NORMAL_PRIORITY_CLASS
+        )
     except Exception:
         pass
 
 
-def _acquire_watchdog_lock_with_takeover(timeout_sec=30):
-    """takeover (새 --staged 인스턴스가 있으면 STOP_FILE을 생성하고, 락을 재시도하여 인수)"""
-    start = time.monotonic()
-    requested_stop = False
-    while True:
-        fd = _single_instance_lock()
-        if fd is not None:
-            try:
-                if os.path.exists(STOP_FILE):
-                    os.remove(STOP_FILE)
-            except Exception:
-                pass
-            return fd
-
-        if ('--staged' in sys.argv) and not requested_stop:
-            try:
-                Path(STOP_FILE).touch()
-            except Exception:
-                pass
-            requested_stop = True
-
-        if time.monotonic() - start > timeout_sec:
-            return None
-
-        time.sleep(0.5)
-
-
-def _should_enable_watchdog():
-    """실행파일이 설치 경로('D:\AI Vision') 또는 '--staged'일 때만 자동 재실행(워치독) 동작"""
-    return ('--staged' in sys.argv) or _is_install_location()
-
-
-def run_watchdog_loop():
-    """ 워치독 메인 루프 (자식 GUI를 감시 & 재시작 / exe 삭제 시 자동실행 일시정지 / 새 exe 등장 시 새 빌드가 수행)"""
-    lock_fd = _acquire_watchdog_lock_with_takeover(timeout_sec=30)
-    if lock_fd is None:
-        return
-
-    missing_since = None
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-    try:
-        while True:
-            if os.path.exists(STOP_FILE):
-                try:
-                    os.remove(STOP_FILE)
-                except Exception:
-                    pass
-                break
-
-            # 설치본 부재 → 자식 종료 유도 + 스폰 중단(일시정지)
-            if not _install_exe_available():
-                try:
-                    Path(DISABLE_FILE).touch()
-                except Exception:
-                    pass
-                if missing_since is None:
-                    missing_since = time.monotonic()
-                time.sleep(1.5)
-                continue
-
-            # 설치 exe가 다시 등장 시, 새 바이너리를 1회 실행시켜 자동 인수 유도
-            if missing_since is not None:
-                # 자동실행 재개: DISABLE 해제
-                try:
-                    if os.path.exists(DISABLE_FILE):
-                        os.remove(DISABLE_FILE)
-                except Exception:
-                    pass
-
-                candidate = _find_candidate_install_exe()
-                if candidate is not None:
-                    try:
-                        # 새 exe 1회 기동 → 자체 스테이징 & takeover
-                        subprocess.Popen([str(candidate)], cwd=str(candidate.parent), creationflags=creationflags)
-                    except Exception:
-                        pass
-
-                missing_since = None
-                time.sleep(2.0)
-
-            # 일반 루틴 자식이 종료되면 루프가 재시도/쿨다운
-            _spawn_child_and_wait()
-            time.sleep(10)
-    finally:
-        _release_instance_lock(lock_fd)
+# 메인 윈도우 기본 위치 (모니터 좌측 하단 기준 offset)
+WINDOW_OFFSET_X = 100
+WINDOW_OFFSET_Y = 200
 
 
 # ======== SMB 연결 정보 (카메라PC의 호스트명으로 장비PC와의 네트워크 자동 설정) ========
@@ -267,7 +92,7 @@ client_name = host_name            # 카메라PC 네트워크(호스트) 이름
 server_name = username             # 장비PC 네트워크(호스트) 이름
 domain = ''                        # 도메인이 없으면 빈 문자열
 share_name = 'data'                # 설정 IP의 하위 폴더명
-# =============================
+# ===============================================================================
 
 
 def maintain_max_files(output_folder, max_files):
@@ -355,15 +180,21 @@ def parse_datetime(date_str, time_str):
         date_part = date_str.replace('-', '')
     try:
         time_lower = time_str.lower()
-        is_pm = '오후' in time_lower or 'pm' in time_lower
-        is_am = '오전' in time_lower or 'am' in time_lower
+        is_pm = ('오후' in time_lower) or ('pm' in time_lower)
+        is_am = ('오전' in time_lower) or ('am' in time_lower)
         time_clean = time_str.replace('오전', '').replace('오후', '').replace('AM', '').replace('PM', '').strip()
-        dt_time = datetime.strptime(time_clean, '%I:%M:%S')
-        hour = dt_time.hour
-        if is_pm and hour < 12:
-            hour += 12
-        if is_am and hour == 12:
-            hour = 0
+        # 12시간제 우선
+        try:
+            dt_time = datetime.strptime(time_clean, '%I:%M:%S')
+            hour = dt_time.hour
+            if is_pm and hour < 12:
+                hour += 12
+            if is_am and hour == 12:
+                hour = 0
+        except ValueError:
+            # 24시간제 폴백
+            dt_time = datetime.strptime(time_clean, '%H:%M:%S')
+            hour = dt_time.hour
         dt_full = datetime.strptime(date_part, '%Y%m%d').replace(
             hour=hour, minute=dt_time.minute, second=dt_time.second)
         return dt_full
@@ -418,7 +249,8 @@ def extract_row_info(row):
     equipment = host_name[3:5]  # host_name에서 4~5번째 글자로 장비명 추출
     lot_number = run_number
 
-    puller_status_str = puller_status_raw.strip() if isinstance(puller_status_raw, str) else str(puller_status_raw)
+    puller_status_str = row.get('Puller Mode Status', '')
+    puller_status_str = puller_status_str.strip() if isinstance(puller_status_str, str) else str(puller_status_str)
     try:
         puller_status = int(float(puller_status_str))
     except (ValueError, TypeError):
@@ -444,7 +276,7 @@ def extract_row_info(row):
         4: "TAKEOVER",
         5: "PUMPDOWN",
         90: "PULLOUT",
-        94: "POST PULLOUT"
+        94: "POST-PULLOUT"
     }
 
     if puller_status is not None:
@@ -475,6 +307,7 @@ def extract_row_info(row):
 
         status_display = f"{puller_status} / {status_text}"
     else:
+        status_text = ""  # 누락 방지
         status_display = f"{puller_status_str} / 상태 정보 없음"
 
     return {
@@ -491,18 +324,26 @@ INTEREST_STATUSES = ("NECK", "CROWN", "SHOULDER", "BODY")
 
 
 def find_closest_row_and_attempt(csv_text, target_dt):
-    """Attempt_NEW를 온라인 방식으로 계산하여 반환"""
+    """Attempt_NEW를 온라인 방식으로 계산 (현재시각 이하 중 가장 늦은 행 선택)"""
     f = io.StringIO(csv_text)
     reader = csv.DictReader(f)
-
-    min_diff = timedelta.max
-    selected_row = None
-    selected_attempt = 0
-    selected_info = None
 
     counters = {s: 0 for s in INTEREST_STATUSES}
     prev_status = None
     prev_lot = None
+
+    selected_row = None
+    selected_attempt = 0
+    selected_info = None
+    selected_dt = None
+
+    # fallback 대비: 첫 유효 행/최신 행(각 attempt 스냅샷 포함) 기억
+    first_row = first_info = None
+    first_attempt = None
+
+    last_row = last_info = None
+    last_attempt = None
+    last_dt = None
 
     for row in reader:
         info = extract_row_info(row)
@@ -516,28 +357,124 @@ def find_closest_row_and_attempt(csv_text, target_dt):
             prev_lot = lot
 
         # Attempt_NEW 계산 (설정된 Status 진입 시 이전 row와 다르면 해당 상태 카운터 +1)
-        if status_text in counters:
-            if prev_status != status_text:
-                counters[status_text] += 1
-            attempt_now = counters[status_text]
-        else:
-            attempt_now = 0
+        if status_text in counters and prev_status != status_text:
+            counters[status_text] += 1
+        attempt_now = counters.get(status_text, 0)
 
+        # 행의 시간 파싱
         row_dt = parse_datetime(row.get('Date', ''), row.get('Time', ''))
-        if row_dt is None:
-            prev_status = status_text
-            continue
+        if row_dt:
+            # 첫 유효 행 기억
+            if first_row is None:
+                first_row = row
+                first_info = info
+                first_attempt = attempt_now
 
-        diff = abs(target_dt - row_dt)
-        if diff < min_diff:
-            min_diff = diff
-            selected_row = row
-            selected_attempt = attempt_now
-            selected_info = info
+            # 전체 최신 행 갱신
+            if (last_dt is None) or (row_dt >= last_dt):
+                last_dt = row_dt
+                last_row = row
+                last_info = info
+                last_attempt = attempt_now
+
+            # target_dt 이하 중 가장 늦은 행을 선택
+            if row_dt <= target_dt:
+                if (selected_dt is None) or (row_dt >= selected_dt):
+                    selected_dt = row_dt
+                    selected_row = row
+                    selected_attempt = attempt_now
+                    selected_info = info
 
         prev_status = status_text
 
+    # 폴백: target_dt 이하 행이 하나도 없으면 '최신 행'으로(권장), 없으면 '첫 행'
+    if selected_info is None:
+        if last_info is not None:
+            selected_row = last_row
+            selected_info = last_info
+            selected_attempt = last_attempt
+        elif first_info is not None:
+            selected_row = first_row
+            selected_info = first_info
+            selected_attempt = first_attempt
+        else:
+            # CSV 구조가 비정상/빈 경우 안전한 기본값 반환
+            selected_row = None
+            selected_attempt = 0
+            selected_info = {
+                "date_time": "",
+                "equipment": "",
+                "lot_number": "",
+                "status_display": "",
+                "status_text": ""
+            }
+
     return selected_row, selected_attempt, selected_info
+
+
+def safe_read_gray(path, retries=5, delay=0.2):
+    """안전한 비잠금 읽기 함수"""
+    for _ in range(retries):
+        try:
+            arr = np.fromfile(str(path), dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                return img
+        except Exception:
+            pass
+        time.sleep(delay)
+    return None
+
+
+class CsvTracker:
+    """CSV 접근 최적화용 트래커 (디렉터리 스캔 최소 주기 / 파일 변경 시에만 재파싱 등)"""
+    def __init__(self, min_scan_interval_s=5.0):
+        self.min_scan_interval_s = min_scan_interval_s
+        self.last_check = 0.0
+        self.name = None
+        self.text = None
+        self.last_line_count = 0
+        self.cached_attempt = 0
+        self.cached_info = {"status_text": "", "lot_number": "", "status_display": ""}
+
+    def get_info(self, now_dt):
+        now = time.monotonic()
+        # 스캔 최소 주기 적용
+        if (now - self.last_check) < self.min_scan_interval_s and self.text is not None:
+            return self.cached_attempt, self.cached_info
+
+        latest_name = find_latest_csv_file()
+        if latest_name != self.name:
+            # Lot 변경 등으로 파일 교체 → 전체 재로딩
+            txt = retrieve_csv_text(latest_name) if latest_name else ""
+            self.name, self.text = latest_name, txt
+            self.last_line_count = self.text.count('\n') if self.text else 0
+        else:
+            # 같은 파일이면 줄수(간단 지표) 비교로 변경 여부 판단
+            if latest_name:
+                txt = retrieve_csv_text(latest_name)
+                if txt:
+                    new_count = txt.count('\n')
+                    if new_count != self.last_line_count:
+                        self.text = txt
+                        self.last_line_count = new_count
+                    # 같으면 self.text 유지
+            else:
+                # 파일이 사라진 경우
+                self.text = ""
+                self.last_line_count = 0
+
+        self.last_check = now
+
+        # 파싱/계산 (필요 시만)
+        if self.text:
+            _, attempt_new, info = find_closest_row_and_attempt(self.text, now_dt)
+        else:
+            attempt_new, info = 0, {"status_text": "", "lot_number": "", "status_display": ""}
+
+        self.cached_attempt = attempt_new
+        self.cached_info = info
+        return attempt_new, info
 
 
 class ImageSaverThread(QThread):
@@ -547,7 +484,7 @@ class ImageSaverThread(QThread):
     update_preview = Signal()
     update_device_name = Signal(str)
 
-    def __init__(self, source_file, output_folder, crop_rect, get_format, get_quality, get_interval, get_device_name, get_delete_interval_hours):
+    def __init__(self, source_file, output_folder, crop_rect, get_format, get_quality, get_interval, get_device_name, get_delete_interval_hours, get_allowed_statuses):
         """이미지 저장에 필요한 파라미터(파일 경로, 형식, 크롭 영역 등)를 받으며 쓰레드 객체 초기화"""
         super().__init__()
         self.source_file = source_file
@@ -558,15 +495,17 @@ class ImageSaverThread(QThread):
         self.get_interval = get_interval
         self.get_device_name = get_device_name
         self.get_delete_interval_hours = get_delete_interval_hours
+        self.get_allowed_statuses = get_allowed_statuses
         self.running = False
         self.last_delete_time = None
+        self._last_mtime = None
+        self.csv_tracker = CsvTracker(min_scan_interval_s=5.0)
+        self.setPriority(QThread.LowestPriority)
 
     def run(self):
-        """이미지 저장 루프(Interval 이미지 파일 로드/크롭/저장, 최신 CSV 파일에서 이미지 저장 시각과 가장 가까운 row를 찾아 파일명에 반영)"""
+        """이미지 저장 루프"""
         self.running = True
         while self.running:
-            loop_start = time.monotonic()
-
             if not self.output_folder.exists():
                 try:
                     self.output_folder.mkdir(parents=True, exist_ok=True)
@@ -574,92 +513,109 @@ class ImageSaverThread(QThread):
                     self.update_status.emit(f'폴더 생성 실패: {e}')
                     return
 
-            if self.source_file.exists():
-                try:
-                    with Image.open(self.source_file) as img:
-                        img = img.convert('L')
-                        cx, cy, cw, ch = self.crop_rect()
-                        img_w, img_h = img.size
-                        if (cx + cw > img_w) or (cy + ch > img_h):
-                            self.update_status.emit(f'Crop 영역({cx},{cy},{cw},{ch})이 원본 이미지({img_w},{img_h})보다 큽니다.')
-                            return
-                        cropped = img.crop((cx, cy, cx+cw, cy+ch))
-
-                        formats = self.get_format()
-                        now = datetime.now()
-                        dt_str = now.strftime("%Y%m%d_%H%M%S")
-
-                        latest_csv_fname = find_latest_csv_file()
-                        csv_row_info = {
-                            "equipment": "",
-                            "lot_number": "",
-                            "status_display": "",
-                            "date_time": "",
-                            "status_text": ""
-                        }
-                        attempt_new = 0
-                        if latest_csv_fname:
-                            csv_text = retrieve_csv_text(latest_csv_fname)
-                            if csv_text:
-                                # 현 시각과 가장 가까운 row의 정보 획득
-                                closest_row, attempt_new, csv_row_info = find_closest_row_and_attempt(csv_text, now)
-                            else:
-                                csv_row_info["status_display"] = "CSV 내용 없음"
-                        else:
-                            csv_row_info["status_display"] = "CSV 파일 없음"
-
-                        device_name_full = f"{host_name} / {latest_csv_fname.rsplit('.', 1)[0] if latest_csv_fname else 'N/A'}"
-                        self.update_device_name.emit(device_name_full)
-
-                        device_name_for_fname = host_name[3:5]
-                        lot_for_fname = csv_row_info.get("lot_number", "") or "LotUnknown"
-                        status_for_fname = (csv_row_info.get("status_text", "") or "StatusUnknown").replace(" ", "_").replace("/", "-")
-                        attempt_tag_for_fname = f"{attempt_new}"
-                        base_fname = f"{device_name_for_fname}_{lot_for_fname}_{status_for_fname}_{attempt_tag_for_fname}_{dt_str}"
-
-                        if "BMP" in formats:
-                            fname = f"{base_fname}.bmp"
-                            save_path = self.output_folder / fname
-                            cropped.save(save_path, format="BMP")
-                            self.update_status.emit(f'저장: {fname}')
-                        if "JPEG" in formats:
-                            fname = f"{base_fname}.jpg"
-                            save_path = self.output_folder / fname
-                            cropped.save(save_path, format="JPEG", quality=self.get_quality())
-                            self.update_status.emit(f'저장: {fname}')
-
-                        # 유지 개수(삭제) 정책: 주기적으로 오래된 파일 삭제
-                        maintain_max_files(self.output_folder, self.get_delete_interval_hours())
-
-                        now_time = datetime.now()
-                        current_delete_interval_hours = self.get_delete_interval_hours()
-                        if (self.last_delete_time is None or
-                                (now_time - self.last_delete_time).total_seconds() >= current_delete_interval_hours * 3600):
-                            maintain_max_files(self.output_folder, self.get_delete_interval_hours())
-                            self.last_delete_time = now_time
-
-                    self.update_preview.emit()
-                except Exception as e:
-                    self.update_status.emit(f'저장 실패: {e}')
-            else:
+            # 소스 파일 변경 감지 (변경 시에만 처리, 안정화 대기 200ms)
+            if not self.source_file.exists():
                 self.update_status.emit('소스 파일이 존재하지 않음!')
+                self.msleep(200)
+                continue
 
-            # 고정 레이트 수면: 처리시간 포함해 간격 맞추기
+            try:
+                st = self.source_file.stat()
+                mtime = st.st_mtime
+            except Exception:
+                self.update_status.emit('소스 파일 상태 확인 실패')
+                self.msleep(200)
+                continue
+
+            if self._last_mtime is not None and mtime == self._last_mtime:
+                self.msleep(100)
+                continue
+
+            self.msleep(200)
+            self._last_mtime = mtime
+
+            # 실제 처리 시작
+            try:
+                formats = self.get_format()
+                now = datetime.now()
+                dt_str = now.strftime("%Y%m%d_%H%M%S")
+
+                # 최신 attempt/info 조회
+                attempt_new, csv_row_info = self.csv_tracker.get_info(now)
+
+                # 허용 Status인지 판정 (ALL / * 지원)
+                allowed_raw = self.get_allowed_statuses()  # None이면 '전부 허용'
+                status_txt = (csv_row_info.get("status_text") or "").upper()
+
+                # 장비명/CSV 파일명 GUI 갱신
+                latest_csv_fname = self.csv_tracker.name
+                device_name_full = f"{host_name} / {latest_csv_fname.rsplit('.', 1)[0] if latest_csv_fname else 'N/A'}"
+                self.update_device_name.emit(device_name_full)
+
+                if allowed_raw is not None:
+                    # 빈 세트 방지: 잘못된 ini로 비어있으면 기본 NECK만 허용
+                    allowed = {s.upper() for s in (allowed_raw or {'NECK'})}
+                    if status_txt not in allowed:
+                        self.update_status.emit(f"허용 Status가 아님: {status_txt} → 저장 스킵")
+                        self.update_preview.emit()
+                        self.msleep(50)
+                        continue
+
+                # 안전한 비잠금 읽기
+                img_gray = safe_read_gray(self.source_file)
+                if img_gray is None:
+                    self.update_status.emit('이미지 읽기 실패(쓰기중/락)')
+                    self.msleep(50)
+                    continue
+
+                cx, cy, cw, ch = self.crop_rect()
+                h, w = img_gray.shape[:2]
+                if (cx + cw > w) or (cy + ch > h):
+                    self.update_status.emit(f'Crop 영역({cx},{cy},{cw},{ch})이 원본 이미지({w},{h})보다 큼')
+                    self.msleep(50)
+                    continue
+
+                cropped_np = img_gray[cy:cy+ch, cx:cx+cw]
+                cropped_pil = Image.fromarray(cropped_np)
+
+                # 파일명 구성
+                device_name_for_fname = host_name[3:5]
+                lot_for_fname = csv_row_info.get("lot_number", "") or "LotUnknown"
+                status_for_fname = (csv_row_info.get("status_text", "") or "StatusUnknown").replace(" ", "_").replace("/", "-")
+                attempt_tag_for_fname = f"{attempt_new}"
+                base_fname = f"{device_name_for_fname}_{lot_for_fname}_{status_for_fname}_{attempt_tag_for_fname}_{dt_str}"
+
+                # 저장
+                if "BMP" in formats:
+                    fname = f"{base_fname}.bmp"
+                    save_path = self.output_folder / fname
+                    cropped_pil.save(save_path, format="BMP")
+                    self.update_status.emit(f'저장: {fname}')
+                if "JPEG" in formats:
+                    fname = f"{base_fname}.jpg"
+                    save_path = self.output_folder / fname
+                    cropped_pil.save(save_path, format="JPEG", quality=self.get_quality())
+                    self.update_status.emit(f'저장: {fname}')
+
+                # 유지 개수 기준 (저장 직후에만 호출)
+                try:
+                    maintain_max_files(self.output_folder, self.get_delete_interval_hours())
+                except Exception as e:
+                    self.update_status.emit(f'정리 실패: {e}')
+
+                # 프리뷰 갱신
+                self.update_preview.emit()
+
+            except Exception as e:
+                self.update_status.emit(f'저장 실패: {e}')
+
+            # 안전장치: 파일 변경이 잦을 때 저장 빈도를 제한
             target = float(self.get_interval())
-            elapsed = time.monotonic() - loop_start
-            sleep_left = max(0.0, target - elapsed)
-
-            # 100ms 단위로 잘게 잠자면서 종료 신호 체크
-            ticks = int(sleep_left / 0.1)
-            for _ in range(ticks):
+            ticks = int(target / 0.1)
+            for _ in range(max(1, ticks)):
                 if not self.running:
                     return
                 self.msleep(100)
-            rem_ms = int((sleep_left - ticks * 0.1) * 1000)
-            if rem_ms > 0:
-                if not self.running:
-                    return
-                self.msleep(rem_ms)
 
     def stop(self):
         """이미지 저장 루프 종료"""
@@ -736,6 +692,11 @@ class MainWindow(QWidget):
             settings_path = r"D:\AI Vision\CompositeImageApp.ini"
 
         self.settings = QSettings(settings_path, QSettings.IniFormat)
+        self._window_position_restored = False
+
+        # 허용 Status 기본값 보증(설정 파일 없을 때 기본 'ALL')
+        if self.settings.value('allowed_statuses', None) is None:
+            self.settings.setValue('allowed_statuses', 'ALL')
 
         self.output_folder = Path('Images')
         self.output_folder.mkdir(exist_ok=True)
@@ -818,7 +779,7 @@ class MainWindow(QWidget):
         self.crop_h.setMaximum(9999)
         self.crop_h.setFixedWidth(120)
 
-        # 그룹 박스(Crop Parameter) 생성 및 설정
+        # 그룹 박스(Crop Parameters) 생성 및 설정
         crop_group = QGroupBox('Crop Parameters')
         crop_layout = QGridLayout()
         crop_layout.addWidget(self.crop_x_label, 0, 0)
@@ -878,10 +839,6 @@ class MainWindow(QWidget):
         self.quality_slider.valueChanged.connect(self.set_quality)
         self.quality_slider.valueChanged.connect(self.update_preview)
 
-        # 저장/삭제 Interval 변경 시 설정 저장
-        self.interval_spin.valueChanged.connect(self.save_options)
-        self.delete_interval_spin.valueChanged.connect(self.save_options)
-
         # 초기 설정 파일을 읽어 GUI에 반영
         self.load_options()
         self.set_quality(self.quality_slider.value())
@@ -895,11 +852,76 @@ class MainWindow(QWidget):
         if self.auto_start_enabled:
             QTimer.singleShot(0, self.handle_auto_start)
 
-        # STOP/DISABLE 파일 감시 (업데이트/정지/삭제-일시정지 시 GUI 즉시 종료)
-        self._stop_timer = QTimer(self)
-        self._stop_timer.setInterval(1000)  # 1초마다
-        self._stop_timer.timeout.connect(self._check_stop_or_disable_and_quit)
-        self._stop_timer.start()
+    def showEvent(self, event):
+        """메인 창 최초 표시 시 INI 저장 좌표 복원 또는 좌하단 오프셋 기본 위치 적용"""
+        super().showEvent(event)
+        if not self._window_position_restored:
+            self._window_position_restored = True
+            self._restore_window_position()
+
+    def _restore_window_position(self):
+        """INI(QSettings)에 저장된 메인 창 좌표를 복원"""
+        saved_x = self.settings.value('main_window_pos_x', None)
+        saved_y = self.settings.value('main_window_pos_y', None)
+        try:
+            x_val = None if saved_x is None else int(float(saved_x))
+            y_val = None if saved_y is None else int(float(saved_y))
+        except (TypeError, ValueError):
+            x_val = y_val = None
+
+        if x_val is not None and y_val is not None:
+            x_val, y_val = self._adjust_position_to_screen(x_val, y_val)
+            self.move(x_val, y_val)
+            return
+
+        self._move_to_default_position()
+
+    def _move_to_default_position(self):
+        """저장 값이 없을 때, 기본 위치로 메인 창을 이동"""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+
+        available = screen.availableGeometry()
+        frame_geo = self.frameGeometry()
+        window_width = frame_geo.width()
+        window_height = frame_geo.height()
+        target_x = available.x() + WINDOW_OFFSET_X
+        target_y = available.y() + available.height() - WINDOW_OFFSET_Y - window_height
+        target_x, target_y = self._adjust_position_to_screen(target_x, target_y, window_width, window_height)
+        self.move(target_x, target_y)
+
+    def _adjust_position_to_screen(self, x, y, window_width=None, window_height=None):
+        """메인 창의 좌표가 현재 모니터의 표시 가능한 영역을 벗어나지 않도록 보정"""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return int(round(x)), int(round(y))
+
+        available = screen.availableGeometry()
+        if window_width is None or window_height is None:
+            frame_geo = self.frameGeometry()
+            if window_width is None:
+                window_width = frame_geo.width()
+            if window_height is None:
+                window_height = frame_geo.height()
+
+        min_x = available.x()
+        min_y = available.y()
+        max_x = max(min_x, available.x() + available.width() - window_width)
+        max_y = max(min_y, available.y() + available.height() - window_height)
+
+        clamped_x = max(min_x, min(int(round(x)), max_x))
+        clamped_y = max(min_y, min(int(round(y)), max_y))
+        return clamped_x, clamped_y
+
+
+    def get_allowed_statuses(self):
+        """허용 Status 문자열을 세트로 변환 (ALL / * 지원: 전체 허용 시 None 반환)"""
+        s = str(self.settings.value('allowed_statuses', 'ALL') or 'ALL')
+        parts = {t.strip().upper() for t in s.split(',') if t.strip()}
+        if 'ALL' in parts or '*' in parts:
+            return None
+        return parts
 
     def start_saving(self):
         """이미지 저장 쓰레드 시작"""
@@ -914,7 +936,8 @@ class MainWindow(QWidget):
             self.get_quality,
             self.get_interval,
             self.get_device_name,
-            self.get_delete_interval_hours
+            self.get_delete_interval_hours,
+            self.get_allowed_statuses
         )
         self.image_thread.update_status.connect(self.status_label.setText)
         self.image_thread.update_preview.connect(self.update_preview)
@@ -937,7 +960,11 @@ class MainWindow(QWidget):
         self.status_label.setText('저장 중지.')
 
     def closeEvent(self, event):
-        """윈도우 종료 시 쓰레드도 정리"""
+        """윈도우 종료 시 설정 저장(.ini) 및 쓰레드 정리"""
+        try:
+            self.save_options()
+        except Exception:
+            pass
         self.stop_saving()
         event.accept()
 
@@ -991,10 +1018,12 @@ class MainWindow(QWidget):
             self.preview_label.setText('이미지 없음')
             return
         try:
-            with Image.open(self.source_file) as img:
-                img = img.convert('L')
-                crop_rect = self.get_crop_rect()
-                self.preview_label.set_image(img.copy(), crop_rect)
+            img_gray = safe_read_gray(self.source_file)
+            if img_gray is None:
+                raise RuntimeError("이미지 읽기 실패(쓰기중/락)")
+            pil_img = Image.fromarray(img_gray)
+            crop_rect = self.get_crop_rect()
+            self.preview_label.set_image(pil_img, crop_rect)
         except Exception as e:
             self.preview_label.clear()
             self.preview_label.setText(str(e))
@@ -1010,6 +1039,12 @@ class MainWindow(QWidget):
         self.settings.setValue('bmp_checked', self.bmp_check.isChecked())
         self.settings.setValue('jpg_checked', self.jpg_check.isChecked())
         self.settings.setValue('jpeg_quality', self.quality_slider.value())
+
+        # 메인 창 위치 저장
+        top_left = self.frameGeometry().topLeft()
+        self.settings.setValue('main_window_pos_x', int(top_left.x()))
+        self.settings.setValue('main_window_pos_y', int(top_left.y()))
+
         self.settings.sync()
         self.status_label.setText('설정 저장됨.')
 
@@ -1031,14 +1066,11 @@ class MainWindow(QWidget):
         """ImageSaverThread에서 보낸 최신 장비명으로 GUI 장비명 입력란 갱신"""
         self.device_edit.setText(full_device_name)
 
-    def _check_stop_or_disable_and_quit(self):
-        """STOP/DISABLE 감지 시 GUI 자발 종료 (업데이트 인수 & 삭제 후 멈춤 즉시 반영)"""
-        if os.path.exists(STOP_FILE) or os.path.exists(DISABLE_FILE):
-            QApplication.quit()
-
 
 def run_gui():
-    """QApplication 인스턴스의 중복 실행 문제 방지"""
+    """프로세스 우선순위 하향 및 QApplication 인스턴스의 중복 실행 문제 방지"""
+    set_low_process_priority()
+
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
@@ -1061,18 +1093,4 @@ def run_gui():
 
 
 if __name__ == '__main__':
-    # 즉시 워치독/자식 중지 (--stop 인자로 실행하면 STOP_FILE 생성 후 종료)
-    if '--stop' in sys.argv:
-        Path(STOP_FILE).touch()
-        sys.exit(0)
-
-    _maybe_stage_to_temp()
-
-    # 워치독 조건 (설치 경로이거나 --staged 일 때만)
-    if ('--no-watchdog' in sys.argv) or (not _should_enable_watchdog()):
-        run_gui()
-    else:
-        if '--child' in sys.argv:
-            run_gui()
-        else:
-            run_watchdog_loop()
+    run_gui()
