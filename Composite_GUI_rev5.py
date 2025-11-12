@@ -18,26 +18,6 @@ import time
 import numpy as np
 import cv2
 
-def set_low_process_priority():
-    """프로세스/스레드 우선순위 낮추기 (장비 제어 프로그램과의 경합 감소)"""
-    try:
-        import psutil, os as _os
-        p = psutil.Process(_os.getpid())
-        p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
-        return
-    except Exception:
-        pass
-    try:
-        # ctypes 폴백
-        import ctypes
-        BELOW_NORMAL_PRIORITY_CLASS = 0x4000
-        ctypes.windll.kernel32.SetPriorityClass(
-            ctypes.windll.kernel32.GetCurrentProcess(),
-            BELOW_NORMAL_PRIORITY_CLASS
-        )
-    except Exception:
-        pass
-
 
 # 메인 윈도우 기본 위치 (모니터 좌측 하단 기준 offset)
 WINDOW_OFFSET_X = 100
@@ -112,7 +92,6 @@ def maintain_max_files(output_folder, max_files):
 def find_latest_csv_file():
     """SMB에서 가장 마지막으로 수정된 CSV 파일명을 반환"""
     conn = None
-    last_exception = None
     for port_try in [139, 445]:
         try:
             is_direct_tcp = (port_try == 445)
@@ -131,7 +110,7 @@ def find_latest_csv_file():
             else:
                 conn.close()
         except Exception:
-            last_exception = traceback.format_exc()
+            pass
         finally:
             if conn:
                 try:
@@ -144,7 +123,6 @@ def find_latest_csv_file():
 def retrieve_csv_text(filename):
     """SMB에서 지정한 CSV 파일 내용을 cp949 인코딩으로 읽어 반환"""
     conn = None
-    last_exception = None
     for port_try in [139, 445]:
         try:
             is_direct_tcp = (port_try == 445)
@@ -161,7 +139,7 @@ def retrieve_csv_text(filename):
             else:
                 conn.close()
         except Exception:
-            last_exception = traceback.format_exc()
+            pass
         finally:
             if conn:
                 try:
@@ -178,13 +156,17 @@ def parse_datetime(date_str, time_str):
         date_part = dt.strftime('%Y%m%d')
     except Exception:
         date_part = date_str.replace('-', '')
+
     try:
-        time_lower = time_str.lower()
-        is_pm = ('오후' in time_lower) or ('pm' in time_lower)
-        is_am = ('오전' in time_lower) or ('am' in time_lower)
-        time_clean = time_str.replace('오전', '').replace('오후', '').replace('AM', '').replace('PM', '').strip()
-        # 12시간제 우선
+        t = time_str.strip()
+        tl = t.lower()
+        is_pm = ('오후' in tl) or ('pm' in tl)
+        is_am = ('오전' in tl) or ('am' in tl)
+
+        time_clean = (t.replace('오전','').replace('오후','').replace('AM','').replace('PM','').replace('am','').replace('pm','').strip())
+
         try:
+            # 12시간제 우선
             dt_time = datetime.strptime(time_clean, '%I:%M:%S')
             hour = dt_time.hour
             if is_pm and hour < 12:
@@ -195,30 +177,12 @@ def parse_datetime(date_str, time_str):
             # 24시간제 폴백
             dt_time = datetime.strptime(time_clean, '%H:%M:%S')
             hour = dt_time.hour
+
         dt_full = datetime.strptime(date_part, '%Y%m%d').replace(
             hour=hour, minute=dt_time.minute, second=dt_time.second)
         return dt_full
     except Exception:
         return None
-
-
-def find_closest_row(csv_text, target_dt):
-    """주어진 CSV 텍스트에서 target_dt에 가장 가까운 날짜/시간을 가진 row를 반환"""
-    f = io.StringIO(csv_text)
-    reader = csv.DictReader(f)
-    min_diff = timedelta.max
-    selected_row = None
-    for row in reader:
-        row_date = row.get('Date', '')
-        row_time = row.get('Time', '')
-        row_dt = parse_datetime(row_date, row_time)
-        if row_dt is None:
-            continue
-        diff = abs(target_dt - row_dt)
-        if diff < min_diff:
-            min_diff = diff
-            selected_row = row
-    return selected_row, None
 
 
 def extract_row_info(row):
@@ -249,8 +213,7 @@ def extract_row_info(row):
     equipment = host_name[3:5]  # host_name에서 4~5번째 글자로 장비명 추출
     lot_number = run_number
 
-    puller_status_str = row.get('Puller Mode Status', '')
-    puller_status_str = puller_status_str.strip() if isinstance(puller_status_str, str) else str(puller_status_str)
+    puller_status_str = puller_status_raw.strip() if isinstance(puller_status_raw, str) else str(puller_status_raw)
     try:
         puller_status = int(float(puller_status_str))
     except (ValueError, TypeError):
@@ -307,11 +270,12 @@ def extract_row_info(row):
 
         status_display = f"{puller_status} / {status_text}"
     else:
-        status_text = ""  # 누락 방지
+        status_text = ""
         status_display = f"{puller_status_str} / 상태 정보 없음"
 
     return {
         "date_time": date_time,
+        "dt": dt_full,
         "equipment": equipment,
         "lot_number": lot_number,
         "status_display": status_display,
@@ -337,7 +301,6 @@ def find_closest_row_and_attempt(csv_text, target_dt):
     selected_info = None
     selected_dt = None
 
-    # fallback 대비: 첫 유효 행/최신 행(각 attempt 스냅샷 포함) 기억
     first_row = first_info = None
     first_attempt = None
 
@@ -349,6 +312,7 @@ def find_closest_row_and_attempt(csv_text, target_dt):
         info = extract_row_info(row)
         lot = info.get("lot_number", "")
         status_text = info.get("status_text", "")
+        row_dt = info.get("dt")
 
         # 동일 csv 내에서 Lot# 변경 시 카운터 리셋
         if lot and lot != prev_lot:
@@ -361,23 +325,21 @@ def find_closest_row_and_attempt(csv_text, target_dt):
             counters[status_text] += 1
         attempt_now = counters.get(status_text, 0)
 
-        # 행의 시간 파싱
-        row_dt = parse_datetime(row.get('Date', ''), row.get('Time', ''))
         if row_dt:
-            # 첫 유효 행 기억
+            # 첫 유효 행
             if first_row is None:
                 first_row = row
                 first_info = info
                 first_attempt = attempt_now
 
-            # 전체 최신 행 갱신
+            # 전체 최신 행
             if (last_dt is None) or (row_dt >= last_dt):
                 last_dt = row_dt
                 last_row = row
                 last_info = info
                 last_attempt = attempt_now
 
-            # target_dt 이하 중 가장 늦은 행을 선택
+            # target_dt 이하 중 가장 늦은 행 선택
             if row_dt <= target_dt:
                 if (selected_dt is None) or (row_dt >= selected_dt):
                     selected_dt = row_dt
@@ -413,7 +375,7 @@ def find_closest_row_and_attempt(csv_text, target_dt):
 
 
 def safe_read_gray(path, retries=5, delay=0.2):
-    """안전한 비잠금 읽기 함수"""
+    """이미지 안전 읽기(비잠금) 함수"""
     for _ in range(retries):
         try:
             arr = np.fromfile(str(path), dtype=np.uint8)
@@ -426,55 +388,85 @@ def safe_read_gray(path, retries=5, delay=0.2):
     return None
 
 
+def find_latest_csv_with_meta():
+    """최신 CSV의 파일명과 메타데이터(mtime, size)를 함께 반환"""
+    conn = None
+    for port_try in [139, 445]:
+        try:
+            is_direct_tcp = (port_try == 445)
+            conn = SMBConnection(username, password, client_name, server_name,
+                                 domain=domain, use_ntlm_v2=True, is_direct_tcp=is_direct_tcp)
+            if conn.connect(server_ip, port_try):
+                files = conn.listPath(share_name, '/')
+                csv_files = [f for f in files if f.filename.lower().endswith('.csv')]
+                if not csv_files:
+                    return None
+                latest = max(csv_files, key=lambda f: f.last_write_time)
+                return {
+                    "name": latest.filename,
+                    "mtime": latest.last_write_time,
+                    "size": getattr(latest, "file_size", None)
+                }
+        except Exception:
+            pass
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+    return None
+
+
 class CsvTracker:
-    """CSV 접근 최적화용 트래커 (디렉터리 스캔 최소 주기 / 파일 변경 시에만 재파싱 등)"""
-    def __init__(self, min_scan_interval_s=5.0):
-        self.min_scan_interval_s = min_scan_interval_s
-        self.last_check = 0.0
+    """CSV 접근 최적화용 트래커 (루프당 1회 디렉터리 스캔)"""
+    def __init__(self):
         self.name = None
+        self.mtime = None
+        self.size = None
         self.text = None
-        self.last_line_count = 0
+
         self.cached_attempt = 0
         self.cached_info = {"status_text": "", "lot_number": "", "status_display": ""}
 
     def get_info(self, now_dt):
-        now = time.monotonic()
-        # 스캔 최소 주기 적용
-        if (now - self.last_check) < self.min_scan_interval_s and self.text is not None:
+        # 1) 디렉터리 스캔으로 최신 CSV + 메타데이터 획득
+        latest = find_latest_csv_with_meta()
+
+        # 최신 CSV 자체가 없으면 캐시 초기화/유지
+        if latest is None:
+            if self.text is None:
+                self.cached_attempt = 0
+                self.cached_info = {"status_text": "", "lot_number": "", "status_display": ""}
             return self.cached_attempt, self.cached_info
 
-        latest_name = find_latest_csv_file()
-        if latest_name != self.name:
-            # Lot 변경 등으로 파일 교체 → 전체 재로딩
-            txt = retrieve_csv_text(latest_name) if latest_name else ""
-            self.name, self.text = latest_name, txt
-            self.last_line_count = self.text.count('\n') if self.text else 0
-        else:
-            # 같은 파일이면 줄수(간단 지표) 비교로 변경 여부 판단
-            if latest_name:
-                txt = retrieve_csv_text(latest_name)
-                if txt:
-                    new_count = txt.count('\n')
-                    if new_count != self.last_line_count:
-                        self.text = txt
-                        self.last_line_count = new_count
-                    # 같으면 self.text 유지
-            else:
-                # 파일이 사라진 경우
-                self.text = ""
-                self.last_line_count = 0
+        need_reload = False
 
-        self.last_check = now
+        # 2) 파일명이 바뀐 경우(새 Lot 시작) → 본문 읽기 시도
+        if self.name != latest["name"]:
+            need_reload = True
 
-        # 파싱/계산 (필요 시만)
-        if self.text:
-            _, attempt_new, info = find_closest_row_and_attempt(self.text, now_dt)
-        else:
-            attempt_new, info = 0, {"status_text": "", "lot_number": "", "status_display": ""}
+        # 3) 파일명은 같지만 메타데이터가 변한 경우 → 본문 읽기 시도
+        elif (latest.get("mtime") != self.mtime) or (latest.get("size") != self.size):
+            need_reload = True
 
-        self.cached_attempt = attempt_new
-        self.cached_info = info
-        return attempt_new, info
+        # 4) 본문 읽기/파싱
+        if need_reload:
+            # 본문 읽기
+            new_text = retrieve_csv_text(latest["name"])
+            if new_text:  # 성공한 경우에만 상태 갱신 (실패 시 캐시/상태 유지 후 다음 루프에서 재시도)
+                self.text = new_text
+                self.name = latest["name"]
+                self.mtime = latest["mtime"]
+                self.size = latest["size"]
+
+                # Process 정보 파싱 + Attempt 재계산
+                _, attempt_new, info = find_closest_row_and_attempt(self.text, now_dt)
+                self.cached_attempt = attempt_new
+                self.cached_info = info
+
+        # 5) 변경 없음 → 캐시 그대로 반환
+        return self.cached_attempt, self.cached_info
 
 
 class ImageSaverThread(QThread):
@@ -484,7 +476,7 @@ class ImageSaverThread(QThread):
     update_preview = Signal()
     update_device_name = Signal(str)
 
-    def __init__(self, source_file, output_folder, crop_rect, get_format, get_quality, get_interval, get_device_name, get_delete_interval_hours, get_allowed_statuses):
+    def __init__(self, source_file, output_folder, crop_rect, get_format, get_quality, get_interval, get_device_name, get_delete_interval_hours):
         """이미지 저장에 필요한 파라미터(파일 경로, 형식, 크롭 영역 등)를 받으며 쓰레드 객체 초기화"""
         super().__init__()
         self.source_file = source_file
@@ -495,11 +487,9 @@ class ImageSaverThread(QThread):
         self.get_interval = get_interval
         self.get_device_name = get_device_name
         self.get_delete_interval_hours = get_delete_interval_hours
-        self.get_allowed_statuses = get_allowed_statuses
         self.running = False
-        self.last_delete_time = None
         self._last_mtime = None
-        self.csv_tracker = CsvTracker(min_scan_interval_s=5.0)
+        self.csv_tracker = CsvTracker()
         self.setPriority(QThread.LowestPriority)
 
     def run(self):
@@ -543,23 +533,10 @@ class ImageSaverThread(QThread):
                 # 최신 attempt/info 조회
                 attempt_new, csv_row_info = self.csv_tracker.get_info(now)
 
-                # 허용 Status인지 판정 (ALL / * 지원)
-                allowed_raw = self.get_allowed_statuses()  # None이면 '전부 허용'
-                status_txt = (csv_row_info.get("status_text") or "").upper()
-
                 # 장비명/CSV 파일명 GUI 갱신
                 latest_csv_fname = self.csv_tracker.name
                 device_name_full = f"{host_name} / {latest_csv_fname.rsplit('.', 1)[0] if latest_csv_fname else 'N/A'}"
                 self.update_device_name.emit(device_name_full)
-
-                if allowed_raw is not None:
-                    # 빈 세트 방지: 잘못된 ini로 비어있으면 기본 NECK만 허용
-                    allowed = {s.upper() for s in (allowed_raw or {'NECK'})}
-                    if status_txt not in allowed:
-                        self.update_status.emit(f"허용 Status가 아님: {status_txt} → 저장 스킵")
-                        self.update_preview.emit()
-                        self.msleep(50)
-                        continue
 
                 # 안전한 비잠금 읽기
                 img_gray = safe_read_gray(self.source_file)
@@ -693,10 +670,6 @@ class MainWindow(QWidget):
 
         self.settings = QSettings(settings_path, QSettings.IniFormat)
         self._window_position_restored = False
-
-        # 허용 Status 기본값 보증(설정 파일 없을 때 기본 'ALL')
-        if self.settings.value('allowed_statuses', None) is None:
-            self.settings.setValue('allowed_statuses', 'ALL')
 
         self.output_folder = Path('Images')
         self.output_folder.mkdir(exist_ok=True)
@@ -915,14 +888,6 @@ class MainWindow(QWidget):
         return clamped_x, clamped_y
 
 
-    def get_allowed_statuses(self):
-        """허용 Status 문자열을 세트로 변환 (ALL / * 지원: 전체 허용 시 None 반환)"""
-        s = str(self.settings.value('allowed_statuses', 'ALL') or 'ALL')
-        parts = {t.strip().upper() for t in s.split(',') if t.strip()}
-        if 'ALL' in parts or '*' in parts:
-            return None
-        return parts
-
     def start_saving(self):
         """이미지 저장 쓰레드 시작"""
         self.start_button.setEnabled(False)
@@ -936,8 +901,7 @@ class MainWindow(QWidget):
             self.get_quality,
             self.get_interval,
             self.get_device_name,
-            self.get_delete_interval_hours,
-            self.get_allowed_statuses
+            self.get_delete_interval_hours
         )
         self.image_thread.update_status.connect(self.status_label.setText)
         self.image_thread.update_preview.connect(self.update_preview)
@@ -1068,9 +1032,7 @@ class MainWindow(QWidget):
 
 
 def run_gui():
-    """프로세스 우선순위 하향 및 QApplication 인스턴스의 중복 실행 문제 방지"""
-    set_low_process_priority()
-
+    """QApplication 인스턴스의 중복 실행 문제 방지"""
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
@@ -1083,8 +1045,8 @@ def run_gui():
 
     window = MainWindow()
 
-    # GUI 시작 시 최신 CSV 파일명과 호스트명을 장비명 입력란에 반영
-    latest_csv_fname = find_latest_csv_file()
+    latest_meta = find_latest_csv_with_meta()
+    latest_csv_fname = latest_meta["name"] if latest_meta else None
     host_and_csvname = f"{host_name} / {latest_csv_fname.rsplit('.',1)[0] if latest_csv_fname else 'N/A'}"
     window.device_edit.setText(host_and_csvname)
 
