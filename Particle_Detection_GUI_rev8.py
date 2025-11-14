@@ -97,6 +97,9 @@ ADAPTIVE_THRESHOLD_GAIN = 0.2       # 적응 임계 보정계수
 WINDOW_OFFSET_X = 100
 WINDOW_OFFSET_Y = 200
 
+# 신규 이미지 부재 시 미리보기 플레이스홀더 텍스트
+NO_IMAGE_PLACEHOLDER_TEXT = "신규 이미지 없음"
+
 
 def safe_image_load(image_path, max_retries=5, delay=0.2):
     """안전 이미지 로당 (재시도 최대 5회, 0.2초 간격)"""
@@ -346,6 +349,7 @@ class ImagePreviewLabel(QLabel):
         self.noise_text = ""
         self.anchor_value = None
         self.noise_points = []
+        self.placeholder_text = ""
 
     def set_noise_text(self, text: str):
         """미리보기 하단에 표시할 Noise 정보 텍스트 설정"""
@@ -362,6 +366,29 @@ class ImagePreviewLabel(QLabel):
         self.noise_points = list(points) if points else []
         self.update()
 
+    def show_placeholder(self, text: str):
+        """이미지 대신 표시할 플레이스홀더 텍스트 설정"""
+        self.pixmap = None
+        self.src_shape = None
+        self.placeholder_text = text or ""
+        self.filename = ''
+        self.noise_text = ""
+        self.noise_points = []
+        self.anchor_value = None
+        self.update()
+
+    def clear(self):
+        """레이블 초기화 (플레이스홀더/이미지/텍스트 모두 삭제)"""
+        super().clear()
+        self.pixmap = None
+        self.src_shape = None
+        self.placeholder_text = ""
+        self.filename = ''
+        self.noise_text = ""
+        self.noise_points = []
+        self.anchor_value = None
+        self.update()
+
     def show_image(self, npimg, box=None, filename=None):
         if box is not None:
             if isinstance(box, (list, tuple)) and len(box) == 2 and isinstance(box[0], (list, tuple)):
@@ -374,6 +401,7 @@ class ImagePreviewLabel(QLabel):
             self.filename = filename
         self.src_shape = npimg.shape[:2]
         h, w = self.src_shape
+        self.placeholder_text = ""
 
         if npimg.ndim == 3:
             rgb_img = cv2.cvtColor(npimg, cv2.COLOR_BGR2RGB)
@@ -387,9 +415,10 @@ class ImagePreviewLabel(QLabel):
 
     def paintEvent(self, event):
         super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
         if self.pixmap is not None and self.src_shape is not None:
-            painter = QPainter(self)
-            painter.setRenderHint(QPainter.Antialiasing, True)
             x0 = (self.width() - self.pixmap.width()) // 2
             y0 = (self.height() - self.pixmap.height()) // 2
             painter.drawPixmap(x0, y0, self.pixmap)
@@ -471,7 +500,16 @@ class ImagePreviewLabel(QLabel):
                 painter.setPen(QColor(255, 255, 255))
                 painter.drawText(bg_rect.adjusted(4, 0, -2, 0), Qt.AlignLeft | Qt.AlignVCenter, text)
 
-            painter.end()
+        else:
+            painter.fillRect(self.rect(), QColor(0, 0, 0))
+            if self.placeholder_text:
+                font = painter.font()
+                font.setPointSize(11)
+                painter.setFont(font)
+                painter.setPen(QColor(255, 255, 255))
+                painter.drawText(self.rect().adjusted(8, 8, -8, -8), Qt.AlignCenter | Qt.TextWordWrap, self.placeholder_text)
+
+        painter.end()
 
 
 class BacklogFeeder(QObject):
@@ -1171,14 +1209,14 @@ class ParticleDetectionGUI(QWidget):
             allow_ext = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
             cands = [p for p in IMG_INPUT_DIR.iterdir() if p.suffix.lower() in allow_ext]
             if not cands:
-                self.preview_label.clear()
+                self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
                 return
 
             latest = max(cands, key=lambda p: p.stat().st_mtime)
             img = safe_image_load(str(latest))
             img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img is not None else None
             if img is None:
-                self.preview_label.clear()
+                self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
                 return
 
             boxes = [self.get_box1(), self.get_box2()]
@@ -1195,7 +1233,7 @@ class ParticleDetectionGUI(QWidget):
             self.device_info_box.setText('_'.join(fields[:4]))
 
         except Exception:
-            self.preview_label.clear()
+            self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
 
 
     def start_realtime(self):
@@ -1288,22 +1326,23 @@ class ParticleDetectionGUI(QWidget):
         finally:
             super().closeEvent(event)
 
-    def process_new_images_tick(self):
-        """(실시간)신규 이미지 처리"""
-        new_images = find_new_images(IMG_INPUT_DIR, self.session_processed_images)
-        if not new_images:
-            # 상태 메세지 깜빡임 방지 (래치/홀드/유예시간 고려)
-            now = time.monotonic()
-            if self.disallowed_mode_latched:
-                return
-            if now < self.status_hold_until:
-                return
-            if (now - self.last_image_seen_at) <= self.no_new_image_grace_s:
-                return
-            self._set_status("신규 이미지 없음 (폴더 감시 중)")
+def process_new_images_tick(self):
+    """(실시간)신규 이미지 처리"""
+    new_images = find_new_images(IMG_INPUT_DIR, self.session_processed_images)
+
+    if not new_images:
+        # 상태 메세지 깜빡임 방지 (홀드/유예시간 고려)
+        now = time.monotonic()
+        if now < self.status_hold_until:
             return
-        for p in new_images:
-            self.process_single_image(p)
+        if (now - self.last_image_seen_at) <= self.no_new_image_grace_s:
+            return
+        self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
+        self._set_status("신규 이미지 없음 (폴더 감시 중)")
+        return
+
+    for p in new_images:
+        self.process_single_image(p)
 
     @Slot()
     def _on_backlog_finished(self):
