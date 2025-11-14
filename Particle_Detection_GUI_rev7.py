@@ -71,7 +71,7 @@ os.makedirs(EVENT_OUTPUT_DIR, exist_ok=True)
 os.makedirs(GRAPH_OUTPUT_DIR, exist_ok=True)
 
 # 파티클 탐지 파라미터
-WARMUP_FRAMES = 10             # 워밍업 프레임 수
+WARMUP_FRAMES = 15             # 워밍업 프레임 수
 MIN_NOISE_REPEAT = 2           # 워밍업 구간 내 몇 회 이상 등장 좌표를 노이즈로 설정
 MANUAL_THRESHOLD   = 7         # 이진화 임계값
 KERNEL_SIZE_TOPHAT = (3, 3)    # tophat 모폴로지 연산 커널 크기
@@ -345,6 +345,7 @@ class ImagePreviewLabel(QLabel):
         self.filename = ''
         self.noise_text = ""
         self.anchor_value = None
+        self.noise_points = []
 
     def set_noise_text(self, text: str):
         """미리보기 하단에 표시할 Noise 정보 텍스트 설정"""
@@ -354,6 +355,11 @@ class ImagePreviewLabel(QLabel):
     def set_anchor_value(self, value: int | None):
         """미리보기에 표시할 앵커 밝기 값 저장"""
         self.anchor_value = int(value) if value is not None else None
+        self.update()
+
+    def set_noise_points(self, points):
+        """미리보기에 표기할 Noise 좌표 리스트 저장"""
+        self.noise_points = list(points) if points else []
         self.update()
 
     def show_image(self, npimg, box=None, filename=None):
@@ -383,6 +389,7 @@ class ImagePreviewLabel(QLabel):
         super().paintEvent(event)
         if self.pixmap is not None and self.src_shape is not None:
             painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing, True)
             x0 = (self.width() - self.pixmap.width()) // 2
             y0 = (self.height() - self.pixmap.height()) // 2
             painter.drawPixmap(x0, y0, self.pixmap)
@@ -421,6 +428,21 @@ class ImagePreviewLabel(QLabel):
             painter.setPen(pen_ref)
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(rect_ref_x, rect_ref_y, rect_ref_w, rect_ref_h)
+
+            # Noise 좌표 흰색 원 표기
+            if self.noise_points:
+                painter.setBrush(Qt.NoBrush)
+                for point in self.noise_points:
+                    if not point or len(point) < 2:
+                        continue
+                    px, py = int(point[0]), int(point[1])
+                    cx = int(x0 + px * scale)
+                    cy = int(y0 + py * scale)
+                    radius = max(1, int(round(NOISE_CIRCLE_RADIUS * scale)))
+                    thickness = max(1, int(round(NOISE_CIRCLE_THICKNESS * scale)))
+                    pen_noise = QPen(QColor(255, 255, 255), thickness)
+                    painter.setPen(pen_noise)
+                    painter.drawEllipse(cx - radius, cy - radius, radius * 2, radius * 2)
 
             if self.anchor_value is not None:
                 font = painter.font()
@@ -858,8 +880,8 @@ class ParticleDetectionGUI(QWidget):
         # Noise Particle 판정 파라미터
         self.prev_particles = []         # 워밍 업 시, 반복 좌표 및 크기 기억
         self.frame_buffer = []           # 워밍 업 시, 파티클 리스트 버퍼
-        self.distance_threshold = 10     # 거리 임계값
-        self.area_threshold = 20         # 면적 임계값
+        self.distance_threshold = 20     # 거리 임계값 (반경 내 같은 Noise로 인식)
+        self.area_threshold = 20         # 면적 임계값 (차이 내 같은 Noise로 인식)
         self.collecting_initial = True   # 최초 10장 워밍업 플래그
 
         # 허용 모드 집합 & 래치/홀드 상태
@@ -1134,12 +1156,14 @@ class ParticleDetectionGUI(QWidget):
         """Noise 정보 텍스트 생성/반영"""
         if not self.show_noise_text or self.collecting_initial:
             self.preview_label.set_noise_text("")
+            self.preview_label.set_noise_points([])
             return
         if self.prev_particles:
             text = "; ".join([f"[Noise] X:{x}, Y:{y}, Size:{a}" for (x, y, a) in self.prev_particles])
         else:
             text = "[Noise] None"
         self.preview_label.set_noise_text(text)
+        self.preview_label.set_noise_points(self.prev_particles)
 
     def update_preview(self):
         """이미지 미리보기 / 상부 텍스트 갱신 (최신파일 기준)"""
@@ -1151,7 +1175,7 @@ class ParticleDetectionGUI(QWidget):
                 return
 
             latest = max(cands, key=lambda p: p.stat().st_mtime)
-            img = safe_image_load(str(latest))  # BGR 로드 (재시도 포함)
+            img = safe_image_load(str(latest))
             img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img is not None else None
             if img is None:
                 self.preview_label.clear()
