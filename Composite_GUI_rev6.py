@@ -193,7 +193,8 @@ def extract_row_info(row):
             "equipment": "",
             "lot_number": "",
             "status_display": "",
-            "status_text": ""
+            "status_text": "",
+            "puller_status": None
         }
 
     date_str = row.get('Date', '')
@@ -279,7 +280,8 @@ def extract_row_info(row):
         "equipment": equipment,
         "lot_number": lot_number,
         "status_display": status_display,
-        "status_text": status_text
+        "status_text": status_text,
+        "puller_status": puller_status  # 현재 공정 상태 판별을 위해 원시 모드 값도 전달
     }
 
 
@@ -368,7 +370,8 @@ def find_closest_row_and_attempt(csv_text, target_dt):
                 "equipment": "",
                 "lot_number": "",
                 "status_display": "",
-                "status_text": ""
+                "status_text": "",
+                "puller_status": None
             }
 
     return selected_row, selected_attempt, selected_info
@@ -427,7 +430,7 @@ class CsvTracker:
         self.text = None
 
         self.cached_attempt = 0
-        self.cached_info = {"status_text": "", "lot_number": "", "status_display": ""}
+        self.cached_info = {"status_text": "", "lot_number": "", "status_display": "", "puller_status": None}
 
     def get_info(self, now_dt):
         # 1) 디렉터리 스캔으로 최신 CSV + 메타데이터 획득
@@ -437,7 +440,7 @@ class CsvTracker:
         if latest is None:
             if self.text is None:
                 self.cached_attempt = 0
-                self.cached_info = {"status_text": "", "lot_number": "", "status_display": ""}
+                self.cached_info = {"status_text": "", "lot_number": "", "status_display": "", "puller_status": None}
             return self.cached_attempt, self.cached_info
 
         need_reload = False
@@ -526,7 +529,6 @@ class ImageSaverThread(QThread):
 
             # 실제 처리 시작
             try:
-                formats = self.get_format()
                 now = datetime.now()
                 dt_str = now.strftime("%Y%m%d_%H%M%S")
 
@@ -537,6 +539,23 @@ class ImageSaverThread(QThread):
                 latest_csv_fname = self.csv_tracker.name
                 device_name_full = f"{host_name} / {latest_csv_fname.rsplit('.', 1)[0] if latest_csv_fname else 'N/A'}"
                 self.update_device_name.emit(device_name_full)
+
+                puller_status_value = csv_row_info.get("puller_status")
+                status_text = (csv_row_info.get("status_text", "") or "UNKNOWN").upper()
+                is_neck_process = (
+                    isinstance(puller_status_value, int)
+                    and 30 <= puller_status_value <= 39
+                    and status_text == "NECK"
+                )
+
+                if not is_neck_process:
+                    # puller_status로 현재 공정을 확인하고, 허용 외 공정일 때는 '다음 composite.bmp 변경'까지 대기
+                    self.update_status.emit(f'이미지 저장 허용 공정이 아님: {status_text}')
+                    if not self._wait_until_next_change(poll_ms=200):
+                        return
+                    continue
+
+                formats = self.get_format()
 
                 # 안전한 비잠금 읽기
                 img_gray = safe_read_gray(self.source_file)
@@ -597,6 +616,21 @@ class ImageSaverThread(QThread):
     def stop(self):
         """이미지 저장 루프 종료"""
         self.running = False
+
+    def _wait_until_next_change(self, poll_ms=200):
+        """ composite.bmp의 '다음 변경'이 발생할 때까지 블로킹 대기 헬퍼"""
+        prev_mtime = self._last_mtime
+        while self.running:
+            try:
+                cur_mtime = self.source_file.stat().st_mtime
+                if prev_mtime is None or cur_mtime != prev_mtime:
+                    # 변경 감지됨 → 다음 루프에서 기존 흐름(200ms 디바운스 → CSV 확인/파싱)으로 이어짐
+                    return True
+            except Exception:
+                # 파일이 없거나 접근 실패 시 잠시 대기 후 재시도
+                pass
+            self.msleep(int(poll_ms))
+        return False
 
 
 class PreviewLabel(QLabel):
