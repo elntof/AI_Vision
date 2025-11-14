@@ -337,8 +337,6 @@ class ImagePreviewLabel(QLabel):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # 독립 창 보장: 최상위 윈도우 플래그 지정
-        self.setWindowFlag(Qt.Window, True)
         self.pixmap = None
         self.box1 = (0, 0, 0, 0)
         self.box2 = (0, 0, 0, 0)
