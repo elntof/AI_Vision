@@ -6,7 +6,6 @@ import time
 import re
 import numpy as np
 import cv2
-import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 import matplotlib
@@ -21,6 +20,8 @@ from PySide6.QtCore import Qt, QTimer, QSettings, QRect, QThread, QObject, Signa
 from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QGuiApplication
 import csv
 from collections import deque
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 # 한글 폰트 설정 (windows 한글깨짐 방지)
 mpl.rcParams['font.family'] = 'Malgun Gothic'
@@ -100,13 +101,17 @@ WINDOW_OFFSET_Y = 200
 # 신규 이미지 부재 시 미리보기 플레이스홀더 텍스트
 NO_IMAGE_PLACEHOLDER_TEXT = "신규 이미지 없음"
 
+# 감시 대상 이미지 확장자 목록
+ALLOWED_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
 
-def safe_image_load(image_path, max_retries=5, delay=0.2):
-    """안전 이미지 로당 (재시도 최대 5회, 0.2초 간격)"""
+
+def safe_image_load(image_path, as_gray=False, max_retries=5, delay=0.2):
+    """안전 이미지 로딩 (재시도 최대 5회)"""
+    flag = cv2.IMREAD_GRAYSCALE if as_gray else cv2.IMREAD_UNCHANGED
     for _ in range(max_retries):
         try:
             img_array = np.fromfile(str(image_path), dtype=np.uint8)
-            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            img = cv2.imdecode(img_array, flag)
             if img is not None:
                 return img
         except Exception:
@@ -172,38 +177,54 @@ def compute_adaptive_threshold(anchor_current: int | float | None) -> int:
     return int(round(adaptive_value))
 
 
-def particle_detection(image_path, exclude_boxes, threshold=None, area_min=PARTICLE_AREA_MIN, area_max=PARTICLE_AREA_MAX):
+def particle_detection(image_source, exclude_boxes, threshold=None,
+                       area_min=PARTICLE_AREA_MIN, area_max=PARTICLE_AREA_MAX):
     """파티클 탐지 (OpenCV 파이프라인)"""
-    img = safe_image_load(image_path)
+    if isinstance(image_source, np.ndarray):
+        img = image_source
+    else:
+        img = safe_image_load(image_source, as_gray=True)
+
     if img is None:
-        print(f"❌ 오류: {image_path} 이미지 로딩 실패")
+        print(f"❌ 오류: {image_source} 이미지 로딩 실패")
         return None, None, None
+
     try:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if img.ndim == 2:
+            gray = img
+        else:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, KERNEL_SIZE_TOPHAT)
         tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
         thr_value = MANUAL_THRESHOLD if threshold is None else int(threshold)
         thr_value = max(0, min(255, thr_value))
         _, binary_mask = cv2.threshold(tophat, thr_value, 255, cv2.THRESH_BINARY)
         cleaned_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, KERNEL_SIZE_MORPH))
-        vis_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
         # 제외영역(2개) 마스킹
-        mask = np.ones_like(cleaned_mask) * 255
+        mask = np.ones_like(cleaned_mask, dtype=np.uint8) * 255
         for (x, y, w, h) in exclude_boxes:
             if w > 0 and h > 0:
-                cv2.rectangle(vis_img, (x, y), (x+w, y+h), (0, 255, 0), 1)
                 cv2.rectangle(mask, (x, y), (x+w, y+h), 0, -1)
+
         final_mask = np.bitwise_and(cleaned_mask, mask)
 
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(final_mask, connectivity=8)
+        num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(final_mask, connectivity=8)
         particle_info = []
         for i in range(1, num_labels):
             area = stats[i, cv2.CC_STAT_AREA]
             cx, cy = int(centroids[i][0]), int(centroids[i][1])
             if area_min <= area <= area_max:
                 particle_info.append((cx, cy, area))
+
+        vis_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        for (x, y, w, h) in exclude_boxes:
+            if w > 0 and h > 0:
+                cv2.rectangle(vis_img, (x, y), (x+w, y+h), (0, 255, 0), 1)
+
         return gray, vis_img, particle_info
+
     except Exception as e:
         print(f"❌ 오류: {e}")
         return None, None, None
@@ -211,8 +232,71 @@ def particle_detection(image_path, exclude_boxes, threshold=None, area_min=PARTI
 
 def find_new_images(img_dir, processed_set):
     """디렉토리 내 신규 이미지 탐색 (파일명 기준)"""
-    all_imgs = sorted([p for p in img_dir.glob('*') if p.suffix.lower() in ['.jpg', '.bmp', '.jpeg', '.png', '.tif', '.tiff']])
+    all_imgs = sorted([p for p in img_dir.glob('*') if p.suffix.lower() in ALLOWED_IMAGE_EXTS])
     return [p for p in all_imgs if p.name not in processed_set]
+
+
+class _ImageFileEventHandler(FileSystemEventHandler):
+    """watchdog 이벤트 핸들러 (신규 이미지 감지)"""
+
+    def __init__(self, callback, allow_ext):
+        super().__init__()
+        self._callback = callback
+        self._allow_ext = tuple(allow_ext)
+
+    def _handle_path(self, src_path):
+        if not src_path:
+            return
+        path = Path(src_path)
+        if path.is_dir():
+            return
+        if path.suffix.lower() not in self._allow_ext:
+            return
+        self._callback(path)
+
+    def on_created(self, event):
+        self._handle_path(getattr(event, 'src_path', None))
+
+    def on_moved(self, event):
+        self._handle_path(getattr(event, 'dest_path', None))
+
+
+class ImageDirectoryWatcher(QObject):
+    """watchdog 기반 이미지 디렉토리 감시기"""
+
+    file_created = Signal(object)
+
+    def __init__(self, directory: Path, allow_ext=None, parent=None):
+        super().__init__(parent)
+        self._directory = Path(directory)
+        self._observer: Observer | None = None
+        self._handler: _ImageFileEventHandler | None = None
+        if allow_ext is None:
+            allow_ext = ALLOWED_IMAGE_EXTS
+        self._allow_ext = {ext.lower() for ext in allow_ext}
+
+    def start(self):
+        if self._observer is not None:
+            return
+        if not self._directory.exists():
+            self._directory.mkdir(parents=True, exist_ok=True)
+        self._handler = _ImageFileEventHandler(self.file_created.emit, self._allow_ext)
+        observer = Observer()
+        observer.schedule(self._handler, str(self._directory), recursive=False)
+        observer.start()
+        self._observer = observer
+
+    def stop(self):
+        if self._observer is None:
+            return
+        observer = self._observer
+        self._observer = None
+        self._handler = None
+        try:
+            observer.stop()
+            observer.join(timeout=2.0)
+        except Exception:
+            pass
 
 
 def parse_filename(fname: str):
@@ -814,14 +898,31 @@ class AlertPopup(QWidget):
             self.img_container.insertWidget(self.img_container.count()-1, wrapper)
             self._pix_labels.append(wrapper)
 
+
     def _load_pix(self, p: Path) -> QPixmap:
-        img = safe_image_load(str(p))
+        img = safe_image_load(str(p), as_gray=False)
         if img is None:
             return QPixmap()
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        h, w, _ = img.shape
-        qimg = QImage(img.data, w, h, 3*w, QImage.Format_RGB888)
+
+        if img.ndim == 2:
+            h, w = img.shape
+            qimg = QImage(img.data, w, h, w, QImage.Format_Grayscale8)
+        else:
+            if img.shape[2] == 3:
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                h, w, _ = rgb.shape
+                qimg = QImage(rgb.data, w, h, 3*w, QImage.Format_RGB888)
+            elif img.shape[2] == 4:
+                rgba = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+                h, w, _ = rgba.shape
+                qimg = QImage(rgba.data, w, h, 4*w, QImage.Format_RGBA8888)
+            else:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                h, w = gray.shape
+                qimg = QImage(gray.data, w, h, w, QImage.Format_Grayscale8)
+
         return QPixmap.fromImage(qimg).scaled(180, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
 
     def _format_image_timestamp(self, path: Path) -> str:
         qdt = self._extract_image_datetime(path)
@@ -893,7 +994,7 @@ class ParticleDetectionGUI(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Real-time Particle Detection GUI')
+        self.setWindowTitle('Particle Detector GUI')
         self.resize(500, 400)
         self.settings = QSettings(str(INI_SETTINGS_PATH), QSettings.IniFormat)
         self._window_position_restored = False
@@ -912,6 +1013,9 @@ class ParticleDetectionGUI(QWidget):
         self.processed_images: set[str] = set()
         self.session_processed_images: set[str] = set()
         self.saved_graph_lots: set[str] = set()
+        self.graph_records: list[tuple[str, int, float]] = []
+        self.pending_images: deque[Path] = deque()
+        self._is_processing_queue = False
 
         # Noise Particle 판정 파라미터
         self.prev_particles = []         # 워밍 업 시, 반복 좌표 및 크기 기억
@@ -925,7 +1029,7 @@ class ParticleDetectionGUI(QWidget):
         self.disallowed_mode_latched = False  # 비허용 모드 래치
         self.status_hold_until = 0.0          # 상태 메시지 유지 만료 시각
         self.last_image_seen_at = 0.0         # 마지막 새 이미지 관측 시각
-        self.no_new_image_grace_s = 9.0       # 신규 이미지 없음 표시는 9초 이후
+        self.no_new_image_grace_s = 9.0       # 신규 이미지 없음 표시 유예 초
 
         # 팝업/무시/누적
         self.alert_popup: AlertPopup | None = None
@@ -1045,8 +1149,13 @@ class ParticleDetectionGUI(QWidget):
         self.crop1_enabled_cb.toggled.connect(self._on_crop1_toggled)
         self.crop2_enabled_cb.toggled.connect(self._on_crop2_toggled)
 
-        # 라이브 테일링 전용 타이머 (백로그 완료 후에만 사용)
+        # 라이브 감시기 (watchdog) 및 대기 타이머
+        self.directory_watcher = ImageDirectoryWatcher(IMG_INPUT_DIR, parent=self)
+        self.directory_watcher.file_created.connect(self._enqueue_new_image)
+        self._allowed_extensions = set(ALLOWED_IMAGE_EXTS)
+
         self.tail_timer = QTimer(self)
+        self.tail_timer.setInterval(500)
         self.tail_timer.timeout.connect(self.process_new_images_tick)
 
         # 백로그 스레드 구성 요소
@@ -1162,6 +1271,40 @@ class ParticleDetectionGUI(QWidget):
         self.processed_images.add(filename)
         self.session_processed_images.add(filename)
 
+    @Slot(object)
+    def _enqueue_new_image(self, path_obj):
+        """watchdog로 감지된 신규 이미지를 큐에 적재"""
+        if path_obj is None:
+            return
+        path = Path(path_obj)
+        if path.suffix.lower() not in self._allowed_extensions:
+            return
+        if path.name in self.session_processed_images:
+            return
+        self.pending_images.append(path)
+        if not (self._backlog_thread and self._backlog_thread.isRunning()):
+            self._drain_pending_queue()
+
+    def _drain_pending_queue(self):
+        """큐에 쌓인 신규 이미지를 순차 처리"""
+        if self._is_processing_queue:
+            return
+        if self._backlog_thread and self._backlog_thread.isRunning():
+            return
+        self._is_processing_queue = True
+        try:
+            while self.pending_images:
+                path = self.pending_images.popleft()
+                if not isinstance(path, Path):
+                    path = Path(path)
+                if path.suffix.lower() not in self._allowed_extensions:
+                    continue
+                if path.name in self.session_processed_images:
+                    continue
+                self.process_single_image(path)
+        finally:
+            self._is_processing_queue = False
+
     @Slot(bool)
     def _on_crop1_toggled(self, checked: bool):
         "체크박스1 토글 핸들러"
@@ -1204,15 +1347,13 @@ class ParticleDetectionGUI(QWidget):
     def update_preview(self):
         """이미지 미리보기 / 상부 텍스트 갱신 (최신파일 기준)"""
         try:
-            allow_ext = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
-            cands = [p for p in IMG_INPUT_DIR.iterdir() if p.suffix.lower() in allow_ext]
+            cands = [p for p in IMG_INPUT_DIR.iterdir() if p.suffix.lower() in ALLOWED_IMAGE_EXTS]
             if not cands:
                 self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
                 return
 
             latest = max(cands, key=lambda p: p.stat().st_mtime)
-            img = safe_image_load(str(latest))
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img is not None else None
+            img = safe_image_load(str(latest), as_gray=True)
             if img is None:
                 self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
                 return
@@ -1245,10 +1386,15 @@ class ParticleDetectionGUI(QWidget):
         self.show_noise_text = False
         self._update_noise_text()
 
-        # ▼ 변경: 하드코딩된 '10장'을 상수 사용으로 변경
         self.status_label.setText(f"초기 워밍업 중... (최초 {WARMUP_FRAMES}장 데이터 수집)")
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
+
+        self.pending_images.clear()
+        self._is_processing_queue = False
+        self.directory_watcher.start()
+        self.tail_timer.start()
+        self.last_image_seen_at = time.monotonic()
 
         # 백로그 목록 구성 (processed_images 기준 미처리 파일 전체)
         backlog = find_new_images(IMG_INPUT_DIR, self.session_processed_images)
@@ -1266,12 +1412,12 @@ class ParticleDetectionGUI(QWidget):
             self._backlog_thread.finished.connect(lambda: setattr(self, "_backlog_thread", None))
             self._backlog_thread.destroyed.connect(lambda: setattr(self, "_backlog_thread", None))
             self._backlog_feeder.finished.connect(lambda: setattr(self, "_backlog_feeder", None))
+            self._backlog_thread.finished.connect(self._drain_pending_queue)
             self._backlog_thread.start()
             self.status_label.setText(f"백로그 처리 시작: {len(backlog)}장")
         else:
-            # 백로그가 없으면 라이브 감시 시작
-            self.tail_timer.start(200)
             self.status_label.setText("백로그 없음. 라이브 감시 시작.")
+            self._drain_pending_queue()
         # 초기 Noise 텍스트
         self._update_noise_text()
 
@@ -1281,6 +1427,9 @@ class ParticleDetectionGUI(QWidget):
         self.stop_button.setEnabled(False)
         if self.tail_timer.isActive():
             self.tail_timer.stop()
+        self.directory_watcher.stop()
+        self.pending_images.clear()
+        self._is_processing_queue = False
         # 백로그 중지
         try:
             if self._backlog_feeder:
@@ -1318,29 +1467,25 @@ class ParticleDetectionGUI(QWidget):
     def closeEvent(self, event):
         """윈도우 종료 시 현재 설정을 .ini에 자동 저장"""
         try:
+            self.stop_realtime()
             self.save_options()
         except Exception:
             pass
         finally:
             super().closeEvent(event)
 
-def process_new_images_tick(self):
-    """(실시간)신규 이미지 처리"""
-    new_images = find_new_images(IMG_INPUT_DIR, self.session_processed_images)
-
-    if not new_images:
-        # 상태 메세지 깜빡임 방지 (홀드/유예시간 고려)
+    def process_new_images_tick(self):
+        """watchdog 큐 처리 및 신규 이미지 부재 상태 갱신"""
+        self._drain_pending_queue()
         now = time.monotonic()
+        if self.pending_images:
+            return
         if now < self.status_hold_until:
             return
         if (now - self.last_image_seen_at) <= self.no_new_image_grace_s:
             return
         self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
         self._set_status("신규 이미지 없음 (폴더 감시 중)")
-        return
-
-    for p in new_images:
-        self.process_single_image(p)
 
     @Slot()
     def _on_backlog_finished(self):
@@ -1348,7 +1493,7 @@ def process_new_images_tick(self):
         self.status_label.setText("백로그 완료. 라이브 감시 시작.")
         # 최신 샘플 1장으로 미리보기 갱신
         self.update_preview()
-        self.tail_timer.start(200)
+        self._drain_pending_queue()
 
 
     @Slot(object)
@@ -1429,6 +1574,8 @@ def process_new_images_tick(self):
                 self._reset_noise_warmup(f"LOT 변경 감지 → 워밍업 재시작 ({WARMUP_FRAMES}장)")
 
                 # 빈 CSV 기반 그래프 즉시 초기화
+                self.graph_records.clear()
+                self._load_graph_buffer_from_csv()
                 self.update_graph()
 
             else:
@@ -1443,10 +1590,13 @@ def process_new_images_tick(self):
                 self.status_label.setText(f"이미 처리됨: {img_path.name}")
                 return
 
-            # 새 이미지 관측 시각 갱신
-            self.last_image_seen_at = time.monotonic()
+            gray_prev = safe_image_load(str(img_path), as_gray=True)
+            if gray_prev is None:
+                self.status_label.setText(f"오류: {img_path.name} 이미지 로딩 실패")
+                self._mark_image_processed(img_path.name)
+                return
 
-            self.device_info_box.setText('_'.join([info['equip'], info['lot'], info['process'], str(info['attempt'])]))
+            self.last_image_seen_at = time.monotonic()
 
             # 허용 모드 체크
             if process_name not in self.ALLOWED_PULLER_MODES:
@@ -1457,14 +1607,14 @@ def process_new_images_tick(self):
                 self._set_status("지정된 Puller Mode Status가 아님.")
 
                 # 미리보기는 최신 이미지로 갱신하되 앵커값은 숨김
-                img_preview = safe_image_load(str(img_path))
-                if img_preview is not None:
-                    gray_prev = cv2.cvtColor(img_preview, cv2.COLOR_BGR2GRAY)
+                if gray_prev is not None:
                     self.preview_label.show_image(
                         gray_prev, [self.get_box1(), self.get_box2()],
                         filename=img_path.name
                     )
-                    self.preview_label.set_anchor_value(None)
+                else:
+                    self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
+                self.preview_label.set_anchor_value(None)
 
                 self._mark_image_processed(img_path.name)
                 return
@@ -1475,13 +1625,12 @@ def process_new_images_tick(self):
 
             # 현재 처리 대상 파일 기준으로 이미지 미리보기 표기 + 앵커값
             anchor_current = None
-            img_preview = safe_image_load(str(img_path))
-            if img_preview is not None:
-                gray_prev = cv2.cvtColor(img_preview, cv2.COLOR_BGR2GRAY)
+            if gray_prev is not None:
                 anchor_current = compute_anchor_brightness(gray_prev)
                 self.preview_label.show_image(gray_prev, [self.get_box1(), self.get_box2()], filename=img_path.name)
                 self.preview_label.set_anchor_value(anchor_current)
             else:
+                self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
                 self.preview_label.set_anchor_value(None)
 
             # 현재 Noise 정보 텍스트 갱신 및 임계값 계산
@@ -1495,7 +1644,7 @@ def process_new_images_tick(self):
                 self._update_noise_text()
 
                 # 후보 파티클만 수집(판정/CSV/그래프/이벤트 저장 없음)
-                _, _, particle_info = particle_detection(str(img_path), [self.get_box1(), self.get_box2()], adaptive_value, area_min=WARMUP_NOISE_AREA_MIN, area_max=PARTICLE_AREA_MAX)
+                _, _, particle_info = particle_detection(gray_prev, [self.get_box1(), self.get_box2()], adaptive_value, area_min=WARMUP_NOISE_AREA_MIN, area_max=PARTICLE_AREA_MAX)
                 if particle_info is None:
                     # 로딩/후보 추출 실패 시 스킵
                     self.status_label.setText(f"오류: {img_path.name} 로딩/후보 추출 실패 (워밍업)")
@@ -1530,7 +1679,7 @@ def process_new_images_tick(self):
             self._update_noise_text()
 
             # 실제 판정 처리 (OpenCV 파이프라인)
-            gray, overlay_img, particle_info = particle_detection(str(img_path), [self.get_box1(), self.get_box2()], adaptive_value)
+            gray, overlay_img, particle_info = particle_detection(gray_prev, [self.get_box1(), self.get_box2()], adaptive_value)
             if overlay_img is None or particle_info is None:
                 self.status_label.setText(f"오류: {img_path.name} 처리 실패")
                 self._mark_image_processed(img_path.name)
@@ -1609,10 +1758,45 @@ def process_new_images_tick(self):
             self.status_label.setText(f"오류: {e}")
 
 
-    def save_csv(self, row, max_retries=5, delay=0.2):
-        """결과 CSV 저장"""
-        if not self.csv_path:
+    def _record_graph_row(self, row):
+        """그래프 버퍼에 행 추가"""
+        if isinstance(row, dict):
+            image_name = row.get('이미지 파일명', '')
+            attempt_val = row.get('Attempt 횟수', 0)
+            size_val = row.get('파티클_크기', 0)
+        else:
+            image_name = row[0] if len(row) > 0 else ''
+            attempt_val = row[1] if len(row) > 1 else 0
+            size_val = row[5] if len(row) > 5 else 0
+        if not image_name:
             return
+        try:
+            attempt_int = int(float(attempt_val))
+        except (TypeError, ValueError):
+            attempt_int = 0
+        try:
+            size_float = float(size_val)
+        except (TypeError, ValueError):
+            size_float = 0.0
+        self.graph_records.append((image_name, attempt_int, size_float))
+
+    def _load_graph_buffer_from_csv(self):
+        """기존 CSV 데이터를 그래프 버퍼로 로딩"""
+        if not self.csv_path or not self.csv_path.exists():
+            return
+        try:
+            with open(self.csv_path, 'r', encoding='utf-8-sig', newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row:
+                        self._record_graph_row(row)
+        except Exception:
+            pass
+
+    def save_csv(self, row, max_retries=5, delay=0.2):
+        """결과 CSV 저장 (성공 시 True 반환)"""
+        if not self.csv_path:
+            return False
         attempt = 0
         while attempt < max_retries:
             try:
@@ -1622,39 +1806,26 @@ def process_new_images_tick(self):
                     if not header_exists:
                         writer.writerow(self.csv_header)
                     writer.writerow(row)
-                return
+                self._record_graph_row(row)
+                return True
             except Exception:
                 attempt += 1
                 time.sleep(delay)
         print("❌ CSV 저장 최종 실패 - 데이터가 저장되지 않았습니다.")
+        return False
 
     def update_graph(self):
         """파티클 그래프 갱신 (Attempt 밴딩 지원)"""
-        if not getattr(self, "csv_path", None) or not self.csv_path.exists():
+        if not self.graph_records:
             self.plot_canvas.update_plot([], [], latest_index=None)
             return
-        try:
-            df = pd.read_csv(self.csv_path)
-        except Exception:
-            self.plot_canvas.update_plot([], [], latest_index=None)
-            return
-        if '파티클_크기' in df.columns:
-            df['파티클_크기'] = pd.to_numeric(df['파티클_크기'], errors='coerce').fillna(0)
-        else:
-            df['파티클_크기'] = 0
-        attempt_list = None
-        if 'Attempt 횟수' in df.columns:
-            attempt_list = (
-                pd.to_numeric(df['Attempt 횟수'], errors='coerce')
-                  .ffill()
-                  .fillna(0)
-                  .astype(int)
-                  .to_numpy()
-            )
-        latest_index = len(df) - 1 if len(df) > 0 else None
+        image_names = [rec[0] for rec in self.graph_records]
+        particle_sizes = np.asarray([rec[2] for rec in self.graph_records], dtype=float)
+        attempt_list = [rec[1] for rec in self.graph_records]
+        latest_index = len(image_names) - 1
         self.plot_canvas.update_plot(
-            df['이미지 파일명'],
-            df['파티클_크기'],
+            image_names,
+            particle_sizes,
             latest_index,
             attempt_list=attempt_list
         )
