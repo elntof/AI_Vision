@@ -13,11 +13,10 @@ matplotlib.use('QtAgg')
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox,
-    QGroupBox, QSizePolicy, QLineEdit, QLayout, QCheckBox, QTextEdit, QScrollArea,
-    QFrame, QSpacerItem
+    QGroupBox, QSizePolicy, QLineEdit, QLayout, QCheckBox, QTextEdit, QScrollArea
 )
-from PySide6.QtCore import Qt, QTimer, QSettings, QRect, QThread, QObject, Signal, Slot, QDateTime, QEvent
-from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QGuiApplication
+from PySide6.QtCore import Qt, QTimer, QSettings, QRect, QThread, QObject, Signal, Slot, QDateTime, QEvent, QUrl
+from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QGuiApplication, QDesktopServices
 import csv
 from collections import deque
 from watchdog.observers import Observer
@@ -269,7 +268,7 @@ class ImageDirectoryWatcher(QObject):
     def __init__(self, directory: Path, allow_ext=None, parent=None):
         super().__init__(parent)
         self._directory = Path(directory)
-        self._observer: Observer | None = None
+        self._observer: Observer | None = None # pyright: ignore[reportInvalidTypeForm]
         self._handler: _ImageFileEventHandler | None = None
         if allow_ext is None:
             allow_ext = ALLOWED_IMAGE_EXTS
@@ -645,10 +644,22 @@ class AlertPopup(QWidget):
         self.ignore_cb.setFont(small_font)
         self.ignore_min_spin.setFont(small_font)
         self.ignore_cb.setChecked(False)
+        ignore_label = QLabel('분간 팝업 무시')
+        ignore_label.setFont(small_font)
 
-        # 확인/오탐지 버튼 (우측 상단 배치)
-        self.btn_false = QPushButton('오탐지')
+        # 확인 버튼 (우측 상단 배치)
         self.btn_ok = QPushButton('확인')
+
+        # 탐지 이미지 저장 폴더 Link 버튼 생성
+        self.btn_open_folder = QPushButton('Particle 탐지 이미지 저장 폴더 Link')
+        self.btn_open_folder.setCursor(Qt.PointingHandCursor)
+        self.btn_open_folder.setFlat(True)
+        self.btn_open_folder.setStyleSheet(
+            'QPushButton { color: #1a73e8; text-decoration: underline; } '
+            'QPushButton:hover { color: #0b59d4; }'
+        )
+        self.btn_open_folder.setEnabled(False)
+        self.btn_open_folder.clicked.connect(self._on_open_folder)
 
         # 상단 텍스트 영역 구성
         topbar = QHBoxLayout()
@@ -659,27 +670,25 @@ class AlertPopup(QWidget):
         top_right.setContentsMargins(0, 0, 0, 0)
         top_right.setSpacing(6)
 
-        ignore_layout = QHBoxLayout()
-        ignore_layout.setContentsMargins(0, 0, 0, 0)
-        ignore_layout.addWidget(self.ignore_cb)
-        ignore_layout.addWidget(self.ignore_min_spin)
-        ignore_layout.setAlignment(Qt.AlignRight)
-        top_right.addLayout(ignore_layout)
+        # ── 1줄: 무시 옵션 + 확인 버튼 ─────────────────────────────
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(6)
 
-        btn_layout = QHBoxLayout()
-        btn_layout.setContentsMargins(0, 0, 0, 0)
-        btn_layout.addStretch()
-        btn_layout.addWidget(self.btn_false)
-        btn_layout.addWidget(self.btn_ok)
-        top_right.addLayout(btn_layout)
-        top_right.addStretch()
+        top_row.addWidget(self.ignore_cb)
+        top_row.addWidget(self.ignore_min_spin)
+        top_row.addWidget(ignore_label)
+
+        top_row.addStretch()
+
+        top_row.addWidget(self.btn_ok)
+
+        # ── 2줄: "저장 폴더로 이동" 버튼 ─────────────────────────────
+        top_right.addLayout(top_row)
+        top_right.addWidget(self.btn_open_folder, alignment=Qt.AlignRight)
 
         topbar.addLayout(top_right)
-        self.ignore_cb.toggled.connect(self._update_ignore_checkbox_text)
-        self.ignore_min_spin.valueChanged.connect(self._update_ignore_checkbox_text)
-        self._update_ignore_checkbox_text()
 
-        # 기본 정보/시간/누적
         self.info_label = QLabel('')
         self.time_label = QLabel('')
         self.elapsed_label = QLabel('')
@@ -747,6 +756,7 @@ class AlertPopup(QWidget):
         image_section = QGroupBox(' 탐지 이미지 ')
         image_layout = QVBoxLayout(image_section)
         image_layout.setContentsMargins(12, 12, 12, 12)
+
         image_layout.addWidget(self.img_scroll)
 
         # 로그 영역
@@ -780,7 +790,6 @@ class AlertPopup(QWidget):
 
         # 시그널 연결
         self.btn_ok.clicked.connect(lambda: self._close_with('ok'))
-        self.btn_false.clicked.connect(lambda: self._close_with('false'))
 
         # 배경 깜빡임
         self._blink_red = False
@@ -792,8 +801,9 @@ class AlertPopup(QWidget):
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.timeout.connect(self._update_elapsed)
 
-        # 이미지 관리
+        # 이미지/이벤트 폴더 관리
         self._pix_labels: list[QWidget] = []
+        self._event_folder_path: Path | None = None
 
     def start_blink(self):
         self._blink_timer.start(500)  # 0.5초 주기
@@ -811,10 +821,6 @@ class AlertPopup(QWidget):
             self.info_group_container.setStyleSheet("#infoGroupBody {background-color: rgba(255,30,30,0.25); border-radius:8px;}")
         else:
             self.info_group_container.setStyleSheet("")
-
-    def _update_ignore_checkbox_text(self):
-        value = self.ignore_min_spin.value()
-        self.ignore_cb.setText(f"{value:02d}분 팝업 무시")
 
     def set_first_detect_time(self, qdt: QDateTime):
         self._first_dt = qdt
@@ -965,6 +971,22 @@ class AlertPopup(QWidget):
             self._refresh_graph_view()
         return super().eventFilter(obj, event)
 
+    def set_event_folder(self, path: Path | str | None):
+        self._event_folder_path = Path(path) if path else None
+        self.btn_open_folder.setEnabled(self._event_folder_path is not None)
+
+    def _on_open_folder(self):
+        if not self._event_folder_path:
+            return
+        try:
+            folder_str = str(self._event_folder_path)
+            if os.name == 'nt':
+                os.startfile(folder_str)
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(folder_str))
+        except Exception:
+            pass
+
     def closeEvent(self, event):
         self.stop_blink()
         self._elapsed_timer.stop()
@@ -979,9 +1001,7 @@ class AlertPopup(QWidget):
         now = QDateTime.currentDateTime()
         if snooze_min > 0:
             self.append_log(f"{snooze_min:02d}분 팝업 무시 체크", now)
-        if reason == 'false':
-            self.append_log('오탐지 종료', now)
-        elif reason == 'ok':
+        if reason == 'ok':
             self.append_log('확인 종료', now)
         else:
             self.append_log('창 종료', now)
@@ -1889,6 +1909,7 @@ class ParticleDetectionGUI(QWidget):
         pop.set_first_detect_time(event_dt)
         pop.set_graph_pixmap(self._graph_pixmap())
         pop.set_images(list(self._popup_images))
+        pop.set_event_folder(event_image_path.parent)
         pop.append_log(f"Particle 탐지 {self.lot_event_count}회", event_dt)
         pop.start_blink()
 
@@ -1905,11 +1926,9 @@ class ParticleDetectionGUI(QWidget):
             self.popup_snooze_until = time.monotonic() + snooze_min * 60
         else:
             self.popup_snooze_until = 0.0
-        if reason == 'false':
-            pass
 
         self._popup_detect_dt = None
-        if reason not in {'false', 'ok'}:
+        if reason != 'ok':
             self.alert_popup = None
 
 
