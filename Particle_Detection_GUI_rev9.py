@@ -687,6 +687,8 @@ class DeletionDialog(QDialog):
         self.setWindowModality(Qt.ApplicationModal)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
 
+        self._bulk_updating = False
+
         # 이력에서 장비/LOT 기본 정보를 추출해 상단에 노출
         base_info_label = QLabel(self._extract_base_info(history_entries))
         base_info_label.setAlignment(Qt.AlignLeft)
@@ -701,7 +703,7 @@ class DeletionDialog(QDialog):
         title.setFont(title_font)
 
         self.chk_all = QCheckBox('전체 삭제')
-        self.chk_all.stateChanged.connect(self._on_all_toggled)
+        self.chk_all.toggled.connect(self._on_all_toggled)
 
         self.entry_container = QWidget()
         self.entry_layout = QHBoxLayout(self.entry_container)
@@ -765,6 +767,7 @@ class DeletionDialog(QDialog):
         chk.setToolTip(entry.get('name', ''))
         chk.setProperty('image_name', entry.get('name', ''))
         self.chk_list.append(chk)
+        chk.toggled.connect(self._on_entry_toggled)
 
         card_layout.addWidget(ts_label)
         card_layout.addWidget(img_label)
@@ -772,10 +775,27 @@ class DeletionDialog(QDialog):
 
         self.entry_layout.insertWidget(self.entry_layout.count() - 1, card)
 
-    def _on_all_toggled(self, state):
-        checked = state == Qt.Checked
+    def _on_all_toggled(self, checked: bool):
+        if self._bulk_updating:
+            return
+
+        self._bulk_updating = True
         for chk in self.chk_list:
+            prev = chk.blockSignals(True)
             chk.setChecked(checked)
+            chk.blockSignals(prev)
+        self._bulk_updating = False
+
+    def _on_entry_toggled(self, _checked: bool):
+        if self._bulk_updating:
+            return
+
+        all_checked = bool(self.chk_list) and all(chk.isChecked() for chk in self.chk_list)
+        self._bulk_updating = True
+        prev = self.chk_all.blockSignals(True)
+        self.chk_all.setChecked(all_checked)
+        self.chk_all.blockSignals(prev)
+        self._bulk_updating = False
 
     def _emit_confirm(self):
         selected = [chk.property('image_name') for chk in self.chk_list if chk.isChecked()]
