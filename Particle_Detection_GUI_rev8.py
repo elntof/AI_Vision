@@ -1036,6 +1036,7 @@ class ParticleDetectionGUI(QWidget):
         self.graph_records: list[tuple[str, int, float]] = []
         self.pending_images: deque[Path] = deque()
         self._is_processing_queue = False
+        self.current_process = None
 
         # Noise Particle 판정 파라미터
         self.prev_particles = []         # 워밍 업 시, 반복 좌표 및 크기 기억
@@ -1388,9 +1389,6 @@ class ParticleDetectionGUI(QWidget):
             process_ok = (fields[2] in self.ALLOWED_PULLER_MODES)
             self.preview_label.set_anchor_value(compute_anchor_brightness(img) if process_ok else None)
 
-            # 상단 텍스트 박스: 장비명_Lot#_Process_Att
-            self.device_info_box.setText('_'.join(fields[:4]))
-
         except Exception:
             self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
 
@@ -1554,8 +1552,9 @@ class ParticleDetectionGUI(QWidget):
                 except Exception as e:
                     self._set_status(f"그래프 이미지 저장 오류: {e}", hold_s=3.0)
 
-                # 새 Lot로 전환
+                # 새 Lot로 전환 및 현재 공정 상태 동기화
                 self.current_lot = lot_number
+                self.current_process = process_name
 
                 new_lot_valid = bool(lot_number) and (lot_number != "LotUnknown")
                 self.csv_path = (CSV_OUTPUT_DIR / f"{lot_number}.csv") if new_lot_valid else None
@@ -1604,6 +1603,12 @@ class ParticleDetectionGUI(QWidget):
                 elif self.current_attempt != attempt_value:
                     self.current_attempt = attempt_value
                     self._reset_noise_warmup(f"Attempt 변경 감지 → 워밍업 재시작 ({WARMUP_FRAMES}장)")
+
+                # 동일 Lot 내에서 Process만 변경된 경우에도 공정 텍스트 갱신
+                if self.current_process != process_name:
+                    self.current_process = process_name
+                    # 장비_Lot_공정_Attempt 형식으로 반영
+                    self.device_info_box.setText(f"{info['equip']}_{info['lot']}_{info['process']}_{info['attempt']}")
 
             # Lot 전환 이후 CSV 기반 중복 세트 로딩이 완료된 상태에서 중복 여부 재확인
             if img_name in self.processed_images:
@@ -1657,7 +1662,11 @@ class ParticleDetectionGUI(QWidget):
             adaptive_value = compute_adaptive_threshold(anchor_current)
             self._update_noise_text()
 
-            # 워밍업 구간 (최초 10장 동안은 '판정/CSV/그래프' 수행하지 않음)
+            # 워밍업 구간 (해당 구간에는 '판정/CSV/그래프' 수행하지 않음)
+            if self.collecting_initial and not self.frame_buffer:
+                # 워밍업 시작 시 "공정 정보(텍스트)"를 "현재 처리 이미지" 기준으로 1회 갱신
+                self.device_info_box.setText(f"{info['equip']}_{info['lot']}_{info['process']}_{info['attempt']}")
+
             if self.collecting_initial:
                 self.status_label.setText(f"초기 워밍업 수집 중... ({len(self.frame_buffer) + 1} / {WARMUP_FRAMES})")
                 self.show_noise_text = False
