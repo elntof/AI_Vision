@@ -648,6 +648,14 @@ class DeletionDialog(QDialog):
         self.setWindowModality(Qt.ApplicationModal)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
 
+        # 이력에서 장비/LOT 기본 정보를 추출해 상단에 노출
+        base_info_label = QLabel(self._extract_base_info(history_entries))
+        base_info_label.setAlignment(Qt.AlignLeft)
+        base_info_font = base_info_label.font()
+        base_info_font.setPointSize(11)
+        base_info_font.setBold(True)
+        base_info_label.setFont(base_info_font)
+
         title = QLabel('삭제할 파티클 이미지를 선택하세요.')
         title_font = title.font()
         title_font.setPointSize(12)
@@ -657,14 +665,18 @@ class DeletionDialog(QDialog):
         self.chk_all.stateChanged.connect(self._on_all_toggled)
 
         self.entry_container = QWidget()
-        self.entry_layout = QVBoxLayout(self.entry_container)
+        self.entry_layout = QHBoxLayout(self.entry_container)
         self.entry_layout.setContentsMargins(8, 8, 8, 8)
         self.entry_layout.setSpacing(12)
         self.entry_layout.addStretch()
+        self.entry_container.setMinimumHeight(340)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.entry_container)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setMinimumHeight(380)
 
         self.chk_list: list[QCheckBox] = []
         for idx, entry in enumerate(history_entries, start=1):
@@ -681,6 +693,7 @@ class DeletionDialog(QDialog):
         btn_box.addWidget(btn_close)
 
         layout = QVBoxLayout(self)
+        layout.addWidget(base_info_label)
         layout.addWidget(title)
         layout.addWidget(self.chk_all)
         layout.addWidget(scroll, 1)
@@ -706,34 +719,38 @@ class DeletionDialog(QDialog):
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                 h, w = gray.shape
                 qimg = QImage(gray.data, w, h, w, QImage.Format_Grayscale8)
-        return QPixmap.fromImage(qimg).scaled(220, 160, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        return QPixmap.fromImage(qimg).scaled(260, 260, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
     def _add_entry(self, entry: dict, order: int):
-        row = QWidget()
-        row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(6, 6, 6, 6)
-        row_layout.setSpacing(10)
+        card = QWidget()
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(6, 6, 6, 6)
+        card_layout.setSpacing(8)
 
-        chk = QCheckBox(f"[{order:03d}] {entry.get('name', '')}")
-        chk.setToolTip(entry.get('name', ''))
-        self.chk_list.append(chk)
-
-        qdt = entry.get('datetime')
-        ts_label = QLabel(qdt.toString('MM/dd HH:mm:ss') if isinstance(qdt, QDateTime) else '-')
-        ts_label.setFixedWidth(130)
+        qdt = entry.get('datetime') if isinstance(entry.get('datetime'), QDateTime) else None
+        ts_label = QLabel(self._format_entry_label(qdt, order))
+        ts_label.setAlignment(Qt.AlignCenter)
+        ts_label.setStyleSheet("color: #222; font-weight: bold;")
 
         img_label = QLabel()
         img_label.setAlignment(Qt.AlignCenter)
+        img_label.setFixedSize(280, 300)
         img_path = entry.get('path')
         if isinstance(img_path, Path) and img_path.exists():
             img_label.setPixmap(self._make_pixmap(img_path))
         else:
             img_label.setText('이미지 없음')
 
-        row_layout.addWidget(chk)
-        row_layout.addWidget(ts_label)
-        row_layout.addWidget(img_label, 1)
-        self.entry_layout.insertWidget(self.entry_layout.count() - 1, row)
+        chk = QCheckBox('삭제 선택')
+        chk.setToolTip(entry.get('name', ''))
+        chk.setProperty('image_name', entry.get('name', ''))
+        self.chk_list.append(chk)
+
+        card_layout.addWidget(ts_label)
+        card_layout.addWidget(img_label)
+        card_layout.addWidget(chk, alignment=Qt.AlignCenter)
+
+        self.entry_layout.insertWidget(self.entry_layout.count() - 1, card)
 
     def _on_all_toggled(self, state):
         checked = state == Qt.Checked
@@ -741,9 +758,28 @@ class DeletionDialog(QDialog):
             chk.setChecked(checked)
 
     def _emit_confirm(self):
-        selected = [chk.text().split(' ', 1)[1] for chk in self.chk_list if chk.isChecked()]
-        self.deleteConfirmed.emit(selected, self.chk_all.isChecked())
+        selected = [chk.property('image_name') for chk in self.chk_list if chk.isChecked()]
+        self.deleteConfirmed.emit([s for s in selected if s], self.chk_all.isChecked())
         self.close()
+
+    def _format_entry_label(self, qdt: QDateTime | None, order: int) -> str:
+        """알림 팝업과 동일한 포맷으로 시각/회차 텍스트를 생성"""
+        if qdt and qdt.isValid():
+            ts_text = qdt.toString('MM/dd_HH:mm:ss')
+        else:
+            ts_text = '-'
+        return f"[{ts_text}] {order:02d}회"
+
+    def _extract_base_info(self, history_entries: list[dict]) -> str:
+        """장비/LOT 기본 정보를 파싱해 상단 라벨 문구를 생성"""
+        if not history_entries:
+            return '- [기본 정보] -'
+        name = history_entries[0].get('name', '')
+        try:
+            info = parse_filename(name)
+            return f"- [기본 정보] {info.get('equip', '')}_{info.get('lot', '')}"
+        except Exception:
+            return '- [기본 정보] -'
 
 
 class AlertPopup(QWidget):
@@ -779,10 +815,16 @@ class AlertPopup(QWidget):
         ignore_label = QLabel('분간 팝업 무시')
         ignore_label.setFont(small_font)
 
-        # 확인 버튼 (우측 상단 배치)
+        # 확인/오탐 삭제 버튼 (우측 상단 배치)
         self.btn_ok = QPushButton('확인')
         self.btn_delete = QPushButton('오탐 삭제')
-
+        # 오탐 삭제 버튼을 강조 (진회색 배경+흰색 텍스트)
+        self.btn_delete.setSizePolicy(self.btn_ok.sizePolicy())
+        self.btn_delete.setMinimumSize(self.btn_ok.sizeHint())
+        self.btn_delete.setStyleSheet(
+            "QPushButton { background-color: #444; color: white; }"
+            "QPushButton:hover { background-color: #555; }"
+        )
         # 탐지 이미지 저장 폴더 Link 버튼 생성
         self.btn_open_folder = QPushButton('Particle 탐지 이미지 저장 폴더 Link')
         self.btn_open_folder.setCursor(Qt.PointingHandCursor)
@@ -814,8 +856,8 @@ class AlertPopup(QWidget):
 
         top_row.addStretch()
 
-        top_row.addWidget(self.btn_delete)
         top_row.addWidget(self.btn_ok)
+        top_row.addWidget(self.btn_delete)
 
         # ── 2줄: "저장 폴더로 이동" 버튼 ─────────────────────────────
         top_right.addLayout(top_row)
