@@ -13,7 +13,7 @@ matplotlib.use('QtAgg')
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox,
-    QGroupBox, QSizePolicy, QLineEdit, QLayout, QCheckBox, QTextEdit, QScrollArea
+    QGroupBox, QSizePolicy, QLineEdit, QLayout, QCheckBox, QTextEdit, QScrollArea, QDialog
 )
 from PySide6.QtCore import Qt, QTimer, QSettings, QRect, QThread, QObject, Signal, Slot, QDateTime, QEvent, QUrl
 from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QGuiApplication, QDesktopServices
@@ -27,9 +27,9 @@ mpl.rcParams['font.family'] = 'Malgun Gothic'
 mpl.rcParams['axes.unicode_minus'] = False
 
 # 환경 플래그: 경로 및 저장동작 테스트(True) / 운영(False) 모드 구분
-LOAD_TEST_MODE = False
-SAVE_TEST_MODE = False
-INI_TEST_MODE  = False
+LOAD_TEST_MODE = True
+SAVE_TEST_MODE = True
+INI_TEST_MODE  = True
 
 # 실행파일 실행 시, "자동 시작 동작 수행" 여부 플래그 : 자동 시작(True) / 수동 시작(False)
 AUTO_START_ON_LAUNCH = True
@@ -174,6 +174,27 @@ def compute_adaptive_threshold(anchor_current: int | float | None) -> int:
     adaptive_value = MANUAL_THRESHOLD + ADAPTIVE_THRESHOLD_GAIN * (float(anchor_current) - ANCHOR_BRIGHTNESS_REF)
     adaptive_value = max(0.0, min(255.0, adaptive_value))
     return int(round(adaptive_value))
+
+
+def extract_image_datetime(path: Path) -> QDateTime:
+    """파일명으로부터 QDateTime 추출 (YYYYMMDD_HHMMSS 형태 지원)"""
+    stem = path.stem
+    m = re.search(r'(\d{4})(\d{2})(\d{2})[_-]?(\d{2})(\d{2})(\d{0,2})', stem)
+    if m:
+        yyyy = int(m.group(1))
+        mm = int(m.group(2))
+        dd = int(m.group(3))
+        hh = int(m.group(4))
+        mi = int(m.group(5))
+        ss = int(m.group(6)) if m.group(6) else 0
+        qdt = QDateTime(yyyy, mm, dd, hh, mi, ss)
+        if qdt.isValid():
+            return qdt
+    try:
+        ts = path.stat().st_mtime
+        return QDateTime.fromSecsSinceEpoch(int(ts))
+    except Exception:
+        return QDateTime()
 
 
 def particle_detection(image_source, exclude_boxes, threshold=None,
@@ -615,9 +636,120 @@ class BacklogFeeder(QObject):
         self.finished.emit()
 
 
+class DeletionDialog(QDialog):
+    """오탐 삭제를 위한 팝업"""
+
+    deleteConfirmed = Signal(list, bool)
+
+    def __init__(self, history_entries, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('오탐 삭제')
+        self.resize(960, 720)
+        self.setWindowModality(Qt.ApplicationModal)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+
+        title = QLabel('삭제할 파티클 이미지를 선택하세요.')
+        title_font = title.font()
+        title_font.setPointSize(12)
+        title.setFont(title_font)
+
+        self.chk_all = QCheckBox('전체 삭제')
+        self.chk_all.stateChanged.connect(self._on_all_toggled)
+
+        self.entry_container = QWidget()
+        self.entry_layout = QVBoxLayout(self.entry_container)
+        self.entry_layout.setContentsMargins(8, 8, 8, 8)
+        self.entry_layout.setSpacing(12)
+        self.entry_layout.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.entry_container)
+
+        self.chk_list: list[QCheckBox] = []
+        for idx, entry in enumerate(history_entries, start=1):
+            self._add_entry(entry, idx)
+
+        btn_delete = QPushButton('삭제 승인')
+        btn_close = QPushButton('닫기')
+        btn_delete.clicked.connect(self._emit_confirm)
+        btn_close.clicked.connect(self.close)
+
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        btn_box.addWidget(btn_delete)
+        btn_box.addWidget(btn_close)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(title)
+        layout.addWidget(self.chk_all)
+        layout.addWidget(scroll, 1)
+        layout.addLayout(btn_box)
+
+    def _make_pixmap(self, img_path: Path) -> QPixmap:
+        img = safe_image_load(str(img_path), as_gray=False)
+        if img is None:
+            return QPixmap()
+        if img.ndim == 2:
+            h, w = img.shape
+            qimg = QImage(img.data, w, h, w, QImage.Format_Grayscale8)
+        else:
+            if img.shape[2] == 3:
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                h, w, _ = rgb.shape
+                qimg = QImage(rgb.data, w, h, 3*w, QImage.Format_RGB888)
+            elif img.shape[2] == 4:
+                rgba = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+                h, w, _ = rgba.shape
+                qimg = QImage(rgba.data, w, h, 4*w, QImage.Format_RGBA8888)
+            else:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                h, w = gray.shape
+                qimg = QImage(gray.data, w, h, w, QImage.Format_Grayscale8)
+        return QPixmap.fromImage(qimg).scaled(220, 160, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+    def _add_entry(self, entry: dict, order: int):
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(6, 6, 6, 6)
+        row_layout.setSpacing(10)
+
+        chk = QCheckBox(f"[{order:03d}] {entry.get('name', '')}")
+        chk.setToolTip(entry.get('name', ''))
+        self.chk_list.append(chk)
+
+        qdt = entry.get('datetime')
+        ts_label = QLabel(qdt.toString('MM/dd HH:mm:ss') if isinstance(qdt, QDateTime) else '-')
+        ts_label.setFixedWidth(130)
+
+        img_label = QLabel()
+        img_label.setAlignment(Qt.AlignCenter)
+        img_path = entry.get('path')
+        if isinstance(img_path, Path) and img_path.exists():
+            img_label.setPixmap(self._make_pixmap(img_path))
+        else:
+            img_label.setText('이미지 없음')
+
+        row_layout.addWidget(chk)
+        row_layout.addWidget(ts_label)
+        row_layout.addWidget(img_label, 1)
+        self.entry_layout.insertWidget(self.entry_layout.count() - 1, row)
+
+    def _on_all_toggled(self, state):
+        checked = state == Qt.Checked
+        for chk in self.chk_list:
+            chk.setChecked(checked)
+
+    def _emit_confirm(self):
+        selected = [chk.text().split(' ', 1)[1] for chk in self.chk_list if chk.isChecked()]
+        self.deleteConfirmed.emit(selected, self.chk_all.isChecked())
+        self.close()
+
+
 class AlertPopup(QWidget):
     """탐지 팝업(AlertPopup) 클래스"""
     closedWithAction = Signal(str, int)
+    deleteRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -649,6 +781,7 @@ class AlertPopup(QWidget):
 
         # 확인 버튼 (우측 상단 배치)
         self.btn_ok = QPushButton('확인')
+        self.btn_delete = QPushButton('오탐 삭제')
 
         # 탐지 이미지 저장 폴더 Link 버튼 생성
         self.btn_open_folder = QPushButton('Particle 탐지 이미지 저장 폴더 Link')
@@ -681,6 +814,7 @@ class AlertPopup(QWidget):
 
         top_row.addStretch()
 
+        top_row.addWidget(self.btn_delete)
         top_row.addWidget(self.btn_ok)
 
         # ── 2줄: "저장 폴더로 이동" 버튼 ─────────────────────────────
@@ -790,6 +924,7 @@ class AlertPopup(QWidget):
 
         # 시그널 연결
         self.btn_ok.clicked.connect(lambda: self._close_with('ok'))
+        self.btn_delete.clicked.connect(self.deleteRequested.emit)
 
         # 배경 깜빡임
         self._blink_red = False
@@ -822,10 +957,11 @@ class AlertPopup(QWidget):
         else:
             self.info_group_container.setStyleSheet("")
 
-    def set_first_detect_time(self, qdt: QDateTime):
-        self._first_dt = qdt
+    def set_first_detect_time(self, qdt: QDateTime | None):
+        self._first_dt = qdt if (qdt and qdt.isValid()) else None
         self._elapsed_timer.stop()
-        self._elapsed_timer.start(1000)
+        if self._first_dt:
+            self._elapsed_timer.start(1000)
         self._update_elapsed()
 
     def _update_elapsed(self):
@@ -935,26 +1071,7 @@ class AlertPopup(QWidget):
         return qdt.toString('MM/dd_HH:mm:ss')
 
     def _extract_image_datetime(self, path: Path) -> QDateTime:
-        stem = path.stem
-        m = re.search(r'(\d{4})(\d{2})(\d{2})[_-]?(\d{2})(\d{2})(\d{0,2})', stem)
-        if m:
-            yyyy = int(m.group(1))
-            mm = int(m.group(2))
-            dd = int(m.group(3))
-            hh = int(m.group(4))
-            mi = int(m.group(5))
-            ss = int(m.group(6)) if m.group(6) else 0
-            qdt = QDateTime(yyyy, mm, dd, hh, mi, ss)
-            if qdt.isValid():
-                return qdt
-        try:
-            stat = path.stat()
-            qdt = QDateTime.fromSecsSinceEpoch(int(stat.st_mtime), Qt.LocalTime)
-            if qdt.isValid():
-                return qdt
-        except Exception:
-            pass
-        return QDateTime.currentDateTime()
+        return extract_image_datetime(path)
 
     def _refresh_graph_view(self):
         if self._graph_pixmap.isNull():
@@ -1034,6 +1151,7 @@ class ParticleDetectionGUI(QWidget):
         self.session_processed_images: set[str] = set()
         self.saved_graph_lots: set[str] = set()
         self.graph_records: list[tuple[str, int, float]] = []
+        self.detection_history: list[dict] = []
         self.pending_images: deque[Path] = deque()
         self._is_processing_queue = False
         self.current_process = None
@@ -1058,6 +1176,7 @@ class ParticleDetectionGUI(QWidget):
         self.lot_event_count = 0
         self._popup_images = deque(maxlen=5)
         self._popup_detect_dt: QDateTime | None = None
+        self._delete_dialog: QDialog | None = None
 
         # crop1 영역 Spinbox 설정 및 저장값 로딩
         self.crop1_x = QSpinBox(maximum=9999)
@@ -1562,6 +1681,7 @@ class ParticleDetectionGUI(QWidget):
                 self.current_attempt = attempt_value
                 self.processed_images.clear()
                 self.lot_event_count = 0
+                self.detection_history.clear()
                 self._popup_images.clear()
                 self._popup_detect_dt = None
                 if self.alert_popup:
@@ -1596,6 +1716,7 @@ class ParticleDetectionGUI(QWidget):
                 self.graph_records.clear()
                 self._load_graph_buffer_from_csv()
                 self.update_graph()
+                self._load_detection_history()
 
             else:
                 if self.current_attempt is None:
@@ -1767,14 +1888,12 @@ class ParticleDetectionGUI(QWidget):
                 event_path = lot_dir / img_path.name
                 cv2.imwrite(str(event_path), overlay_img)
 
-                # 누적 횟수 증가
-                self.lot_event_count += 1
+                event_dt = self._parse_info_datetime(info)
+                self._add_detection_history_entry(event_path, info, event_dt)
+
                 # 팝업 무시 중 여부 확인
-                if time.monotonic() < self.popup_snooze_until:
-                    # 무시 중이면 이미지 배열만 유지(최대 5장)
-                    self._push_popup_image(event_path, self.lot_event_count)
-                else:
-                    self._maybe_open_or_update_popup(info, event_path)
+                if time.monotonic() >= self.popup_snooze_until:
+                    self._maybe_open_or_update_popup(info, event_path, event_dt)
 
             # 그래프 갱신
             self.update_graph()
@@ -1859,6 +1978,135 @@ class ParticleDetectionGUI(QWidget):
             attempt_list=attempt_list
         )
 
+    def _load_detection_history(self):
+        """현재 Lot의 기존 파티클 탐지 이력을 CSV/이미지 기반으로 로딩"""
+        self.detection_history.clear()
+        if not (self.csv_path and self.csv_path.exists() and self.current_lot):
+            self.lot_event_count = 0
+            self._refresh_popup_images_from_history()
+            return
+
+        event_dir = EVENT_OUTPUT_DIR / self.current_lot
+        try:
+            with open(self.csv_path, 'r', encoding='utf-8-sig', newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if not row or row.get('파티클 발생 여부') != 'O':
+                        continue
+                    name = row.get('이미지 파일명', '')
+                    if not name:
+                        continue
+                    info = parse_filename(name)
+                    img_path = event_dir / name
+                    qdt = extract_image_datetime(img_path if img_path.exists() else Path(name))
+                    self.detection_history.append({
+                        'name': name,
+                        'path': img_path,
+                        'datetime': qdt,
+                        'stem': info.get('stem', name)
+                    })
+            self.detection_history.sort(key=lambda e: e['datetime'].toSecsSinceEpoch())
+        except Exception:
+            pass
+
+        self.lot_event_count = len(self.detection_history)
+        self._refresh_popup_images_from_history()
+
+    def _refresh_popup_images_from_history(self):
+        self._popup_images = deque(maxlen=5)
+        if not self.detection_history:
+            return
+        start = max(0, len(self.detection_history) - 5)
+        for idx, entry in enumerate(self.detection_history[start:], start=start + 1):
+            img_path = entry.get('path')
+            if isinstance(img_path, Path) and img_path.exists():
+                self._popup_images.append((img_path, idx))
+
+    def _add_detection_history_entry(self, event_path: Path, info: dict, event_dt: QDateTime):
+        self.detection_history.append({
+            'name': event_path.name,
+            'path': event_path,
+            'datetime': event_dt if event_dt and event_dt.isValid() else extract_image_datetime(event_path),
+            'stem': info.get('stem', event_path.stem)
+        })
+        self.detection_history.sort(key=lambda e: e['datetime'].toSecsSinceEpoch())
+        self._refresh_popup_images_from_history()
+        self.lot_event_count = len(self.detection_history)
+
+    def _open_false_positive_dialog(self):
+        if not self.detection_history:
+            self._set_status('삭제할 파티클 탐지 이력이 없습니다.', hold_s=3.0)
+            return
+        if self._delete_dialog:
+            self._delete_dialog.close()
+        self._delete_dialog = DeletionDialog(self.detection_history, parent=self.alert_popup or self)
+        self._delete_dialog.deleteConfirmed.connect(self._handle_false_positive_deletion)
+        self._delete_dialog.destroyed.connect(lambda: setattr(self, '_delete_dialog', None))
+        self._delete_dialog.show()
+
+    def _handle_false_positive_deletion(self, selected_names: list[str], delete_all: bool):
+        names_set = {entry['name'] for entry in self.detection_history} if delete_all else set(selected_names)
+        names_set = {name for name in names_set if name}
+        if not names_set:
+            return
+
+        to_delete = [entry for entry in self.detection_history if entry['name'] in names_set]
+        self.detection_history = [entry for entry in self.detection_history if entry['name'] not in names_set]
+
+        self._rewrite_csv_excluding(names_set)
+
+        for entry in to_delete:
+            img_path = entry.get('path')
+            if isinstance(img_path, Path) and img_path.exists():
+                try:
+                    img_path.unlink()
+                except Exception:
+                    pass
+
+        self.graph_records = [rec for rec in self.graph_records if rec[0] not in names_set]
+        self.update_graph()
+
+        self.lot_event_count = len(self.detection_history)
+        self._refresh_popup_images_from_history()
+        self._refresh_alert_popup_after_deletion()
+        self._set_status(f"오탐 {len(to_delete)}건 삭제 완료", hold_s=3.0)
+
+    def _rewrite_csv_excluding(self, names_set: set[str]):
+        if not (self.csv_path and self.csv_path.exists()):
+            return
+        try:
+            with open(self.csv_path, 'r', encoding='utf-8-sig', newline='') as f:
+                rows = list(csv.reader(f))
+            if not rows:
+                return
+            header, data_rows = rows[0], rows[1:]
+            filtered = [row for row in data_rows if row and row[0] not in names_set]
+            with open(self.csv_path, 'w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                writer.writerows(filtered)
+        except Exception as e:
+            self._set_status(f"CSV 삭제 실패: {e}", hold_s=3.0)
+
+    def _refresh_alert_popup_after_deletion(self):
+        if not self.alert_popup:
+            return
+        count_text = f"{len(self.detection_history)}회"
+        if self.detection_history:
+            last = self.detection_history[-1]
+            when_text = self._when_text(last['datetime'])
+            base_info = last.get('stem', '')
+            first_dt = self.detection_history[0]['datetime']
+        else:
+            when_text = '-'
+            base_info = ''
+            first_dt = None
+
+        self.alert_popup.set_info(base_info, when_text, count_text)
+        self.alert_popup.set_first_detect_time(first_dt)
+        self.alert_popup.set_graph_pixmap(self._graph_pixmap())
+        self.alert_popup.set_images(list(self._popup_images))
+
 
     def _push_popup_image(self, path: Path, event_count: int):
         """팝업창 이미지 출력"""
@@ -1898,31 +2146,31 @@ class ParticleDetectionGUI(QWidget):
             self.alert_popup = AlertPopup(None)
             self.alert_popup.setWindowModality(Qt.NonModal)
             self.alert_popup.closedWithAction.connect(self._on_popup_closed)
+            self.alert_popup.deleteRequested.connect(self._open_false_positive_dialog)
         return self.alert_popup
 
-    def _maybe_open_or_update_popup(self, info: dict, event_image_path: Path):
+    def _maybe_open_or_update_popup(self, info: dict, event_image_path: Path, event_dt: QDateTime | None = None):
         """팝업 이미지 큐 갱신"""
-        self._push_popup_image(event_image_path, self.lot_event_count)
+        if event_dt is None:
+            event_dt = self._parse_info_datetime(info)
+        self._popup_detect_dt = event_dt
+        self._refresh_popup_images_from_history()
         pop = self._ensure_popup()
 
-        # 발생 시각 (최신 탐지 시간으로 갱신)
-        event_dt = self._parse_info_datetime(info)
-        self._popup_detect_dt = event_dt
-
-        # 머릿글/정보/그래프/이미지 세팅
         base_info_text = info['stem']
         when_text = self._when_text(event_dt)
-        count_text = f"{self.lot_event_count}회"
+        count_text = f"{len(self.detection_history)}회"
+        first_dt = self.detection_history[0]['datetime'] if self.detection_history else event_dt
 
         pop.set_info(base_info_text, when_text, count_text)
-        pop.set_first_detect_time(event_dt)
+        pop.set_first_detect_time(first_dt)
         pop.set_graph_pixmap(self._graph_pixmap())
         pop.set_images(list(self._popup_images))
         pop.set_event_folder(event_image_path.parent)
-        pop.append_log(f"Particle 탐지 {self.lot_event_count}회", event_dt)
+        pop.append_log(f"Particle 탐지 {len(self.detection_history)}회", event_dt)
         pop.start_blink()
 
-        # 이미 떠 있으면 내용만 갱신, 없으면 표시
+        # 이미 떠 있으면 내용만 갱신, 없으면 표시␊
         if not pop.isVisible():
             pop.show()
             pop.raise_()
