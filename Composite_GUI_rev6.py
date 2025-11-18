@@ -2,7 +2,7 @@ import os
 import sys
 from pathlib import Path
 from PIL import Image, ImageQt
-from datetime import datetime, timedelta
+from datetime import datetime
 from PySide6.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QLabel, QHBoxLayout, QSpinBox,
     QSlider, QCheckBox, QGroupBox, QGridLayout, QLineEdit, QSizePolicy
@@ -13,10 +13,10 @@ import socket
 import csv
 import io
 from smb.SMBConnection import SMBConnection
-import traceback
 import time
 import numpy as np
 import cv2
+import ast
 
 
 # 메인 윈도우 기본 위치 (모니터 좌측 하단 기준 offset)
@@ -87,37 +87,6 @@ def maintain_max_files(output_folder, max_files):
             f.unlink()
         except Exception as e:
             print(f'파일 삭제 실패: {f} - {e}')
-
-
-def find_latest_csv_file():
-    """SMB에서 가장 마지막으로 수정된 CSV 파일명을 반환"""
-    conn = None
-    for port_try in [139, 445]:
-        try:
-            is_direct_tcp = (port_try == 445)
-            conn = SMBConnection(username, password, client_name, server_name,
-                                 domain=domain, use_ntlm_v2=True, is_direct_tcp=is_direct_tcp)
-            connected = conn.connect(server_ip, port_try)
-            if connected:
-                files = conn.listPath(share_name, '/')
-                csv_files = [file for file in files if file.filename.lower().endswith('.csv')]
-                if not csv_files:
-                    conn.close()
-                    return None
-                latest_file = max(csv_files, key=lambda f: f.last_write_time)
-                conn.close()
-                return latest_file.filename
-            else:
-                conn.close()
-        except Exception:
-            pass
-        finally:
-            if conn:
-                try:
-                    conn.close()
-                except:
-                    pass
-    return None
 
 
 def retrieve_csv_text(filename):
@@ -479,17 +448,17 @@ class ImageSaverThread(QThread):
     update_preview = Signal()
     update_device_name = Signal(str)
 
-    def __init__(self, source_file, output_folder, crop_rect, get_format, get_quality, get_interval, get_device_name, get_delete_interval_hours):
+    def __init__(self, source_file, output_folder, crop_rect, get_format, get_quality, get_interval, get_max_files, get_allowed_process_rule):
         """이미지 저장에 필요한 파라미터(파일 경로, 형식, 크롭 영역 등)를 받으며 쓰레드 객체 초기화"""
         super().__init__()
-        self.source_file = source_file
-        self.output_folder = output_folder
+        self.source_file = Path(source_file)
+        self.output_folder = Path(output_folder)
         self.crop_rect = crop_rect
         self.get_format = get_format
         self.get_quality = get_quality
         self.get_interval = get_interval
-        self.get_device_name = get_device_name
-        self.get_delete_interval_hours = get_delete_interval_hours
+        self.get_max_files = get_max_files
+        self.get_allowed_process_rule = get_allowed_process_rule
         self.running = False
         self._last_mtime = None
         self.csv_tracker = CsvTracker()
@@ -540,17 +509,11 @@ class ImageSaverThread(QThread):
                 device_name_full = f"{host_name} / {latest_csv_fname.rsplit('.', 1)[0] if latest_csv_fname else 'N/A'}"
                 self.update_device_name.emit(device_name_full)
 
-                puller_status_value = csv_row_info.get("puller_status")
-                status_text = (csv_row_info.get("status_text", "") or "UNKNOWN").upper()
-                is_neck_process = (
-                    isinstance(puller_status_value, int)
-                    and 30 <= puller_status_value <= 39
-                    and status_text == "NECK"
-                )
+                status_text = csv_row_info.get("status_text", "") or "UNKNOWN"
 
-                if not is_neck_process:
-                    # puller_status로 현재 공정을 확인하고, 허용 외 공정일 때는 '다음 composite.bmp 변경'까지 대기
-                    self.update_status.emit(f'이미지 저장 허용 공정이 아님: {status_text}')
+                if not self._is_allowed_process(status_text):
+                    allowed_desc = self._describe_allowed_processes()
+                    self.update_status.emit(f'저장 허용 공정이 아님 (현재: {status_text}, 허용: {allowed_desc})')
                     if not self._wait_until_next_change(poll_ms=200):
                         return
                     continue
@@ -595,7 +558,7 @@ class ImageSaverThread(QThread):
 
                 # 유지 개수 기준 (저장 직후에만 호출)
                 try:
-                    maintain_max_files(self.output_folder, self.get_delete_interval_hours())
+                    maintain_max_files(self.output_folder, self.get_max_files())
                 except Exception as e:
                     self.update_status.emit(f'정리 실패: {e}')
 
@@ -617,8 +580,31 @@ class ImageSaverThread(QThread):
         """이미지 저장 루프 종료"""
         self.running = False
 
+    def _is_allowed_process(self, status_text):
+        """이미지 저장 허용 공정 판정 (ALL이면 모두 허용)"""
+        allow_all, allowed_set = self.get_allowed_process_rule()
+        if allow_all:
+            return True
+
+        # 비교는 대소문자만 무시 (철자/형태는 그대로 구분)
+        normalized = (status_text or "").upper().strip()
+        effective_allowed = allowed_set or {"NECK"}
+
+        return normalized in effective_allowed
+    
+
+    def _describe_allowed_processes(self):
+        allow_all, allowed_set = self.get_allowed_process_rule()
+        if allow_all:
+            return "ALL"
+
+        if not allowed_set:
+            return "NECK"
+
+        return ", ".join(sorted(allowed_set))
+
     def _wait_until_next_change(self, poll_ms=200):
-        """ composite.bmp의 '다음 변경'이 발생할 때까지 블로킹 대기 헬퍼"""
+        """composite.bmp의 '다음 변경'이 발생할 때까지 블로킹 대기 헬퍼"""
         prev_mtime = self._last_mtime
         while self.running:
             try:
@@ -708,6 +694,10 @@ class MainWindow(QWidget):
         self.output_folder = Path('Images')
         self.output_folder.mkdir(exist_ok=True)
 
+        self._allowed_process_raw = "NECK"
+        self._allowed_process_allow_all = False
+        self._allowed_process_set = {"NECK"}
+
         self.status_label = QLabel('대기 중.')
         self.start_button = QPushButton('시작')
         self.stop_button = QPushButton('종료')
@@ -742,21 +732,21 @@ class MainWindow(QWidget):
         self.interval_spin.setFixedWidth(85)
         self.interval_label = QLabel('저장(초):')
 
-        # Spin 박스(삭제 Interval) 생성 및 설정
-        self.delete_interval_spin = QSpinBox()
-        self.delete_interval_spin.setMinimum(1)
-        self.delete_interval_spin.setMaximum(1000)
-        self.delete_interval_spin.setValue(1000)
-        self.delete_interval_spin.setFixedWidth(85)
-        self.delete_interval_label = QLabel('삭제(장):')
+        # Spin 박스(최대 보존 파일 개수) 생성 및 설정
+        self.max_files_spin = QSpinBox()
+        self.max_files_spin.setMinimum(1)
+        self.max_files_spin.setMaximum(1000)
+        self.max_files_spin.setValue(1000)
+        self.max_files_spin.setFixedWidth(85)
+        self.max_files_label = QLabel('보존(장):')
 
         # 그룹 박스(Interval Parameter) 생성 및 설정
         interval_group = QGroupBox('Interval Parameter')
         interval_layout = QGridLayout()
         interval_layout.addWidget(self.interval_label, 0, 0)
         interval_layout.addWidget(self.interval_spin, 0, 1)
-        interval_layout.addWidget(self.delete_interval_label, 0, 2)
-        interval_layout.addWidget(self.delete_interval_spin, 0, 3)
+        interval_layout.addWidget(self.max_files_label, 0, 2)
+        interval_layout.addWidget(self.max_files_spin, 0, 3)
         interval_group.setLayout(interval_layout)
 
         # 체크 박스(BMP, JPEG) 생성
@@ -934,8 +924,8 @@ class MainWindow(QWidget):
             self.get_selected_formats,
             self.get_quality,
             self.get_interval,
-            self.get_device_name,
-            self.get_delete_interval_hours
+            self.get_max_files,
+            self.get_allowed_process_rule
         )
         self.image_thread.update_status.connect(self.status_label.setText)
         self.image_thread.update_preview.connect(self.update_preview)
@@ -984,11 +974,8 @@ class MainWindow(QWidget):
     def get_interval(self):
         return self.interval_spin.value()
 
-    def get_delete_interval_hours(self):
-        return self.delete_interval_spin.value()
-
-    def get_device_name(self):
-        return self.device_edit.text()
+    def get_max_files(self):
+        return self.max_files_spin.value()
 
     def set_quality(self, val):
         self.quality_label.setText(f'JPEG 품질: {val}')
@@ -1033,10 +1020,19 @@ class MainWindow(QWidget):
         self.settings.setValue('crop_w', self.crop_w.value())
         self.settings.setValue('crop_h', self.crop_h.value())
         self.settings.setValue('interval', self.interval_spin.value())
-        self.settings.setValue('delete_interval', self.delete_interval_spin.value())
+        self.settings.setValue('max_files', self.max_files_spin.value())
         self.settings.setValue('bmp_checked', self.bmp_check.isChecked())
         self.settings.setValue('jpg_checked', self.jpg_check.isChecked())
         self.settings.setValue('jpeg_quality', self.quality_slider.value())
+
+        # allowed_processes를 항상 "표준 문자열"로 저장
+        allow_all, allowed_set = self.get_allowed_process_rule()
+        if allow_all:
+            canonical = 'ALL'
+        else:
+            canonical = ', '.join(sorted(allowed_set)) if allowed_set else 'NECK'
+        self._allowed_process_raw = canonical
+        self.settings.setValue('allowed_processes', canonical)
 
         # 메인 창 위치 저장
         top_left = self.frameGeometry().topLeft()
@@ -1053,16 +1049,66 @@ class MainWindow(QWidget):
         self.crop_w.setValue(int(self.settings.value('crop_w', 280)))
         self.crop_h.setValue(int(self.settings.value('crop_h', 600)))
         self.interval_spin.setValue(int(self.settings.value('interval', 4)))
-        self.delete_interval_spin.setValue(int(self.settings.value('delete_interval', 1000)))
+        max_files_val = self.settings.value('max_files', None)
+        if max_files_val is None:
+            max_files_val = self.settings.value('delete_interval', 1000)
+        self.max_files_spin.setValue(int(max_files_val))
         self.bmp_check.setChecked(self.settings.value('bmp_checked', 'False') in ['true', 'True', True])
         self.jpg_check.setChecked(self.settings.value('jpg_checked', 'True') in ['true', 'True', True])
         self.device_edit.setText(str(self.settings.value('device_name', '')))
         qual = int(self.settings.value('jpeg_quality', 90))
         self.quality_slider.setValue(qual)
 
+        allowed_processes_value = self.settings.value('allowed_processes', 'NECK')
+        if allowed_processes_value is None:
+            allowed_processes_value = 'NECK'
+        self._set_allowed_processes(allowed_processes_value)
+
     def update_device_name_from_thread(self, full_device_name):
         """ImageSaverThread에서 보낸 최신 장비명으로 GUI 장비명 입력란 갱신"""
         self.device_edit.setText(full_device_name)
+
+    def _set_allowed_processes(self, value):
+        """value는 리스트/튜플/셋 어떤 형태든 허용 공정 집합으로 정상화"""
+        tokens = []
+
+        if isinstance(value, (list, tuple, set)):
+            tokens = [str(v).strip() for v in value if str(v).strip()]
+        elif isinstance(value, str):
+            s = value.strip()
+            if s.startswith('[') and s.endswith(']'):
+                # 리스트 문자열이면 안전하게 파싱 시도
+                try:
+                    parsed = ast.literal_eval(s)
+                    if isinstance(parsed, (list, tuple, set)):
+                        tokens = [str(v).strip() for v in parsed if str(v).strip()]
+                    else:
+                        # 리스트가 아니면 수동 분해
+                        tokens = [p.strip() for p in s.strip('[]').split(',')]
+                except Exception:
+                    tokens = [p.strip() for p in s.strip('[]').split(',')]
+            else:
+                tokens = [p.strip() for p in s.split(',') if p.strip()]
+        else:
+            tokens = []
+
+        upper_tokens = {t.upper() for t in tokens if t}
+
+        # raw는 항상 "표준 문자열"로 유지
+        self._allowed_process_raw = 'ALL' if 'ALL' in upper_tokens else ', '.join(tokens) if tokens else 'NECK'
+
+        if 'ALL' in upper_tokens:
+            self._allowed_process_allow_all = True
+            self._allowed_process_set = set()
+        elif upper_tokens:
+            self._allowed_process_allow_all = False
+            self._allowed_process_set = upper_tokens
+        else:
+            self._allowed_process_allow_all = False
+            self._allowed_process_set = {"NECK"}
+
+    def get_allowed_process_rule(self):
+        return (self._allowed_process_allow_all, set(self._allowed_process_set))
 
 
 def run_gui():
