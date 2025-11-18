@@ -119,6 +119,49 @@ def safe_image_load(image_path, as_gray=False, max_retries=5, delay=0.2):
     return None
 
 
+def _numpy_to_qimage(npimg) -> QImage:
+    """NumPy 이미지를 QImage로 변환 (채널 수에 따라 자동 변환)"""
+    if npimg is None:
+        return QImage()
+
+    if npimg.ndim == 2:
+        h, w = npimg.shape
+        return QImage(npimg.data, w, h, w, QImage.Format_Grayscale8).copy()
+
+    if npimg.shape[2] == 3:
+        rgb = cv2.cvtColor(npimg, cv2.COLOR_BGR2RGB)
+        h, w, _ = rgb.shape
+        return QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+
+    if npimg.shape[2] == 4:
+        rgba = cv2.cvtColor(npimg, cv2.COLOR_BGRA2RGBA)
+        h, w, _ = rgba.shape
+        return QImage(rgba.data, w, h, 4 * w, QImage.Format_RGBA8888).copy()
+
+    gray = cv2.cvtColor(npimg, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    return QImage(gray.data, w, h, w, QImage.Format_Grayscale8).copy()
+
+
+def pixmap_from_numpy(npimg, target_size: tuple[int, int] | None = None) -> QPixmap:
+    """NumPy 이미지를 QPixmap으로 변환 후 필요 시 스케일링"""
+    qimg = _numpy_to_qimage(npimg)
+    if qimg.isNull():
+        return QPixmap()
+    pm = QPixmap.fromImage(qimg)
+    if target_size:
+        pm = pm.scaled(*target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    return pm
+
+
+def load_pixmap_from_path(img_path: Path, target_size: tuple[int, int] | None = None) -> QPixmap:
+    """파일 경로에서 이미지를 로드 후 QPixmap으로 변환"""
+    img = safe_image_load(str(img_path), as_gray=False)
+    if img is None:
+        return QPixmap()
+    return pixmap_from_numpy(img, target_size)
+
+
 def compute_anchor_brightness(gray_img):
     """70% 최빈 구간 앵커 밝기 계산"""
     if gray_img is None or gray_img.ndim != 2:
@@ -318,6 +361,9 @@ class ImageDirectoryWatcher(QObject):
         except Exception:
             pass
 
+    def is_running(self) -> bool:
+        return self._observer is not None
+
 
 def parse_filename(fname: str):
     """파일명 파서 (형식: EQUIP_Lot#_Process_Attempt_YYYYMMDD_HHMM(SS).ext)"""
@@ -505,14 +551,7 @@ class ImagePreviewLabel(QLabel):
         h, w = self.src_shape
         self.placeholder_text = ""
 
-        if npimg.ndim == 3:
-            rgb_img = cv2.cvtColor(npimg, cv2.COLOR_BGR2RGB)
-            qimg = QImage(rgb_img.data, w, h, 3 * w, QImage.Format_RGB888)
-        else:
-            qimg = QImage(npimg.data, w, h, w, QImage.Format_Grayscale8)
-
-        pixmap = QPixmap.fromImage(qimg).scaled(self.width(), self.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.pixmap = pixmap
+        self.pixmap = pixmap_from_numpy(npimg, (self.width(), self.height()))
         self.repaint()
 
     def paintEvent(self, event):
@@ -644,7 +683,7 @@ class DeletionDialog(QDialog):
     def __init__(self, history_entries, parent=None):
         super().__init__(parent)
         self.setWindowTitle('오탐 삭제')
-        self.resize(960, 720)
+        self.resize(960, 490)
         self.setWindowModality(Qt.ApplicationModal)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
 
@@ -666,17 +705,17 @@ class DeletionDialog(QDialog):
 
         self.entry_container = QWidget()
         self.entry_layout = QHBoxLayout(self.entry_container)
-        self.entry_layout.setContentsMargins(8, 8, 8, 8)
-        self.entry_layout.setSpacing(12)
+        self.entry_layout.setContentsMargins(4, 4, 4, 4)
+        self.entry_layout.setSpacing(6)
         self.entry_layout.addStretch()
-        self.entry_container.setMinimumHeight(340)
+        self.entry_container.setMinimumHeight(300)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.entry_container)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setMinimumHeight(380)
+        scroll.setMinimumHeight(320)
 
         self.chk_list: list[QCheckBox] = []
         for idx, entry in enumerate(history_entries, start=1):
@@ -700,26 +739,7 @@ class DeletionDialog(QDialog):
         layout.addLayout(btn_box)
 
     def _make_pixmap(self, img_path: Path) -> QPixmap:
-        img = safe_image_load(str(img_path), as_gray=False)
-        if img is None:
-            return QPixmap()
-        if img.ndim == 2:
-            h, w = img.shape
-            qimg = QImage(img.data, w, h, w, QImage.Format_Grayscale8)
-        else:
-            if img.shape[2] == 3:
-                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                h, w, _ = rgb.shape
-                qimg = QImage(rgb.data, w, h, 3*w, QImage.Format_RGB888)
-            elif img.shape[2] == 4:
-                rgba = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
-                h, w, _ = rgba.shape
-                qimg = QImage(rgba.data, w, h, 4*w, QImage.Format_RGBA8888)
-            else:
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                h, w = gray.shape
-                qimg = QImage(gray.data, w, h, w, QImage.Format_Grayscale8)
-        return QPixmap.fromImage(qimg).scaled(260, 260, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        return load_pixmap_from_path(img_path, (240, 240))
 
     def _add_entry(self, entry: dict, order: int):
         card = QWidget()
@@ -1046,6 +1066,13 @@ class AlertPopup(QWidget):
         if self.log_edit.verticalScrollBar() is not None:
             self.log_edit.verticalScrollBar().setValue(self.log_edit.verticalScrollBar().maximum())
 
+    def sync_detection_history(self, history_entries: list[dict]):
+        self.log_edit.clear()
+        for idx, entry in enumerate(history_entries, start=1):
+            when = entry.get('datetime')
+            when_dt = when if isinstance(when, QDateTime) else QDateTime()
+            self.append_log(f"Particle 탐지 {idx:02d}회", when_dt)
+
     def set_images(self, image_infos):
         # 기존 라벨 제거
         for lab in self._pix_labels:
@@ -1082,31 +1109,8 @@ class AlertPopup(QWidget):
             self.img_container.insertWidget(self.img_container.count()-1, wrapper)
             self._pix_labels.append(wrapper)
 
-
     def _load_pix(self, p: Path) -> QPixmap:
-        img = safe_image_load(str(p), as_gray=False)
-        if img is None:
-            return QPixmap()
-
-        if img.ndim == 2:
-            h, w = img.shape
-            qimg = QImage(img.data, w, h, w, QImage.Format_Grayscale8)
-        else:
-            if img.shape[2] == 3:
-                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                h, w, _ = rgb.shape
-                qimg = QImage(rgb.data, w, h, 3*w, QImage.Format_RGB888)
-            elif img.shape[2] == 4:
-                rgba = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
-                h, w, _ = rgba.shape
-                qimg = QImage(rgba.data, w, h, 4*w, QImage.Format_RGBA8888)
-            else:
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                h, w = gray.shape
-                qimg = QImage(gray.data, w, h, w, QImage.Format_Grayscale8)
-
-        return QPixmap.fromImage(qimg).scaled(180, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
+        return load_pixmap_from_path(p, (180, 240))
 
     def _format_image_timestamp(self, path: Path) -> str:
         qdt = self._extract_image_datetime(path)
@@ -1554,6 +1558,67 @@ class ParticleDetectionGUI(QWidget):
             self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
 
 
+    def _start_backlog_feeder(self, backlog):
+        if not backlog:
+            self.status_label.setText("백로그 없음. 라이브 감시 시작.")
+            self._drain_pending_queue()
+            return
+
+        self._backlog_thread = QThread()
+        self._backlog_feeder = BacklogFeeder(backlog)
+        self._backlog_feeder.moveToThread(self._backlog_thread)
+        self._backlog_thread.started.connect(self._backlog_feeder.run)
+        self._backlog_feeder.next_image.connect(self.process_single_image)
+        self._backlog_feeder.finished.connect(self._on_backlog_finished)
+        # 안전 종료 연결
+        self._backlog_feeder.finished.connect(self._backlog_thread.quit)
+        self._backlog_thread.finished.connect(self._backlog_thread.deleteLater)
+        self._backlog_thread.finished.connect(lambda: setattr(self, "_backlog_thread", None))
+        self._backlog_thread.destroyed.connect(lambda: setattr(self, "_backlog_thread", None))
+        self._backlog_feeder.finished.connect(lambda: setattr(self, "_backlog_feeder", None))
+        self._backlog_thread.finished.connect(self._drain_pending_queue)
+        self._backlog_thread.start()
+        self.status_label.setText(f"백로그 처리 시작: {len(backlog)}장")
+
+
+    def _restart_backlog_scan(self):
+        backlog = find_new_images(IMG_INPUT_DIR, self.session_processed_images)
+        self._start_backlog_feeder(backlog)
+
+
+    def _pause_ingestion_for_deletion(self):
+        state = {
+            'tail_timer': self.tail_timer.isActive(),
+            'watcher': self.directory_watcher.is_running(),
+            'backlog': bool(self._backlog_thread and self._backlog_thread.isRunning()),
+        }
+
+        if state['tail_timer']:
+            self.tail_timer.stop()
+        if state['watcher']:
+            self.directory_watcher.stop()
+        if state['backlog']:
+            try:
+                if self._backlog_feeder:
+                    self._backlog_feeder.stop()
+                self._backlog_thread.quit()
+                self._backlog_thread.wait(2000)
+            except Exception:
+                pass
+        return state
+
+
+    def _resume_ingestion_after_deletion(self, state: dict):
+        if state.get('watcher'):
+            self.directory_watcher.start()
+        if state.get('tail_timer'):
+            self.tail_timer.start()
+        if state.get('backlog'):
+            self._restart_backlog_scan()
+        else:
+            self._drain_pending_queue()
+
+
     def start_realtime(self):
         """실시간 파티클 판정 시작 (백로그 → 라이브 테일 순)"""
         # 워밍업 초기화
@@ -1577,26 +1642,7 @@ class ParticleDetectionGUI(QWidget):
 
         # 백로그 목록 구성 (processed_images 기준 미처리 파일 전체)
         backlog = find_new_images(IMG_INPUT_DIR, self.session_processed_images)
-        if backlog:
-            # 백로그를 메인스레드에 차례로 공급
-            self._backlog_thread = QThread()
-            self._backlog_feeder = BacklogFeeder(backlog)
-            self._backlog_feeder.moveToThread(self._backlog_thread)
-            self._backlog_thread.started.connect(self._backlog_feeder.run)
-            self._backlog_feeder.next_image.connect(self.process_single_image)
-            self._backlog_feeder.finished.connect(self._on_backlog_finished)
-            # 안전 종료 연결
-            self._backlog_feeder.finished.connect(self._backlog_thread.quit)
-            self._backlog_thread.finished.connect(self._backlog_thread.deleteLater)
-            self._backlog_thread.finished.connect(lambda: setattr(self, "_backlog_thread", None))
-            self._backlog_thread.destroyed.connect(lambda: setattr(self, "_backlog_thread", None))
-            self._backlog_feeder.finished.connect(lambda: setattr(self, "_backlog_feeder", None))
-            self._backlog_thread.finished.connect(self._drain_pending_queue)
-            self._backlog_thread.start()
-            self.status_label.setText(f"백로그 처리 시작: {len(backlog)}장")
-        else:
-            self.status_label.setText("백로그 없음. 라이브 감시 시작.")
-            self._drain_pending_queue()
+        self._start_backlog_feeder(backlog)
         # 초기 Noise 텍스트
         self._update_noise_text()
 
@@ -2092,26 +2138,31 @@ class ParticleDetectionGUI(QWidget):
         if not names_set:
             return
 
-        to_delete = [entry for entry in self.detection_history if entry['name'] in names_set]
-        self.detection_history = [entry for entry in self.detection_history if entry['name'] not in names_set]
+        ingestion_state = self._pause_ingestion_for_deletion()
 
-        self._rewrite_csv_excluding(names_set)
+        try:
+            to_delete = [entry for entry in self.detection_history if entry['name'] in names_set]
+            self.detection_history = [entry for entry in self.detection_history if entry['name'] not in names_set]
 
-        for entry in to_delete:
-            img_path = entry.get('path')
-            if isinstance(img_path, Path) and img_path.exists():
-                try:
-                    img_path.unlink()
-                except Exception:
-                    pass
+            self._rewrite_csv_excluding(names_set)
 
-        self.graph_records = [rec for rec in self.graph_records if rec[0] not in names_set]
-        self.update_graph()
+            for entry in to_delete:
+                img_path = entry.get('path')
+                if isinstance(img_path, Path) and img_path.exists():
+                    try:
+                        img_path.unlink()
+                    except Exception:
+                        pass
 
-        self.lot_event_count = len(self.detection_history)
-        self._refresh_popup_images_from_history()
-        self._refresh_alert_popup_after_deletion()
-        self._set_status(f"오탐 {len(to_delete)}건 삭제 완료", hold_s=3.0)
+            self.graph_records = [rec for rec in self.graph_records if rec[0] not in names_set]
+            self.update_graph()
+
+            self.lot_event_count = len(self.detection_history)
+            self._refresh_popup_images_from_history()
+            self._refresh_alert_popup_after_deletion()
+            self._set_status(f"오탐 {len(to_delete)}건 삭제 완료", hold_s=3.0)
+        finally:
+            self._resume_ingestion_after_deletion(ingestion_state)
 
     def _rewrite_csv_excluding(self, names_set: set[str]):
         if not (self.csv_path and self.csv_path.exists()):
@@ -2148,7 +2199,7 @@ class ParticleDetectionGUI(QWidget):
         self.alert_popup.set_first_detect_time(first_dt)
         self.alert_popup.set_graph_pixmap(self._graph_pixmap())
         self.alert_popup.set_images(list(self._popup_images))
-
+        self.alert_popup.sync_detection_history(self.detection_history)
 
     def _push_popup_image(self, path: Path, event_count: int):
         """팝업창 이미지 출력"""
