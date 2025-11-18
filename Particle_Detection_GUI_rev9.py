@@ -683,7 +683,7 @@ class DeletionDialog(QDialog):
     def __init__(self, history_entries, parent=None):
         super().__init__(parent)
         self.setWindowTitle('오탐 삭제')
-        self.resize(960, 490)
+        self.resize(960, 650)
         self.setWindowModality(Qt.ApplicationModal)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
 
@@ -705,23 +705,23 @@ class DeletionDialog(QDialog):
 
         self.entry_container = QWidget()
         self.entry_layout = QHBoxLayout(self.entry_container)
-        self.entry_layout.setContentsMargins(4, 4, 4, 4)
-        self.entry_layout.setSpacing(6)
+        self.entry_layout.setContentsMargins(2, 2, 2, 2)
+        self.entry_layout.setSpacing(1)
         self.entry_layout.addStretch()
-        self.entry_container.setMinimumHeight(300)
+        self.entry_container.setMinimumHeight(320)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.entry_container)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setMinimumHeight(320)
+        scroll.setMinimumHeight(340)
 
         self.chk_list: list[QCheckBox] = []
         for idx, entry in enumerate(history_entries, start=1):
             self._add_entry(entry, idx)
 
-        btn_delete = QPushButton('삭제 승인')
+        btn_delete = QPushButton('승인')
         btn_close = QPushButton('닫기')
         btn_delete.clicked.connect(self._emit_confirm)
         btn_close.clicked.connect(self.close)
@@ -739,13 +739,13 @@ class DeletionDialog(QDialog):
         layout.addLayout(btn_box)
 
     def _make_pixmap(self, img_path: Path) -> QPixmap:
-        return load_pixmap_from_path(img_path, (240, 240))
+        return load_pixmap_from_path(img_path, (200, 450))   # 픽스맵 크기
 
     def _add_entry(self, entry: dict, order: int):
         card = QWidget()
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(6, 6, 6, 6)
-        card_layout.setSpacing(8)
+        card_layout.setContentsMargins(2, 2, 2, 2)
+        card_layout.setSpacing(2)
 
         qdt = entry.get('datetime') if isinstance(entry.get('datetime'), QDateTime) else None
         ts_label = QLabel(self._format_entry_label(qdt, order))
@@ -754,7 +754,7 @@ class DeletionDialog(QDialog):
 
         img_label = QLabel()
         img_label.setAlignment(Qt.AlignCenter)
-        img_label.setFixedSize(280, 300)
+        img_label.setFixedSize(200, 450)   # 라벨 크기
         img_path = entry.get('path')
         if isinstance(img_path, Path) and img_path.exists():
             img_label.setPixmap(self._make_pixmap(img_path))
@@ -945,7 +945,7 @@ class AlertPopup(QWidget):
         self.img_scroll = QScrollArea()
         self.img_scroll.setWidgetResizable(True)
         self.img_scroll.setWidget(self.img_widget)
-        self.img_scroll.setFixedHeight(260)
+        self.img_scroll.setFixedHeight(290)
         self.img_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.img_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
