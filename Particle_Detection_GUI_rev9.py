@@ -27,9 +27,9 @@ mpl.rcParams['font.family'] = 'Malgun Gothic'
 mpl.rcParams['axes.unicode_minus'] = False
 
 # 환경 플래그: 경로 및 저장동작 테스트(True) / 운영(False) 모드 구분
-LOAD_TEST_MODE = True
-SAVE_TEST_MODE = True
-INI_TEST_MODE  = True
+LOAD_TEST_MODE = False
+SAVE_TEST_MODE = False
+INI_TEST_MODE  = False
 
 # 실행파일 실행 시, "자동 시작 동작 수행" 여부 플래그 : 자동 시작(True) / 수동 시작(False)
 AUTO_START_ON_LAUNCH = True
@@ -1212,7 +1212,7 @@ class ParticleDetectionGUI(QWidget):
         self.current_lot = None
         self.current_attempt = None
         self.csv_path = None
-        self.csv_header = ['이미지 파일명', 'Attempt 횟수', '밝기', 'adaptive_value', '파티클 발생 여부', '파티클_크기', '파티클_x', '파티클_y']
+        self.csv_header = ['이미지 파일명', 'Attempt 횟수', '밝기', 'adaptive_value', '파티클 발생 여부', '파티클 크기', '파티클_x', '파티클_y', 'error flag']
         self.processed_images: set[str] = set()
         self.session_processed_images: set[str] = set()
         self.saved_graph_lots: set[str] = set()
@@ -1983,10 +1983,10 @@ class ParticleDetectionGUI(QWidget):
             # CSV 저장
             if has_particle == 'O':
                 for (x, y, a) in valid_particles:
-                    row = [img_path.name, attempt_value, anchor_brightness, adaptive_value, has_particle, a, x, y]
+                    row = [img_path.name, attempt_value, anchor_brightness, adaptive_value, has_particle, a, x, y, 0]
                     self.save_csv(row)
             else:
-                row = [img_path.name, attempt_value, anchor_brightness, adaptive_value, has_particle, 0, 0, 0]
+                row = [img_path.name, attempt_value, anchor_brightness, adaptive_value, has_particle, 0, 0, 0, 0]
                 self.save_csv(row)
 
             # 이벤트 이미지 저장 (Lot# 폴더 내) + 팝업 호출/갱신
@@ -2016,10 +2016,12 @@ class ParticleDetectionGUI(QWidget):
 
     def _record_graph_row(self, row):
         """그래프 버퍼에 행 추가"""
+        if self._is_error_flagged(row):
+            return
         if isinstance(row, dict):
             image_name = row.get('이미지 파일명', '')
             attempt_val = row.get('Attempt 횟수', 0)
-            size_val = row.get('파티클_크기', 0)
+            size_val = row.get('파티클 크기', 0)
         else:
             image_name = row[0] if len(row) > 0 else ''
             attempt_val = row[1] if len(row) > 1 else 0
@@ -2035,6 +2037,37 @@ class ParticleDetectionGUI(QWidget):
         except (TypeError, ValueError):
             size_float = 0.0
         self.graph_records.append((image_name, attempt_int, size_float))
+
+    def _is_error_flagged(self, row) -> bool:
+        try:
+            if isinstance(row, dict):
+                flag_val = row.get('error flag', '')
+            else:
+                flag_val = row[-1] if row and len(row) >= len(self.csv_header) else ''
+            return str(flag_val).strip() not in ('', '0', 'None')
+        except Exception:
+            return False
+
+    def _ensure_csv_header_has_error_flag(self):
+        if not (self.csv_path and self.csv_path.exists()):
+            return
+        try:
+            with open(self.csv_path, 'r', encoding='utf-8-sig', newline='') as f:
+                rows = list(csv.reader(f))
+            if not rows:
+                return
+            header, data_rows = rows[0], rows[1:]
+            if 'error flag' in header:
+                return
+            header.append('error flag')
+            for r in data_rows:
+                r.append('')
+            with open(self.csv_path, 'w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                writer.writerows(data_rows)
+        except Exception:
+            pass
 
     def _load_graph_buffer_from_csv(self):
         """기존 CSV 데이터를 그래프 버퍼로 로딩"""
@@ -2053,6 +2086,7 @@ class ParticleDetectionGUI(QWidget):
         """결과 CSV 저장 (성공 시 True 반환)"""
         if not self.csv_path:
             return False
+        self._ensure_csv_header_has_error_flag()
         attempt = 0
         while attempt < max_retries:
             try:
@@ -2099,6 +2133,8 @@ class ParticleDetectionGUI(QWidget):
             with open(self.csv_path, 'r', encoding='utf-8-sig', newline='') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
+                    if self._is_error_flagged(row):
+                        continue
                     if not row or row.get('파티클 발생 여부') != 'O':
                         continue
                     name = row.get('이미지 파일명', '')
@@ -2189,15 +2225,25 @@ class ParticleDetectionGUI(QWidget):
             return
         try:
             with open(self.csv_path, 'r', encoding='utf-8-sig', newline='') as f:
-                rows = list(csv.reader(f))
-            if not rows:
-                return
-            header, data_rows = rows[0], rows[1:]
-            filtered = [row for row in data_rows if row and row[0] not in names_set]
+                reader = csv.DictReader(f)
+                fieldnames = reader.fieldnames or list(self.csv_header)
+                if 'error flag' not in fieldnames:
+                    fieldnames.append('error flag')
+                rows = []
+                for row in reader:
+                    if not row:
+                        continue
+                    img_name = row.get('이미지 파일명', '')
+                    if img_name in names_set:
+                        row['error flag'] = '1'
+                    else:
+                        row.setdefault('error flag', '')
+                    rows.append(row)
+
             with open(self.csv_path, 'w', encoding='utf-8-sig', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(header)
-                writer.writerows(filtered)
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
         except Exception as e:
             self._set_status(f"CSV 삭제 실패: {e}", hold_s=3.0)
 
