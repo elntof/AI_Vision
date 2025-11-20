@@ -407,7 +407,6 @@ class ParticlePlotCanvas(FigureCanvas):
         display_labels = [shorten(str(x)) for x in x_list]
         n = len(display_labels)
         if n == 0:
-            self.ax.plot([], [])
             self.draw()
             return
 
@@ -1221,12 +1220,12 @@ class ParticleDetectionGUI(QWidget):
         self.pending_images: deque[Path] = deque()
         self._is_processing_queue = False
         self.current_process = None
+        self._csv_header_checked = False
 
         # Noise Particle 판정 파라미터
         self.prev_particles = []         # 워밍 업 시, 반복 좌표 및 크기 기억
         self.frame_buffer = []           # 워밍 업 시, 파티클 리스트 버퍼
         self.distance_threshold = 20     # 거리 임계값 (반경 내 같은 Noise로 인식)
-        self.area_threshold = 20         # 면적 임계값 (차이 내 같은 Noise로 인식)
         self.collecting_initial = True   # 최초 10장 워밍업 플래그
 
         # 허용 모드 집합 & 래치/홀드 상태
@@ -1374,6 +1373,7 @@ class ParticleDetectionGUI(QWidget):
         self._apply_crop_enable_states()
 
         self.update_preview()
+        self._init_device_info_from_last_image()
 
         if hasattr(self, "update_graph"):
             self.update_graph()
@@ -1543,8 +1543,9 @@ class ParticleDetectionGUI(QWidget):
             self.preview_label.set_noise_text("")
             self.preview_label.set_noise_points([])
             return
+        # 노이즈 개수 표기
         if self.prev_particles:
-            text = "; ".join([f"[Noise] X:{x}, Y:{y}, Size:{a}" for (x, y, a) in self.prev_particles])
+            text = f"[Noise] {len(self.prev_particles)}개"
         else:
             text = "[Noise] None"
         self.preview_label.set_noise_text(text)
@@ -1785,6 +1786,7 @@ class ParticleDetectionGUI(QWidget):
 
                 new_lot_valid = bool(lot_number) and (lot_number != "LotUnknown")
                 self.csv_path = (CSV_OUTPUT_DIR / f"{lot_number}.csv") if new_lot_valid else None
+                self._csv_header_checked = False
 
                 self.current_attempt = attempt_value
                 self.processed_images.clear()
@@ -1902,7 +1904,13 @@ class ParticleDetectionGUI(QWidget):
                 self._update_noise_text()
 
                 # 후보 파티클만 수집(판정/CSV/그래프/이벤트 저장 없음)
-                _, _, particle_info = particle_detection(gray_prev, [self.get_box1(), self.get_box2()], adaptive_value, area_min=WARMUP_NOISE_AREA_MIN, area_max=PARTICLE_AREA_MAX)
+                _, _, particle_info = particle_detection(
+                    gray_prev,
+                    [self.get_box1(), self.get_box2()],
+                    adaptive_value,
+                    area_min=WARMUP_NOISE_AREA_MIN,
+                    area_max=PARTICLE_AREA_MAX
+                )
                 if particle_info is None:
                     # 로딩/후보 추출 실패 시 스킵
                     self.status_label.setText(f"오류: {img_path.name} 로딩/후보 추출 실패 (워밍업)")
@@ -1912,13 +1920,28 @@ class ParticleDetectionGUI(QWidget):
                 self.frame_buffer.append(particle_info)
 
                 if len(self.frame_buffer) >= WARMUP_FRAMES:
-                    # MIN_NOISE_REPEAT회 이상 등장 좌표를 노이즈 기준으로 채택
-                    freq = {}
+                    # 서로 20px 반경 이내에서 2회 이상 반복되는 좌표를 노이즈 기준으로 채택
+                    noise_clusters = []
                     for frame_particles in self.frame_buffer:
                         for (x, y, area) in frame_particles:
-                            key = (x, y, area)
-                            freq[key] = freq.get(key, 0) + 1
-                    self.prev_particles = [k for k, v in freq.items() if v >= MIN_NOISE_REPEAT] or (self.frame_buffer[-1] if self.frame_buffer else [])
+                            matched = False
+                            for cluster in noise_clusters:
+                                cx, cy, carea, cnt = cluster
+                                dist = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+                                if dist < self.distance_threshold:
+                                    new_cnt = cnt + 1
+                                    # 반복 탐지 시, 좌표/면적은 간단한 가중 평균으로 업데이트하여 대표값으로 사용
+                                    cluster[0] = (cx * cnt + x) / new_cnt
+                                    cluster[1] = (cy * cnt + y) / new_cnt
+                                    cluster[2] = (carea * cnt + area) / new_cnt
+                                    cluster[3] = new_cnt
+                                    matched = True
+                                    break
+                            if not matched:
+                                noise_clusters.append([float(x), float(y), float(area), 1])
+
+                    # MIN_NOISE_REPEAT 회 이상 등장한 클러스터만 최종 노이즈 좌표로 채택
+                    self.prev_particles = [(int(round(cx)), int(round(cy)), float(carea)) for (cx, cy, carea, cnt) in noise_clusters if cnt >= MIN_NOISE_REPEAT]
 
                     # 워밍업 종료 이후부터 '허용 모드의 판정 이미지'에서 [Noise] 표기/적용
                     self.collecting_initial = False
@@ -1944,16 +1967,16 @@ class ParticleDetectionGUI(QWidget):
                 return
 
             # 이미지의 앵커 밝기 계산 (CSV 기록용)
-            anchor_brightness = anchor_current if anchor_current is not None else compute_anchor_brightness(gray)
+            anchor_brightness = anchor_current
 
             # 유효 파티클 판별 (prev_particles와 매칭되지 않은 것만)
             valid_particles = []
             for (cx, cy, area) in particle_info:
                 matched = False
-                for (px, py, parea) in self.prev_particles:
+                for (px, py, _) in self.prev_particles:
                     dist = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
-                    area_diff = abs(area - parea)
-                    if dist < self.distance_threshold and area_diff < self.area_threshold:
+                    # 위치 기준(거리)으로 노이즈 여부를 판정
+                    if dist < self.distance_threshold:
                         matched = True
                         break
                 if not matched:
@@ -1964,18 +1987,22 @@ class ParticleDetectionGUI(QWidget):
             # 오버레이: prev(흰) + valid(빨강) + [Noise] 텍스트
             if overlay_img is not None:
                 # prev (white)
-                for (px, py, parea) in self.prev_particles:
+                for (px, py, _) in self.prev_particles:
                     cv2.circle(overlay_img, (px, py), NOISE_CIRCLE_RADIUS, (255, 255, 255), NOISE_CIRCLE_THICKNESS, cv2.LINE_AA)
                 # valid (red)
-                for (vx, vy, varea) in valid_particles:
+                for (vx, vy, _) in valid_particles:
                     cv2.circle(overlay_img, (vx, vy), VALID_CIRCLE_RADIUS, (0, 0, 255), VALID_CIRCLE_THICKNESS, cv2.LINE_AA)
                 # [Noise] 텍스트
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 font_scale = 0.5
                 thickness_text = 1
-                noise_text = "[Noise] None" if not self.prev_particles else "; ".join([f"[Noise] X:{x}, Y:{y}, Size:{a}" for (x, y, a) in self.prev_particles])
+                # 노이즈 개수 출력
+                if not self.prev_particles:
+                    noise_text = "[Noise] None"
+                else:
+                    noise_text = f"[Noise] {len(self.prev_particles)}개"
                 img_h, img_w = overlay_img.shape[:2]
-                (text_w, text_h), _ = cv2.getTextSize(noise_text, font, font_scale, thickness_text)
+                (text_w, _), _ = cv2.getTextSize(noise_text, font, font_scale, thickness_text)
                 text_x = img_w - text_w - 10
                 text_y = img_h - 10
                 cv2.putText(overlay_img, noise_text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness_text, cv2.LINE_AA)
@@ -2049,25 +2076,41 @@ class ParticleDetectionGUI(QWidget):
             return False
 
     def _ensure_csv_header_has_error_flag(self):
-        if not (self.csv_path and self.csv_path.exists()):
+        if self._csv_header_checked:
             return
+        
+        if not (self.csv_path and self.csv_path.exists()):
+            self._csv_header_checked = True
+            return
+        
         try:
             with open(self.csv_path, 'r', encoding='utf-8-sig', newline='') as f:
                 rows = list(csv.reader(f))
+
             if not rows:
+                self._csv_header_checked = True
                 return
+
             header, data_rows = rows[0], rows[1:]
+
             if 'error flag' in header:
+                self._csv_header_checked = True
                 return
+
             header.append('error flag')
             for r in data_rows:
                 r.append('')
+
             with open(self.csv_path, 'w', encoding='utf-8-sig', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(header)
                 writer.writerows(data_rows)
+
         except Exception:
-            pass
+            self._csv_header_checked = True
+            return
+
+        self._csv_header_checked = True
 
     def _load_graph_buffer_from_csv(self):
         """기존 CSV 데이터를 그래프 버퍼로 로딩"""
@@ -2113,12 +2156,7 @@ class ParticleDetectionGUI(QWidget):
         particle_sizes = np.asarray([rec[2] for rec in self.graph_records], dtype=float)
         attempt_list = [rec[1] for rec in self.graph_records]
         latest_index = len(image_names) - 1
-        self.plot_canvas.update_plot(
-            image_names,
-            particle_sizes,
-            latest_index,
-            attempt_list=attempt_list
-        )
+        self.plot_canvas.update_plot(image_names, particle_sizes, latest_index, attempt_list=attempt_list)
 
     def _load_detection_history(self):
         """현재 Lot의 기존 파티클 탐지 이력을 CSV/이미지 기반으로 로딩"""
