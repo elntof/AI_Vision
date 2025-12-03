@@ -1578,6 +1578,22 @@ class ParticleDetectionGUI(QWidget):
         except Exception:
             self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
 
+    def _init_device_info_from_last_image(self):
+        """GUI 최초 실행 시 최신 이미지명으로 공정 정보 텍스트 초기화"""
+        if self.device_info_box.text():
+            return
+        try:
+            candidates = [p for p in IMG_INPUT_DIR.iterdir() if p.suffix.lower() in ALLOWED_IMAGE_EXTS]
+        except Exception:
+            return
+        if not candidates:
+            return
+        try:
+            latest = max(candidates, key=lambda p: p.stat().st_mtime)
+            info = parse_filename(latest.name)
+            self.device_info_box.setText(f"{info['equip']}_{info['lot']}_{info['process']}_{info['attempt']}")
+        except Exception:
+            return
 
     def _start_backlog_feeder(self, backlog):
         if not backlog:
