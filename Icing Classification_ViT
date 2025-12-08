@@ -1,545 +1,1414 @@
-# === [1. 기본 설정] ===
-import os, re, time, random, json, math, csv
+import os
+import sys
+import time
+import re
+import csv
+from datetime import datetime
 from pathlib import Path
-from collections import Counter
-
+from collections import deque
 import numpy as np
+import cv2
 import torch
-from torchvision import transforms as T
-from PIL import Image, ImageOps
-
-import pandas as pd
-import matplotlib.pyplot as plt
-from matplotlib import patches
-from matplotlib.colors import ListedColormap
-from IPython.display import clear_output, display
-from tqdm.auto import tqdm
-
-# 시드 & 디바이스
-def seed_everything(seed=42):
-    random.seed(seed); np.random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-seed_everything(42)
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"[INFO] device={device} | CUDA={torch.cuda.is_available()}")
-
-# 전처리 / ROI (학습과 동일하게)
-class CropROI:
-    def __init__(self, xywh): self.x, self.y, self.w, self.h = map(int, xywh)
-    def __call__(self, img: Image.Image):
-        img = ImageOps.exif_transpose(img)
-        W, H = img.size
-        x = max(0, min(self.x, W-1)); y = max(0, min(self.y, H-1))
-        w = max(1, min(self.w, W-x));  h = max(1, min(self.h, H-y))
-        return img.crop((x, y, x+w, y+h))
-
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD  = [0.229, 0.224, 0.225]
-IMG_SIZE      = 224
-ROI_RECT      = (40, 0, 200, 555)
-
-valtest_tfms = T.Compose([
-    CropROI(ROI_RECT),
-    T.Grayscale(num_output_channels=3),
-    T.Resize((IMG_SIZE, IMG_SIZE), interpolation=T.InterpolationMode.BILINEAR),
-    T.ToTensor(),
-    T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-])
-
-# 경로 설정
-TEST_DIR   = Path(r"test_rawdata\Y0\251006")                  # 테스트 이미지 폴더
-CSV_OUT    = Path("Predictions_Y0_251006.csv")                # 결과 CSV
-MODEL_NAME = "vit_small_patch16_224"                          # timm 모델명
-CHECKPOINT = Path(r"./vit_melted_icing_iced_best_ema.pth")    # 현재 폴더의 EMA 가중치
-
-assert TEST_DIR.exists(), f"TEST_DIR not found: {TEST_DIR.resolve()}"
-
-def natural_key(s: str):
-    """파일 정렬 유틸"""
-    base = os.path.basename(str(s))
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", base)]
-
-# ROI 오버레이 프리뷰(랜덤 1장)
-try:
-    EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
-    candidates = [p for p in TEST_DIR.rglob("*") if p.suffix.lower() in EXTS]
-    if len(candidates) == 0:
-        print(f"[ROI PREVIEW] No images found under: {TEST_DIR}")
-    else:
-        sample = random.choice(candidates)
-        with Image.open(sample) as im:
-            im = ImageOps.exif_transpose(im).convert("RGB")
-            W, H = im.size
-            x, y, w, h = map(int, ROI_RECT)
-            # 원본 크기에 맞춰 경계 보정
-            x = max(0, min(x, W - 1)); y = max(0, min(y, H - 1))
-            w = max(1, min(w, W - x)); h = max(1, min(h, H - y))
-
-            fig, ax = plt.subplots(figsize=(6, 6))
-            ax.imshow(im)
-            ax.add_patch(patches.Rectangle((x, y), w, h,
-                                           linewidth=2.0, edgecolor="lime", facecolor="none"))
-            ax.set_title(f"[x={x}, y={y}, w={w}, h={h}]")
-            ax.set_axis_off(); ax.set_aspect('equal', adjustable='box')
-            plt.show()
-except Exception as e:
-    print(f"[ROI PREVIEW] failed: {e}")
-
-# === [/### 1] ===
-
-# === [2. 모델 로더] ===
 import timm
-import torch.nn as nn
-import torch.nn.functional as F
+from PIL import Image, ImageOps
+from torchvision import transforms as T
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox,
+    QGroupBox, QSizePolicy, QLineEdit, QLayout, QCheckBox)
+from PySide6.QtCore import Qt, QTimer, QSettings, QThread, QObject, Signal, Slot, QDateTime
+from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QGuiApplication, QFont
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
-DEFAULT_CLASS_NAMES = ["Iced", "Icing", "Melted"]  # 클래스
-DROP_PATH_RATE = 0.1
+# 환경 플래그: 경로 및 저장동작 테스트(True) / 운영(False) 모드 구분
+LOAD_TEST_MODE = True
+SAVE_TEST_MODE = True
+INI_TEST_MODE = True
 
-def build_model(n_classes: int):
-    m = timm.create_model(MODEL_NAME, pretrained=False, num_classes=n_classes, drop_path_rate=DROP_PATH_RATE)
-    return m
+# 실행파일 실행 시, "자동 시작 동작 수행" 여부 플래그 : 자동 시작(True) / 수동 시작(False)
+AUTO_START_ON_LAUNCH = False
 
-def _strip_prefix(sd: dict, prefixes=("module.", "model.", "net.", "backbone.")):
-    new_sd = {}
-    for k, v in sd.items():
-        nk = k
-        changed = True
-        while changed:
-            changed = False
-            for pf in prefixes:
-                if nk.startswith(pf):
-                    nk = nk[len(pf):]
-                    changed = True
-        new_sd[nk] = v
-    return new_sd
+# 이미지/CSV/INI 경로 설정
+if LOAD_TEST_MODE:
+    IMG_INPUT_DIR = Path('./Images')
+else:
+    IMG_INPUT_DIR = Path(r'D:/AI Vision/Images')
 
-def _extract_state_dict(blob: dict):
-    """다양한 저장 포맷에서(EMA 우선) state_dict 추출"""
-    if not isinstance(blob, dict):
-        return blob, "raw"
+if SAVE_TEST_MODE:
+    CSV_OUTPUT_DIR = Path('./icing_info')
+else:
+    CSV_OUTPUT_DIR = Path(r'D:/AI Vision/icing_info')
 
-    # EMA 후보
-    for k in ["state_dict_ema", "ema_state_dict", "model_ema", "model_ema_state_dict"]:
-        if k in blob:
-            sd = blob[k]
-            if isinstance(sd, dict) and "state_dict" in sd:
-                sd = sd["state_dict"]
-            if isinstance(sd, dict):
-                return _strip_prefix(sd), "ema"
+LOT_DETAILS_DIR = CSV_OUTPUT_DIR / "lot details"
 
-    # 일반 가중치 후보
-    for k in ["state_dict", "model", "weights", "params", "net"]:
-        if k in blob:
-            sd = blob[k]
-            if isinstance(sd, dict) and "state_dict" in sd:
-                sd = sd["state_dict"]
-            if isinstance(sd, dict):
-                return _strip_prefix(sd), "std"
+if INI_TEST_MODE:
+    try:
+        ini_base_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        ini_base_dir = Path(os.getcwd())
+    INI_SETTINGS_PATH = ini_base_dir / "IcingClassificationApp.ini"
+else:
+    INI_SETTINGS_PATH = Path(r'D:/AI Vision/IcingClassificationApp.ini')
 
-    # 최상위가 곧 state_dict
-    return _strip_prefix(blob), "raw"
+# 출력 경로 생성
+os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
+os.makedirs(LOT_DETAILS_DIR, exist_ok=True)
 
-def infer_num_classes_from_state(sd: dict):
-    # timm ViT head 이름 후보
-    for key in ["head.weight", "fc.weight", "classifier.weight"]:
-        w = sd.get(key, None)
-        if isinstance(w, torch.Tensor) and w.dim()==2:
-            return int(w.shape[0])
-    # 혹시 중첩 구조
-    if "model" in sd and isinstance(sd["model"], dict):
-        return infer_num_classes_from_state(sd["model"])
+# 메인 윈도우 기본 위치 (모니터 좌측 하단 기준 offset)
+WINDOW_OFFSET_X = 100
+WINDOW_OFFSET_Y = 200
+
+# 신규 이미지 부재 시 미리보기 플레이스홀더 텍스트
+NO_IMAGE_PLACEHOLDER_TEXT = "신규 이미지 없음"
+
+# 감시 대상 이미지 확장자 목록
+ALLOWED_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
+
+# ViT 분류 파라미터
+MODEL_NAME = "vit_small_patch16_224"
+CLASS_NAMES = ["Melted", "Icing", "Iced"]
+CHECKPOINT_PATH = Path("./vit_melted_icing_iced_best_ema.pth")
+IMG_SIZE = 224
+
+# ROI 기본값
+DEFAULT_ROI_RECT = (40, 0, 200, 555)
+
+# 그래프 패널 크기
+PANEL_W_PX, PANEL_H_PX = 405, 238
+
+def clamp_roi_to_shape(roi: tuple[int, int, int, int] | None, width: int, height: int):
+    """이미지 크기에 맞춰 ROI를 보정"""
+    if roi is None:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    x, y, w, h = map(int, roi)
+    x = max(0, min(x, width - 1))
+    y = max(0, min(y, height - 1))
+    w = max(1, min(w, width - x))
+    h = max(1, min(h, height - y))
+    return x, y, w, h
+
+def safe_image_load(image_path, as_gray=False, max_retries=5, delay=0.2):
+    """안전 이미지 로딩 (재시도 최대 5회)"""
+    flag = cv2.IMREAD_GRAYSCALE if as_gray else cv2.IMREAD_UNCHANGED
+    for _ in range(max_retries):
+        try:
+            img_array = np.fromfile(str(image_path), dtype=np.uint8)
+            img = cv2.imdecode(img_array, flag)
+            if img is not None:
+                return img
+        except Exception:
+            pass
+        time.sleep(delay)
     return None
 
-def load_model_from_pth(path_pth: Path):
-    raw = torch.load(path_pth, map_location="cpu")
-    sd, kind = _extract_state_dict(raw)
-    n_classes = infer_num_classes_from_state(sd) or len(DEFAULT_CLASS_NAMES)
+def _numpy_to_qimage(npimg) -> QImage:
+    """NumPy 이미지를 QImage로 변환 (채널 수에 따라 자동 변환)"""
+    if npimg is None:
+        return QImage()
 
-    model = build_model(n_classes)
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    print(f"[LOAD] file={path_pth.name} kind={kind} num_classes={n_classes} "
-          f"| missing={len(missing)} unexpected={len(unexpected)}")
+    if npimg.ndim == 2:
+        h, w = npimg.shape
+        return QImage(npimg.data, w, h, w, QImage.Format_Grayscale8).copy()
 
-    class_names = DEFAULT_CLASS_NAMES if n_classes==3 else [f"class_{i}" for i in range(n_classes)]
-    return model.to(device).eval(), class_names
+    if npimg.shape[2] == 3:
+        rgb = cv2.cvtColor(npimg, cv2.COLOR_BGR2RGB)
+        h, w, _ = rgb.shape
+        return QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
 
-# 실제 로드
-assert CHECKPOINT.exists(), f"Checkpoint not found: {CHECKPOINT.resolve()}"
-print(f"[INFO] using checkpoint: {CHECKPOINT.name}")
-model, CLASS_NAMES = load_model_from_pth(CHECKPOINT)
-print("CLASS_NAMES =", CLASS_NAMES)
-# === [/### 2] ===
+    if npimg.shape[2] == 4:
+        rgba = cv2.cvtColor(npimg, cv2.COLOR_BGRA2RGBA)
+        h, w, _ = rgba.shape
+        return QImage(rgba.data, w, h, 4 * w, QImage.Format_RGBA8888).copy()
 
-# === [3. ViT 배치 분류 + 패널/CSV 저장] ===
-import os, re, random, math, csv, json, time
-from pathlib import Path
-from datetime import datetime
-from collections import Counter
+    gray = cv2.cvtColor(npimg, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    return QImage(gray.data, w, h, w, QImage.Format_Grayscale8).copy()
 
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-import timm
-from torchvision import transforms as T
-from PIL import Image, ImageOps
+def pixmap_from_numpy(npimg, target_size: tuple[int, int] | None = None) -> QPixmap:
+    """NumPy 이미지를 QPixmap으로 변환 후 필요 시 스케일링"""
+    qimg = _numpy_to_qimage(npimg)
+    if qimg.isNull():
+        return QPixmap()
+    pm = QPixmap.fromImage(qimg)
+    if target_size:
+        pm = pm.scaled(*target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    return pm
 
-import matplotlib.pyplot as plt
-from matplotlib import patches
-from tqdm.auto import tqdm
+def parse_filename(fname: str):
+    """파일명 파서 (형식: EQUIP_Lot#_Process_Attempt_YYYYMMDD_HHMM(SS).ext)"""
+    stem = Path(fname).stem
+    parts = stem.split('_')
+    try:
+        equip = parts[0]
+        lot = parts[1]
+        process = parts[2]
+        attempt = int(parts[3])
+        date_str = parts[4]
+        time_str = parts[5]
+    except Exception:
+        equip = lot = process = date_str = time_str = ''
+        attempt = 0
+    return {
+        'equip': equip,
+        'lot': lot,
+        'process': process,
+        'attempt': attempt,
+        'date': date_str,
+        'time': time_str,
+        'stem': stem,
+        'name': Path(fname).name,
+    }
 
-def seed_everything(seed=42):
-    """재현성 확보용 시드 고정"""
-    random.seed(seed); np.random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+def extract_image_datetime(path: Path) -> QDateTime:
+    """파일명으로부터 QDateTime 추출 (YYMMDD_HHMMSS 형식 지원, 실패 시 mtime 사용)"""
+    stem = path.stem
 
-seed_everything(42)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"[INFO] device={device} | CUDA={torch.cuda.is_available()}")
+    info = parse_filename(path.name)
+    date_str = info.get('date') or ''
+    time_str = info.get('time') or ''
 
-class CropROI:
-    """학습 ROI와 동일한 영역 Crop"""
-    def __init__(self, xywh):
-        self.x, self.y, self.w, self.h = map(int, xywh)
+    try:
+        if len(date_str) == 6 and len(time_str) >= 4:
+            yy = int(date_str[0:2])
+            mm = int(date_str[2:4])
+            dd = int(date_str[4:6])
+            yyyy = 2000 + yy
 
-    def __call__(self, img: Image.Image):
-        img = ImageOps.exif_transpose(img)
+            hh = int(time_str[0:2])
+            mi = int(time_str[2:4])
+            ss = int(time_str[4:6]) if len(time_str) >= 6 else 0
+
+            qdt = QDateTime(yyyy, mm, dd, hh, mi, ss)
+            if qdt.isValid():
+                return qdt
+    except Exception:
+        pass
+
+    m = re.search(r'(\d{6})[_-]?(\d{4,6})', stem)
+    if m:
+        try:
+            date_part = m.group(1)
+            time_part = m.group(2)
+
+            yy = int(date_part[0:2])
+            mm = int(date_part[2:4])
+            dd = int(date_part[4:6])
+            yyyy = 2000 + yy
+
+            hh = int(time_part[0:2])
+            mi = int(time_part[2:4])
+            ss = int(time_part[4:6]) if len(time_part) >= 6 else 0
+
+            qdt = QDateTime(yyyy, mm, dd, hh, mi, ss)
+            if qdt.isValid():
+                return qdt
+        except Exception:
+            pass
+
+    try:
+        ts = path.stat().st_mtime
+        return QDateTime.fromSecsSinceEpoch(int(ts))
+    except Exception:
+        return QDateTime()
+
+def _qdatetime_to_datetime(qdt: QDateTime | None):
+    """QDateTime → datetime 변환"""
+    if qdt is None or not isinstance(qdt, QDateTime) or not qdt.isValid():
+        return None
+    if hasattr(qdt, "toPython"):
+        try:
+            return qdt.toPython()
+        except Exception:
+            pass
+    try:
+        return datetime.fromtimestamp(qdt.toSecsSinceEpoch())
+    except Exception:
+        return None
+
+def format_mmdd_hhmm(qdt: QDateTime | None) -> str:
+    """MM/DD HH:mm 포맷 문자열"""
+    if qdt is None or not isinstance(qdt, QDateTime) or not qdt.isValid():
+        return ""
+    return qdt.toString("MM/dd HH:mm")
+
+def compute_lead_minutes(start_a: QDateTime | None, start_b: QDateTime | None) -> str:
+    """두 시각 차이를 분 단위로 계산"""
+    dt_a = _qdatetime_to_datetime(start_a)
+    dt_b = _qdatetime_to_datetime(start_b)
+    if dt_a is None or dt_b is None or dt_b < dt_a:
+        return ""
+    return f"{int(round((dt_b - dt_a).total_seconds() / 60.0))}"
+
+def compute_current_lead_minutes(start_dt: QDateTime | None, cur_dt: QDateTime | None) -> str:
+    """특정 시작 시각 대비 현재 시각 리드 타임(분)"""
+    base = _qdatetime_to_datetime(start_dt)
+    cur = _qdatetime_to_datetime(cur_dt)
+    if base is None or cur is None or cur < base:
+        return ""
+    return f"{int(round((cur - base).total_seconds() / 60.0))}"
+
+class ViTClassifier:
+    """학습된 ViT 모델을 사용한 3 클래스 분류기"""
+
+    def __init__(self, model_name: str, checkpoint: Path, class_names: list[str], img_size: int = 224):
+        self.model_name = model_name
+        self.class_names = list(class_names)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = timm.create_model(model_name, pretrained=False, num_classes=len(self.class_names))
+
+        if checkpoint.exists():
+            try:
+                state = torch.load(checkpoint, map_location="cpu")
+                if isinstance(state, dict) and "state_dict" in state:
+                    state = state["state_dict"]
+                cleaned = {k.replace("model.", "").replace("module.", ""): v for k, v in state.items()}
+                self.model.load_state_dict(cleaned, strict=False)
+            except Exception as e:
+                print(f"❌ 모델 가중치 로드 실패: {e}")
+        else:
+            print(f"⚠️ 체크포인트가 존재하지 않습니다: {checkpoint}")
+
+        self.model.to(self.device)
+        self.model.eval()
+
+        # 입력은 항상 grayscale(L) 가정
+        self.transform_gray = T.Compose([
+            T.Resize((img_size, img_size)),
+            T.ToTensor(),
+            T.Lambda(lambda t: t.expand(3, -1, -1)),
+            T.Normalize(mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225]),
+        ])
+
+    @staticmethod
+    def _crop_with_roi(img: Image.Image, roi: tuple[int, int, int, int] | None):
+        if roi is None:
+            return img
         W, H = img.size
-        x = max(0, min(self.x, W - 1)); y = max(0, min(self.y, H - 1))
-        w = max(1, min(self.w, W - x));  h = max(1, min(self.h, H - y))
+        clamped = clamp_roi_to_shape(roi, W, H)
+        if clamped is None:
+            return img
+        x, y, w, h = clamped
         return img.crop((x, y, x + w, y + h))
 
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD  = [0.229, 0.224, 0.225]
-IMG_SIZE      = 224
-ROI_RECT      = (40, 0, 200, 555)
+    def predict(self, image_path: Path, roi: tuple[int, int, int, int] | None = None):
+        """이미지 경로를 입력받아 (라벨, 확률 리스트)를 반환"""
+        try:
+            with Image.open(image_path) as img:
+                img = ImageOps.exif_transpose(img)
 
-valtest_tfms = T.Compose([
-    CropROI(ROI_RECT),
-    T.Grayscale(num_output_channels=3),
-    T.Resize((IMG_SIZE, IMG_SIZE), interpolation=T.InterpolationMode.BILINEAR),
-    T.ToTensor(),
-    T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-])
+                if img.mode != "L":
+                    img = img.convert("L")
 
-# Paths / Config
-IN_DIR     = Path(r"test_rawdata\Y0\251006")       # 입력 폴더
-OUT_ROOT   = Path(r"results\Y0")                   # 출력 루트(날짜별 자동 생성)
-CHECKPOINT = Path(r"./vit_melted_icing_iced_best_ema.pth")
+                img = self._crop_with_roi(img, roi)
+                tensor = self.transform_gray(img).unsqueeze(0).to(self.device)
 
-MODEL_NAME     = "vit_small_patch16_224"
-DROP_PATH_RATE = 0.1
-DEFAULT_CLASS_NAMES = ["Iced", "Icing", "Melted"]
+            with torch.no_grad():
+                logits = self.model(tensor)
+                raw_probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
 
-EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+            # GUI/패널/CLASS_NAMES 순서: [Melted, Icing, Iced]
+            if raw_probs.shape[0] == 3:
+                probs = np.array(
+                    [raw_probs[2], raw_probs[1], raw_probs[0]], dtype=np.float32)
+            else:
+                probs = raw_probs.astype(np.float32)
 
-assert IN_DIR.exists(), f"IN_DIR not found: {IN_DIR.resolve()}"
-assert CHECKPOINT.exists(), f"Checkpoint not found: {CHECKPOINT.resolve()}"
-print(f"[INFO] using checkpoint: {CHECKPOINT.name}")
+            idx = int(np.argmax(probs))
+            return self.class_names[idx], probs
 
-# Model Loader
-def build_model(n_classes: int):
-    """timm ViT 생성"""
-    return timm.create_model(MODEL_NAME, pretrained=False, num_classes=n_classes, drop_path_rate=DROP_PATH_RATE)
+        except Exception as e:
+            print(f"❌ 분류 실패: {e}")
+            return None, None
 
-def _strip_prefix(sd: dict, prefixes=("module.", "model.", "net.", "backbone.")):
-    """state dict key prefix 제거"""
-    new_sd = {}
-    for k, v in sd.items():
-        nk = k
-        changed = True
-        while changed:
-            changed = False
-            for pf in prefixes:
-                if nk.startswith(pf):
-                    nk = nk[len(pf):]
-                    changed = True
-        new_sd[nk] = v
-    return new_sd
+class _ImageFileEventHandler(FileSystemEventHandler):
+    """watchdog 이벤트 핸들러 (신규 이미지 감지)"""
 
-def _extract_state_dict(blob: dict):
-    """다양한 저장 포맷에서 state_dict(EMA 우선) 추출"""
-    if not isinstance(blob, dict):
-        return blob, "raw"
+    def __init__(self, callback, allow_ext):
+        super().__init__()
+        self._callback = callback
+        self._allow_ext = tuple(allow_ext)
 
-    for k in ["state_dict_ema", "ema_state_dict", "model_ema", "model_ema_state_dict"]:
-        if k in blob:
-            sd = blob[k]
-            if isinstance(sd, dict) and "state_dict" in sd:
-                sd = sd["state_dict"]
-            if isinstance(sd, dict):
-                return _strip_prefix(sd), "ema"
+    def _handle_path(self, src_path):
+        if not src_path:
+            return
+        path = Path(src_path)
+        if path.is_dir():
+            return
+        if path.suffix.lower() not in self._allow_ext:
+            return
+        self._callback(path)
 
-    for k in ["state_dict", "model", "weights", "params", "net"]:
-        if k in blob:
-            sd = blob[k]
-            if isinstance(sd, dict) and "state_dict" in sd:
-                sd = sd["state_dict"]
-            if isinstance(sd, dict):
-                return _strip_prefix(sd), "std"
+    def on_created(self, event):
+        self._handle_path(getattr(event, 'src_path', None))
 
-    return _strip_prefix(blob), "raw"
+    def on_moved(self, event):
+        self._handle_path(getattr(event, 'dest_path', None))
 
-def infer_num_classes_from_state(sd: dict):
-    """head weight shape로 클래스 수 추정"""
-    for key in ["head.weight", "fc.weight", "classifier.weight"]:
-        w = sd.get(key, None)
-        if isinstance(w, torch.Tensor) and w.dim() == 2:
-            return int(w.shape[0])
-    if "model" in sd and isinstance(sd["model"], dict):
-        return infer_num_classes_from_state(sd["model"])
-    return None
+class ImageDirectoryWatcher(QObject):
+    """watchdog 기반 이미지 디렉토리 감시기"""
 
-def load_model_from_pth(path_pth: Path):
-    """pth 파일에서 모델 로드"""
-    raw = torch.load(path_pth, map_location="cpu")
-    sd, kind = _extract_state_dict(raw)
-    n_classes = infer_num_classes_from_state(sd) or len(DEFAULT_CLASS_NAMES)
+    file_created = Signal(object)
 
-    model = build_model(n_classes)
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    print(f"[LOAD] file={path_pth.name} kind={kind} num_classes={n_classes} "
-          f"| missing={len(missing)} unexpected={len(unexpected)}")
+    def __init__(self, directory: Path, allow_ext=None, parent=None):
+        super().__init__(parent)
+        self._directory = Path(directory)
+        self._observer: Observer | None = None  # pyright: ignore[reportInvalidTypeForm]
+        self._handler: _ImageFileEventHandler | None = None
+        if allow_ext is None:
+            allow_ext = ALLOWED_IMAGE_EXTS
+        self._allow_ext = {ext.lower() for ext in allow_ext}
 
-    class_names = DEFAULT_CLASS_NAMES if n_classes == 3 else [f"class_{i}" for i in range(n_classes)]
-    return model.to(device).eval(), class_names
+    def start(self):
+        if self._observer is not None:
+            return
+        if not self._directory.exists():
+            self._directory.mkdir(parents=True, exist_ok=True)
+        self._handler = _ImageFileEventHandler(self.file_created.emit, self._allow_ext)
+        observer = Observer()
+        observer.schedule(self._handler, str(self._directory), recursive=False)
+        observer.start()
+        self._observer = observer
 
-model, CLASS_NAMES = load_model_from_pth(CHECKPOINT)
-print("CLASS_NAMES =", CLASS_NAMES)
+    def stop(self):
+        if self._observer is None:
+            return
+        observer = self._observer
+        self._observer = None
+        self._handler = None
+        try:
+            observer.stop()
+            observer.join(timeout=2.0)
+        except Exception:
+            pass
+
+    def is_running(self) -> bool:
+        return self._observer is not None
+
+class ImagePreviewLabel(QLabel):
+    """이미지 미리보기 (원본 + ROI 박스)"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.pixmap = None
+        self.src_shape = None
+        self.roi_rect: tuple[int, int, int, int] | None = None
+        self.setAlignment(Qt.AlignCenter)
+        self.setFixedSize(170, 360)
+        self.filename = ''
+        self.placeholder_text = ""
+
+    def show_placeholder(self, text: str):
+        self.pixmap = None
+        self.src_shape = None
+        self.roi_rect = None
+        self.placeholder_text = text or ""
+        self.filename = ''
+        self.update()
+
+    def show_image(self, npimg, filename: str = '', roi: tuple[int, int, int, int] | None = None):
+        self.placeholder_text = ""
+        self.src_shape = npimg.shape if npimg is not None else None
+        self.pixmap = pixmap_from_numpy(npimg, target_size=(self.width(), self.height()))
+        self.filename = filename
+        if self.src_shape is not None:
+            self.roi_rect = clamp_roi_to_shape(roi, self.src_shape[1], self.src_shape[0])
+        else:
+            self.roi_rect = None
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor('black'))
+        if self.pixmap is not None and not self.pixmap.isNull():
+            pm = self.pixmap
+            x = (self.width() - pm.width()) // 2
+            y = (self.height() - pm.height()) // 2
+            painter.drawPixmap(x, y, pm)
+            if self.roi_rect and self.src_shape:
+                src_h, src_w = self.src_shape[0], self.src_shape[1]
+                if src_w > 0 and src_h > 0:
+                    scale_x = pm.width() / src_w
+                    scale_y = pm.height() / src_h
+                    r_x, r_y, r_w, r_h = self.roi_rect
+                    draw_x = x + int(r_x * scale_x)
+                    draw_y = y + int(r_y * scale_y)
+                    draw_w = int(r_w * scale_x)
+                    draw_h = int(r_h * scale_y)
+                    painter.setPen(QPen(QColor('lime'), 2))
+                    painter.drawRect(draw_x, draw_y, draw_w, draw_h)
+        else:
+            painter.setPen(QPen(Qt.white))
+            painter.drawText(self.rect(), Qt.AlignCenter, self.placeholder_text)
+        painter.end()
+
+class ClassificationPanel(QWidget):
+    """3박스 판정 확률 + 리드타임/파일명 텍스트 패널"""
+
+    # ---- 레이아웃/스타일 상수 ----
+    OUTER_MARGIN = 15             # 패널 좌우/하단 여백
+    HEADER_EXTRA_TOP = 10         # 상단 여백 보정 (파일명 영역 위쪽)
+    HEADER_LINE_HEIGHT = 20       # 파일명/리드타임 텍스트 줄 간격
+
+    BOX_GAP = 10                  # 박스 사이 가로 간격
+    BOX_TITLE_GAP = 23            # 박스 위 타이틀과 박스 사이 간격
+    BOX_TOP_EXTRA = 20            # 헤더 영역 아래에서 박스 시작까지 여분
+    BOX_MIN_SIDE = 20             # 박스 한 변의 최소 픽셀
+
+    PANEL_BOTTOM_MARGIN = 2       # 패널 하단 여유(박스 영역 기준)
+    # ---------------------------
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(PANEL_W_PX, PANEL_H_PX)
+        self.setMinimumSize(PANEL_W_PX, PANEL_H_PX)
+        self.filename = ""
+        self.probs = [0.0 for _ in CLASS_NAMES]
+        self.pred_label = ""
+        self.earliest: dict[str, QDateTime | None] = {name: None for name in CLASS_NAMES}
+        self.current_dt: QDateTime | None = None
+        self.setAutoFillBackground(False)
+
+    def update_panel(self, filename: str, probs, pred_label: str,
+                     earliest: dict, current_dt: QDateTime | None):
+        """패널 내용(파일명, 판정 확률, 각 단계 시작 시각, 현재시각)을 갱신"""
+        try:
+            self.filename = filename or ""
+            self.pred_label = pred_label or ""
+
+            if probs is None:
+                self.probs = [0.0 for _ in CLASS_NAMES]
+            else:
+                arr = list(probs)
+                if len(arr) < len(CLASS_NAMES):
+                    arr.extend([0.0] * (len(CLASS_NAMES) - len(arr)))
+                self.probs = arr[: len(CLASS_NAMES)]
+
+            if isinstance(earliest, dict):
+                self.earliest = {name: earliest.get(name) for name in CLASS_NAMES}
+            else:
+                self.earliest = {name: None for name in CLASS_NAMES}
+
+            self.current_dt = (
+                current_dt if isinstance(current_dt, QDateTime) and current_dt.isValid()
+                else None
+            )
+        except Exception:
+            pass
+
+        self.update()
+
+    def paintEvent(self, event):
+        """패널 배경, 상단 정보 텍스트, Lead Time, 클래스 박스 """
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        panel_rect = self.rect()
+        painter.fillRect(panel_rect, QColor("white"))
+
+        # 표시할 내용이 없으면 "결과 없음"
+        has_filename = bool(self.filename)
+        has_probs = any(self.probs)
+        if not has_filename and not has_probs:
+            painter.setPen(QPen(Qt.gray))
+            painter.drawText(panel_rect, Qt.AlignCenter, "결과 없음")
+            painter.end()
+            return
+
+        # 상단 파일명 + 리드타임 텍스트 영역
+        outer = self.OUTER_MARGIN
+        line_h = self.HEADER_LINE_HEIGHT
+
+        header_x = outer
+        header_y = outer + self.HEADER_EXTRA_TOP
+
+        title_font = QFont(self.font())
+        title_font.setPointSize(11)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.setPen(QPen(Qt.black))
+        painter.drawText(int(header_x), int(header_y + line_h * 0), self.filename)
+
+        # 리드타임 계산
+        lead_font = QFont(self.font())
+        lead_font.setPointSize(10)
+        painter.setFont(lead_font)
+
+        icing_lead = compute_lead_minutes(self.earliest.get("Melted"), self.earliest.get("Icing"))
+        iced_lead = compute_lead_minutes(self.earliest.get("Icing"), self.earliest.get("Iced"))
+        current_lead = compute_current_lead_minutes(self.earliest.get("Iced"), self.current_dt)
+
+        painter.drawText(int(header_x), int(header_y + line_h * 1.2), f"- Melted~Icing Time: {icing_lead} min" if icing_lead else "- Melted~Icing Time: ")
+        painter.drawText(int(header_x), int(header_y + line_h * 2.2), f"- Icing~Iced Time: {iced_lead} min" if iced_lead else "- Icing~Iced Time: ")
+        painter.drawText(int(header_x), int(header_y + line_h * 3.2), f"- Iced~Current Time: {current_lead} min" if current_lead else "- Iced~Current Time: ")
+
+        # 3개 클래스 박스 레이아웃 계산
+        boxes_top_y = header_y + line_h * 4 + self.BOX_TOP_EXTRA
+        side_max_w = PANEL_W_PX - 2 * outer - 2 * self.BOX_GAP
+        side_max_h = PANEL_H_PX - boxes_top_y - outer + self.PANEL_BOTTOM_MARGIN
+
+        side = int(min(side_max_w / 3, side_max_h))
+        side = max(side, self.BOX_MIN_SIDE)
+
+        x0 = outer
+        x1 = x0 + side + self.BOX_GAP
+        x2 = x1 + side + self.BOX_GAP
+        box_x_positions = [x0, x1, x2]
+
+        # 박스 내부 스타일 설정
+        title_font_box = QFont(self.font())
+        title_font_box.setPointSize(12)
+        title_font_box.setBold(True)
+
+        prob_font = QFont(self.font())
+        prob_font.setPointSize(12)
+        prob_font.setBold(True)
+
+        start_font = QFont(self.font())
+        start_font.setPointSize(9)
+
+        active_fill = {"Melted": QColor("#ffadad"), "Icing": QColor("#81CBF8"), "Iced": QColor("#5a63e2")}
+        inactive_fill = QColor("white")
+        stroke_color = QColor("black")
+
+        # 각 클래스(Melted, Icing, Iced) 박스 그리기
+        for idx, (name, x_left) in enumerate(zip(CLASS_NAMES, box_x_positions)):
+            painter.setFont(title_font_box)
+            painter.setPen(stroke_color)
+            painter.drawText(int(x_left), int(boxes_top_y - self.BOX_TITLE_GAP), side, line_h, Qt.AlignCenter, name)
+
+            is_active = (name == self.pred_label)
+            rect_color = active_fill.get(name, inactive_fill) if is_active else inactive_fill
+            painter.fillRect(int(x_left), int(boxes_top_y), side, side, rect_color)
+            painter.setPen(QPen(stroke_color))
+            painter.drawRect(int(x_left), int(boxes_top_y), side, side)
+
+            # 박스 내 확률 값 텍스트
+            try:
+                p_val = float(self.probs[idx]) if idx < len(self.probs) else 0.0
+            except Exception:
+                p_val = 0.0
+
+            painter.setFont(prob_font)
+
+            prob_rect_top = int(boxes_top_y + side * 0.23)
+            prob_rect_h = int(side * 0.40)
+            painter.drawText(int(x_left), prob_rect_top, side, prob_rect_h, Qt.AlignHCenter | Qt.AlignVCenter, f"{p_val * 100:.1f}%")
+
+            # 박스 내 시작 시각 텍스트
+            painter.setFont(start_font)
+            start_str = format_mmdd_hhmm(self.earliest.get(name))
+            start_rect_top = int(boxes_top_y + side * 0.55)
+            start_rect_h = int(side * 0.20)
+            painter.drawText(int(x_left), start_rect_top, side, start_rect_h, Qt.AlignHCenter | Qt.AlignVCenter, start_str)
+
+        painter.end()
 
 
-# Utils
-def natural_key(path: Path):
-    """파일명 내 숫자를 고려한 natural sort key"""
-    base = os.path.basename(str(path))
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", base)]
+class BacklogFeeder(QObject):
+    """이미지 백로그를 천천히 하나씩 흘려 보내는 전용 worker"""
+    finished = Signal()
+    next_image = Signal(object)
 
-def list_images_sorted(folder: Path):
-    """폴더 내 이미지 경로 natural sort"""
-    paths = [p for p in folder.rglob("*") if p.suffix.lower() in EXTS]
-    paths.sort(key=natural_key)
-    return paths
+    def __init__(self, backlog):
+        super().__init__()
+        self.backlog = list(backlog)
+        self._stop = False
 
-def parse_dt_from_filename(fname: str):
-    """파일명 내 6자리 숫자 2개(YYMMDD, HHMMSS)를 찾아 datetime 반환"""
-    sixes = re.findall(r'(\d{6})', fname)
-    if len(sixes) < 2:
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        for p in self.backlog:
+            if self._stop:
+                break
+            self.next_image.emit(p)
+            time.sleep(0.05)
+        self.finished.emit()
+
+class IcingClassificationGUI(QWidget):
+    """메인 GUI 위젯 클래스 (ViT 분류 기반)"""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('Icing Classification GUI')
+        self.resize(500, 400)
+        self.settings = QSettings(str(INI_SETTINGS_PATH), QSettings.IniFormat)
+        self._window_position_restored = False
+
+        # 상태 메시지 관리
+        self._status_text: str = ""
+        self._status_hold_until: float = 0.0
+        self._no_image_grace_until: float = 0.0
+
+        # 텍스트 박스 ('장비명_Lot#_Process')
+        self.device_info_box = QLineEdit()
+        self.device_info_box.setReadOnly(True)
+        self.device_info_box.setFixedWidth(180)
+        self.device_info_box.setAlignment(Qt.AlignCenter)
+
+        # 현재 Lot/Attempt 및 CSV 경로/장비 정보
+        self.current_lot: str | None = None
+        self.current_attempt: int | None = None
+        self.lot_csv_path: Path | None = None
+        self.current_equip: str | None = None
+        self.equip_csv_path: Path | None = None
+        self.last_processed_dt: QDateTime | None = None
+
+        # Lot 상세 CSV 헤더
+        self.csv_header = ['이미지 파일명', 'Attempt', '예측 라벨', 'Melted', 'Icing', 'Iced']
+
+        self.processed_images: set[str] = set()
+        self.session_processed_images: set[str] = set()
+        self.pending_images: deque[Path] = deque()
+        self._is_processing_queue = False
+        self.current_process = None
+        self._csv_header_checked = False
+
+        self.classifier = ViTClassifier(MODEL_NAME, CHECKPOINT_PATH, CLASS_NAMES, img_size=IMG_SIZE)
+
+        # 채택 영역 설정의 기본값 지정
+        self.crop1_x = QSpinBox(maximum=9999)
+        self.crop1_y = QSpinBox(maximum=9999)
+        self.crop1_w = QSpinBox(maximum=9999)
+        self.crop1_h = QSpinBox(maximum=9999)
+        default_roi = DEFAULT_ROI_RECT
+
+        # 채택 영역 좌표 설정 (새 키 우선, 없으면 레거시 키 또는 기본값)
+        stored_vals = [
+            self._load_int_setting('crop1_x', default_roi[0], legacy_keys=['crop_x']),
+            self._load_int_setting('crop1_y', default_roi[1], legacy_keys=['crop_y']),
+            self._load_int_setting('crop1_w', default_roi[2], legacy_keys=['crop_w']),
+            self._load_int_setting('crop1_h', default_roi[3], legacy_keys=['crop_h']),
+        ]
+        for s, v in zip([self.crop1_x, self.crop1_y, self.crop1_w, self.crop1_h], stored_vals):
+            s.setValue(v)
+            s.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            s.setFixedWidth(66)   # 채택 영역(ROI) 스핀박스 폭
+
+        self.crop1_enabled_cb = QCheckBox()
+        enabled_val = self._load_bool_setting('crop1_enabled', True)
+        self.crop1_enabled_cb.setChecked(bool(enabled_val))
+        # 체크 상태에 따라 스핀박스 활성/비활성
+        for s in (self.crop1_x, self.crop1_y, self.crop1_w, self.crop1_h):
+            s.setEnabled(bool(enabled_val))
+
+        # 위젯 초기화
+        self.start_button = QPushButton('시작')
+        self.stop_button = QPushButton('종료')
+        self.stop_button.setEnabled(False)
+        self.save_opt_button = QPushButton('설정 저장')
+        for btn in (self.start_button, self.stop_button, self.save_opt_button):
+            btn.setFixedWidth(70)    # 시작/종료/설정 저장 버튼 너비
+        self.status_label = QLabel('- 대기 중 -')
+        self.preview_label = ImagePreviewLabel()
+        self.panel_canvas = ClassificationPanel()
+        self.auto_start_on_launch = AUTO_START_ON_LAUNCH
+
+        # Lot/Attempt 단위 earliest 시각 관리
+        self.earliest_by_lot_attempt: dict[tuple[str, int], dict[str, QDateTime | None]] = {}
+
+        # 레이아웃 구성
+        main_hbox = QHBoxLayout(self)
+        main_hbox.setContentsMargins(10, 15, 10, 10)
+        main_hbox.setSizeConstraint(QLayout.SetMinimumSize)
+
+        left_panel = QVBoxLayout()
+        left_panel.addWidget(self.status_label)
+
+        btns = QHBoxLayout()
+        btns.addWidget(self.device_info_box)
+        btns.addWidget(self.start_button)
+        btns.addWidget(self.stop_button)
+        btns.addWidget(self.save_opt_button)
+        left_panel.addLayout(btns)
+
+        crop_box = QGroupBox(' 채택 영역 설정 ')
+        crop_vbox = QVBoxLayout()
+
+        crop_hbox1 = QHBoxLayout()
+        crop_hbox1.addWidget(self.crop1_enabled_cb)
+        crop_hbox1.addWidget(QLabel("X:")); crop_hbox1.addWidget(self.crop1_x)
+        crop_hbox1.addWidget(QLabel("Y:")); crop_hbox1.addWidget(self.crop1_y)
+        crop_hbox1.addWidget(QLabel("W:")); crop_hbox1.addWidget(self.crop1_w)
+        crop_hbox1.addWidget(QLabel("H:")); crop_hbox1.addWidget(self.crop1_h)
+        crop_vbox.addLayout(crop_hbox1)
+
+        crop_box.setLayout(crop_vbox)
+
+        left_panel.addWidget(crop_box)
+        left_panel.addWidget(self.panel_canvas)
+        left_panel.addStretch()
+
+        right_panel = QVBoxLayout()
+        right_panel.addWidget(self.preview_label, alignment=Qt.AlignTop)
+
+        main_hbox.addLayout(left_panel)
+        main_hbox.addLayout(right_panel)
+
+        # 타이머/워처
+        self.tail_timer = QTimer(self)
+        self.tail_timer.setInterval(500)
+        self.tail_timer.timeout.connect(self._main_tick)
+
+        self.directory_watcher = ImageDirectoryWatcher(IMG_INPUT_DIR)
+        self.directory_watcher.file_created.connect(self._enqueue_new_image)
+
+        self._backlog_thread: QThread | None = None
+        self._backlog_feeder: BacklogFeeder | None = None
+
+        # 신호 연결
+        self.start_button.clicked.connect(self.start_realtime)
+        self.stop_button.clicked.connect(self.stop_realtime)
+        self.save_opt_button.clicked.connect(self.save_options)
+        self.crop1_enabled_cb.toggled.connect(self._on_crop1_toggled)
+
+        # 마지막 이미지 기준으로 장비/lot/공정/attempt 및 장비 요약 CSV 로드
+        self._init_device_info_from_last_image()
+        self._restore_window_position()
+        self.update_preview()
+
+    def _load_int_setting(self, key: str, default: int, legacy_keys=None) -> int:
+        """QSettings에서 int를 읽되, 없으면 legacy_keys 순서대로 fallback 후 default 사용"""
+        if legacy_keys is None:
+            legacy_keys = []
+        val = self.settings.value(key, None)
+        if val is None:
+            for lk in legacy_keys:
+                val = self.settings.value(lk, None)
+                if val is not None:
+                    break
+        if val is None:
+            return int(default)
+        try:
+            return int(val)
+        except Exception:
+            return int(default)
+
+    def _load_bool_setting(self, key: str, default: bool) -> bool:
+        """QSettings에서 bool 값을 다양한 문자열 표현까지 포함해 안전하게 로드"""
+        val = self.settings.value(key, None)
+        if val is None:
+            return default
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return bool(val)
+        if isinstance(val, str):
+            s = val.strip().lower()
+            if s in ("1", "true", "yes", "y", "on"):
+                return True
+            if s in ("0", "false", "no", "n", "off"):
+                return False
+        return default
+
+    def _set_status(self, text: str, hold_s: float = 3.0):
+        """상태 라벨 업데이트 헬퍼 (깜빡임 방지)"""
+        now = time.monotonic()
+        if text == self._status_text:
+            return
+        self._status_text = text
+        self.status_label.setText(text)
+        if hold_s and hold_s > 0:
+            self._status_hold_until = now + hold_s
+        else:
+            self._status_hold_until = 0.0
+
+    @staticmethod
+    def _qdatetime_to_str(qdt: QDateTime | None) -> str:
+        """QDateTime -> CSV 저장용 문자열 ('yyyy-MM-dd HH:mm:ss')"""
+        if qdt is None or not isinstance(qdt, QDateTime) or not qdt.isValid():
+            return ""
+        return qdt.toString("yyyy-MM-dd HH:mm:ss")
+
+    @staticmethod
+    def _str_to_qdatetime(s: str) -> QDateTime | None:
+        """CSV 문자열 -> QDateTime (24시간제 & AM/PM 12시간제)"""
+        if not s:
+            return None
+
+        s = s.strip()
+        if not s:
+            return None
+        s_norm = re.sub(r'\s+', ' ', s)
+
+        # 24시간제
+        for fmt in ("yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm"):
+            qdt = QDateTime.fromString(s_norm, fmt)
+            if qdt.isValid():
+                return qdt
+
+        # AM/PM 12시간제
+        for fmt in ("yyyy-MM-dd h:mm:ss AP", "yyyy-MM-dd h:mm AP"):
+            qdt = QDateTime.fromString(s_norm, fmt)
+            if qdt.isValid():
+                return qdt
+
         return None
-    d, t = sixes[0], sixes[1]
-    try:
-        yy, mm, dd = int(d[:2]), int(d[2:4]), int(d[4:6])
-        hh, mi, ss = int(t[:2]), int(t[2:4]), int(t[4:6])
-        year = 2000 + yy
-        return datetime(year, mm, dd, hh, mi, ss)
-    except ValueError:
-        return None
 
-def fmt_mmdd_hhmm(dt):
-    return dt.strftime("%m/%d_%H:%M") if isinstance(dt, datetime) else ""
+    def _restore_window_position(self):
+        """이전에 저장된 창 위치(INI)를 복원"""
+        if self._window_position_restored:
+            return
+        try:
+            x_val = int(self.settings.value('main_window_pos_x', 0))
+            y_val = int(self.settings.value('main_window_pos_y', 0))
+        except Exception:
+            x_val = y_val = 0
+        self._window_position_restored = True
 
-def lot_prefix_from_name(fname: str):
-    """장비_날짜 프리픽스(예: Y0_251006)"""
-    parts = Path(fname).stem.split("_")
-    if len(parts) >= 2:
-        return f"{parts[0]}_{parts[1]}", parts[1]
-    return "", ""
+        if x_val or y_val:
+            x_val, y_val = self._adjust_position_to_screen(x_val, y_val)
+            self.move(x_val, y_val)
+            return
+        self._move_to_default_position()
 
-def ensure_outdir(root: Path, date6: str):
-    """날짜별 출력 폴더 생성"""
-    out_dir = root / date6 if date6 else root
-    out_dir.mkdir(parents=True, exist_ok=True)
-    return out_dir
+    def _move_to_default_position(self):
+        """OFFSET 값 기반으로 기본 창 위치를 계산해 이동"""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        frame_geo = self.frameGeometry()
+        window_width = frame_geo.width()
+        window_height = frame_geo.height()
+        target_x = available.x() + WINDOW_OFFSET_X
+        target_y = available.y() + available.height() - WINDOW_OFFSET_Y - window_height
+        target_x, target_y = self._adjust_position_to_screen(target_x, target_y, window_width, window_height)
+        self.move(target_x, target_y)
 
-def compute_lead_minutes(starts):
-    """레이블 간 LEAD TIME 계산"""
-    t_m, t_i, t_c = starts.get("Melted"), starts.get("Icing"), starts.get("Iced")
-    icing_lead_str = ""
-    iced_lead_str  = ""
-    if t_m and t_i:
-        icing_lead_str = f"{max(0, int(round((t_i - t_m).total_seconds()/60.0)))}"
-    if t_i and t_c:
-        iced_lead_str  = f"{max(0, int(round((t_c - t_i).total_seconds()/60.0)))}"
-    return icing_lead_str, iced_lead_str
+    def _adjust_position_to_screen(self, x, y, window_width=None, window_height=None):
+        """창이 화면 영역을 벗어나지 않도록 x, y 좌표를 보정해 반환"""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return int(round(x)), int(round(y))
+        available = screen.availableGeometry()
+        if window_width is None or window_height is None:
+            frame_geo = self.frameGeometry()
+            if window_width is None:
+                window_width = frame_geo.width()
+            if window_height is None:
+                window_height = frame_geo.height()
+        min_x = available.x()
+        min_y = available.y()
+        max_x = max(min_x, available.x() + available.width() - window_width)
+        max_y = max(min_y, available.y() + available.height() - window_height)
+        clamped_x = max(min_x, min(int(round(x)), max_x))
+        clamped_y = max(min_y, min(int(round(y)), max_y))
+        return clamped_x, clamped_y
 
-def compute_current_lead_minutes(starts, cur_dt):
-    """Iced 최초 시각 ~ 현재 프레임 시각 리드타임(분)"""
-    iced_start = starts.get("Iced")
-    if iced_start is None or cur_dt is None or cur_dt < iced_start:
-        return ""
-    return f"{max(0, int(round((cur_dt - iced_start).total_seconds()/60.0)))}"
+    def save_options(self):
+        """현재 ROI 값과 창 위치를 QSettings(INI)에 저장하고 상태를 표시"""
+        self.settings.setValue('crop1_x', self.crop1_x.value())
+        self.settings.setValue('crop1_y', self.crop1_y.value())
+        self.settings.setValue('crop1_w', self.crop1_w.value())
+        self.settings.setValue('crop1_h', self.crop1_h.value())
+        self.settings.setValue('crop1_enabled', bool(self.crop1_enabled_cb.isChecked()))
+        top_left = self.frameGeometry().topLeft()
+        self.settings.setValue('main_window_pos_x', int(top_left.x()))
+        self.settings.setValue('main_window_pos_y', int(top_left.y()))
+        self.settings.sync()
+        self._set_status("설정 저장됨.")
 
-# -------- 패널 크기/레이아웃 파라미터 --------
-W_PX, H_PX = 442, 238
-DPI = 100
-outer_margin = 8
-gap = 6
-img_gap = 8
-title_gap = 5
-title_fontsize = 12
-value_fontsize = 10
-start_fontsize = 9
-stroke_w = 1.2
-ASPECT_W, ASPECT_H = 1.0, 2.1
-# -----------------------------------------
+    def _get_current_roi(self) -> tuple[int, int, int, int] | None:
+        """ROI 체크박스와 스핀박스 값으로 현재 사용 중인 ROI(또는 None)를 반환"""
+        if not self.crop1_enabled_cb.isChecked():
+            return None
+        return (int(self.crop1_x.value()), int(self.crop1_y.value()), int(self.crop1_w.value()), int(self.crop1_h.value()))
 
-# Panel Rendering
-DISPLAY_ORDER = ["Melted", "Icing", "Iced"]  # 좌→우 표시 순서
-active_fill   = {"Melted": "#ffadad", "Icing": "#81CBF8", "Iced": "#5a63e2"}
-inactive_fill = "#ffffff"
+    def _get_earliest_for(self, lot_number: str, attempt_value: int) -> dict[str, QDateTime | None]:
+        """(Lot, Attempt) 조합별 earliest dict 반환"""
+        key = (lot_number, int(attempt_value))
+        return self.earliest_by_lot_attempt.setdefault(key, {name: None for name in CLASS_NAMES})
 
-def render_panel(img_path: Path, probs: np.ndarray, pred_name: str, earliest_dt_by_class: dict, current_dt: datetime, out_path: Path):
-    """파일명 / 리드타임 / 3박스(확률+Start 시각) / 원본 이미지 + ROI overlay"""
-    name2p = {CLASS_NAMES[i]: float(probs[i]) for i in range(len(CLASS_NAMES))}
+    def _reset_panel(self):
+        """Lot / Attempt 전환 시 패널(리드타임/파일명 등) 초기화"""
+        empty_earliest = {name: None for name in CLASS_NAMES}
+        self.panel_canvas.update_panel("", None, "", empty_earliest, None)
 
-    h_img_area = H_PX - 2 * outer_margin
-    w_img_area = int(h_img_area * ASPECT_W / ASPECT_H)
-    left_width = W_PX - 2 * outer_margin - img_gap - w_img_area
-    left_width = max(left_width, 1)
+    def _load_equip_summary_from_csv(self):
+        """<장비#.csv>를 기반으로 패널 정보 복원"""
+        if not self.current_equip:
+            return
 
-    side_max_w = (left_width - 2 * gap) / 3
-    side_max_h = H_PX - outer_margin - title_gap - 14
-    side = int(max(1, min(side_max_w, side_max_h)))
+        self.equip_csv_path = CSV_OUTPUT_DIR / f"{self.current_equip}.csv"
+        if not self.equip_csv_path.exists():
+            return
 
-    x0 = outer_margin
-    x1 = x0 + side + gap
-    x2 = x1 + side + gap
-    y0 = outer_margin
-    title_y = y0 + side + title_gap
+        latest_info = None
+        latest_py_dt = None
 
-    x_img_area = outer_margin + left_width + img_gap
-    y_img_area = outer_margin
-    w_img_area = int(w_img_area)
-    h_img_area = int(h_img_area)
+        try:
+            with open(self.equip_csv_path, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                for row in reader:
+                    if not row or len(row) < 10:
+                        continue
+                    equip, lot, attempt_str = row[0], row[1], row[2]
+                    melted_str, icing_str, iced_str = row[3], row[4], row[5]
+                    last_img_name, last_time_str = row[8], row[9]
 
-    earliest_str = {k: fmt_mmdd_hhmm(v) if v else "" for k, v in earliest_dt_by_class.items()}
-    icing_lead_str, iced_lead_str = compute_lead_minutes(earliest_dt_by_class)
-    current_lead_str = compute_current_lead_minutes(earliest_dt_by_class, current_dt)
+                    if equip and self.current_equip and equip != self.current_equip:
+                        continue
 
-    fig = plt.figure(figsize=(W_PX / DPI, H_PX / DPI), dpi=DPI)
-    ax = fig.add_axes([0, 0, 1, 1])
-    ax.set_xlim(0, W_PX); ax.set_ylim(0, H_PX); ax.axis('off')
+                    try:
+                        attempt_val = int(attempt_str)
+                    except Exception:
+                        attempt_val = 0
 
-    # 좌측 상단: 정보
-    info_x = outer_margin
-    info_y_top = H_PX - outer_margin
-    line_h = 22
-    ax.text(info_x, info_y_top, f"{img_path.name}", ha="left", va="top", fontsize=10, color="#222222", fontweight="bold")
-    ax.text(info_x, info_y_top - 1.2 * line_h, f"- Melted~Icing Time: {icing_lead_str} min" if icing_lead_str else "- Melted~Icing Time: ", ha="left", va="top", fontsize=10, color="#222222")
-    ax.text(info_x, info_y_top - 2.2 * line_h, f"- Icing~Iced Time: {iced_lead_str} min" if iced_lead_str else "- Icing~Iced Time: ", ha="left", va="top", fontsize=10, color="#222222")
-    ax.text(info_x, info_y_top - 3.2 * line_h, f"- Iced~Current Time: {current_lead_str} min" if current_lead_str else "- Iced~Current Time: ", ha="left", va="top", fontsize=10, color="#222222")
+                    melted_dt = self._str_to_qdatetime(melted_str)
+                    icing_dt = self._str_to_qdatetime(icing_str)
+                    iced_dt = self._str_to_qdatetime(iced_str)
 
-    # 좌측 하단: 3박스
-    xs = [x0, x1, x2]
-    for name, x_left in zip(DISPLAY_ORDER, xs):
-        ax.text(x_left + side/2, title_y, name, ha="center", va="bottom", fontsize=title_fontsize, fontweight="bold", color="#000000")
+                    # Case A 대응: LastImageTime 파싱 실패 시 파일명 기반 시간으로 보정
+                    last_dt = self._str_to_qdatetime(last_time_str)
+                    if (last_dt is None or not last_dt.isValid()) and last_img_name:
+                        img_path = IMG_INPUT_DIR / last_img_name
+                        if img_path.exists():
+                            fallback_dt = extract_image_datetime(img_path)
+                            if isinstance(fallback_dt, QDateTime) and fallback_dt.isValid():
+                                last_dt = fallback_dt
 
-        fc = active_fill.get(name, inactive_fill) if name == pred_name else inactive_fill
-        rect = patches.Rectangle((x_left, y0), side, side, linewidth=stroke_w, edgecolor="black", facecolor=fc)
-        ax.add_patch(rect)
+                    key = (lot, attempt_val)
+                    starts = self.earliest_by_lot_attempt.setdefault(key, {name: None for name in CLASS_NAMES})
+                    if melted_dt and melted_dt.isValid():
+                        if starts["Melted"] is None or melted_dt < starts["Melted"]:
+                            starts["Melted"] = melted_dt
+                    if icing_dt and icing_dt.isValid():
+                        if starts["Icing"] is None or icing_dt < starts["Icing"]:
+                            starts["Icing"] = icing_dt
+                    if iced_dt and iced_dt.isValid():
+                        if starts["Iced"] is None or iced_dt < starts["Iced"]:
+                            starts["Iced"] = iced_dt
 
-        p_val = name2p.get(name, 0.0)
-        ax.text(x_left + side/2, y0 + side*0.56, f"{p_val*100:.1f}%", ha="center", va="center", fontsize=value_fontsize, color="#000000", fontweight="bold")
+                    if last_dt and last_dt.isValid():
+                        cur_py = _qdatetime_to_datetime(last_dt)
+                        if cur_py is None:
+                            continue
+                        if latest_py_dt is None or cur_py > latest_py_dt:
+                            latest_py_dt = cur_py
+                            latest_info = (lot, attempt_val, melted_dt, icing_dt, iced_dt, last_img_name, last_dt)
+        except Exception as e:
+            print(f"⚠️ 장비 요약 CSV 로드 실패: {e}")
+            return
 
-        ax.text(x_left + side/2, y0 + side*0.30, earliest_str.get(name, ""), ha="center", va="center", fontsize=start_fontsize, color="#000000")
+        if latest_info is None:
+            return
 
-    # 우측: 원본 이미지 + ROI 오버레이
-    with Image.open(img_path) as im:
-        im = ImageOps.exif_transpose(im).convert("RGB")
-        iw, ih = im.size
-        scale = min(w_img_area / iw, h_img_area / ih) if iw > 0 and ih > 0 else 1.0
-        w_fit, h_fit = iw * scale, ih * scale
-        x_img0 = x_img_area + (w_img_area - w_fit) / 2
-        y_img0 = y_img_area + (h_img_area - h_fit) / 2
+        lot, attempt_val, melted_dt, icing_dt, iced_dt, last_img_name, last_dt = latest_info
+        self.current_lot = lot
+        self.current_attempt = attempt_val
+        self.last_processed_dt = last_dt
 
-        ax_img = fig.add_axes([x_img0 / W_PX, y_img0 / H_PX, w_fit / W_PX, h_fit / H_PX])
-        ax_img.imshow(im, origin='upper')
-        ax_img.set_xlim(0, iw); ax_img.set_ylim(ih, 0)
-        ax_img.axis('off')
+        key = (lot, attempt_val)
+        starts = self._get_earliest_for(lot, attempt_val)
+        if melted_dt and melted_dt.isValid():
+            starts["Melted"] = melted_dt
+        if icing_dt and icing_dt.isValid():
+            starts["Icing"] = icing_dt
+        if iced_dt and iced_dt.isValid():
+            starts["Iced"] = iced_dt
 
-        rx, ry, rw, rh = map(int, ROI_RECT)
-        ax_img.add_patch(patches.Rectangle((rx, ry), rw, rh, linewidth=1.2, edgecolor="lime", facecolor="none"))
+        # device_info_box를 마지막 이미지 기준으로 맞추기
+        if last_img_name:
+            info = parse_filename(last_img_name)
+            if info['equip'] and info['lot'] and info['process']:
+                self.device_info_box.setText(f"{info['equip']}_{info['lot']}_{info['process']}_{info['attempt']}")
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=DPI, bbox_inches=None, pad_inches=0)
-    plt.close(fig)
+        # 패널 복원
+        self.panel_canvas.update_panel(last_img_name, None, "", starts, QDateTime.currentDateTime())
 
-# Main Batch Loop
-all_paths = list_images_sorted(IN_DIR)
-print(f"[INFO] found {len(all_paths)} images under {IN_DIR}")
+    def _update_equip_summary(self, info: dict, starts: dict[str, QDateTime | None],
+                              last_img_name: str, last_img_dt: QDateTime | None):
+        """<장비#.csv> 구성: Lot/Attempt 별 1행으로 Summary (Melted/Icing/Iced 시각, 리드타임, 마지막 이미지 정보 저장)"""
+        equip = info.get("equip") or ""
+        lot = info.get("lot") or ""
+        attempt_val = int(info.get("attempt") or 0)
+        if not equip or not lot:
+            return
 
-earliest_by_lot = {}   # lot별 최초 시각 누적
-rows_csv = []          # CSV 누적 버퍼
+        equip_csv_path = CSV_OUTPUT_DIR / f"{equip}.csv"
+        self.equip_csv_path = equip_csv_path
 
-pbar = tqdm(all_paths, desc="Simulating stream → panels", unit="img")
-for img_path in pbar:
-    fname = img_path.name
-    lot_prefix, date6 = lot_prefix_from_name(fname)
-    out_dir = ensure_outdir(OUT_ROOT, date6)
-    out_path = out_dir / f"{img_path.stem}_panel.png"
+        melted_dt = starts.get("Melted")
+        icing_dt = starts.get("Icing")
+        iced_dt = starts.get("Iced")
 
-    # inference
-    with Image.open(img_path) as im:
-        im = ImageOps.exif_transpose(im).convert("RGB")
-        x = valtest_tfms(im).unsqueeze(0).to(device)
+        melted_str = self._qdatetime_to_str(melted_dt)
+        icing_str = self._qdatetime_to_str(icing_dt)
+        iced_str = self._qdatetime_to_str(iced_dt)
 
-    with torch.no_grad():
-        with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
-            logits = model(x)
-            probs = torch.softmax(logits, dim=1).flatten().float().cpu().numpy()
+        melted_icing = compute_lead_minutes(melted_dt, icing_dt)
+        icing_iced = compute_lead_minutes(icing_dt, iced_dt)
 
-    pred_name = CLASS_NAMES[int(np.argmax(probs))]
+        last_img_time_str = self._qdatetime_to_str(last_img_dt)
 
-    # current datetime from filename
-    cur_dt = parse_dt_from_filename(fname)
+        new_row = [equip, lot, str(attempt_val), melted_str, icing_str, iced_str, melted_icing, icing_iced, last_img_name or "", last_img_time_str]
 
-    # update earliest times by lot
-    if lot_prefix not in earliest_by_lot:
-        earliest_by_lot[lot_prefix] = {"Melted": None, "Icing": None, "Iced": None}
-    starts = earliest_by_lot[lot_prefix]
+        header = ["Equip", "Lot", "Attempt", "MeltedTime", "IcingTime", "IcedTime", "MeltedToIcingMin", "IcingToIcedMin", "LastImageName", "LastImageTime"]
 
-    if cur_dt is not None:
-        if starts.get(pred_name) is None or cur_dt < starts[pred_name]:
-            starts[pred_name] = cur_dt
+        rows: list[list[str]] = []
+        if equip_csv_path.exists():
+            try:
+                with open(equip_csv_path, "r", encoding="utf-8-sig", newline="") as f:
+                    reader = csv.reader(f)
+                    _old_header = next(reader, None)
+                    for row in reader:
+                        if not row:
+                            continue
+                        rows.append(row)
+            except Exception as e:
+                print(f"⚠️ 장비 요약 CSV 읽기 실패: {e}")
 
-    # render/save panel
-    render_panel(img_path, probs, pred_name, starts, cur_dt, out_path)
+        # Lot/Attempt 기준 upsert
+        replaced = False
+        for i, row in enumerate(rows):
+            if len(row) >= 3 and row[1] == lot:
+                try:
+                    old_attempt = int(row[2])
+                except Exception:
+                    old_attempt = 0
+                if old_attempt == attempt_val:
+                    rows[i] = new_row
+                    replaced = True
+                    break
 
-    # accumulate CSV row
-    ts_str = (cur_dt.strftime("%Y-%m-%d %H:%M:%S")
-              if cur_dt is not None
-              else datetime.fromtimestamp(img_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"))
-    row = {
-        "filename": img_path.name,
-        "timestamp": ts_str,
-        "pred_label": pred_name,
-        "confidence": float(np.max(probs)),
-    }
-    for ci, cname in enumerate(CLASS_NAMES):
-        row[f"p_{cname}"] = float(probs[ci])
-    rows_csv.append(row)
+        if not replaced:
+            rows.append(new_row)
 
-# Save CSV
-date6_for_csv = IN_DIR.name
-csv_dir = ensure_outdir(OUT_ROOT, date6_for_csv)
-csv_path = csv_dir / f"Predictions_{date6_for_csv}.csv"
+        try:
+            with open(equip_csv_path, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                writer.writerows(rows)
+        except Exception as e:
+            print(f"❌ 장비 요약 CSV 저장 실패: {e}")
 
-df_csv = pd.DataFrame(rows_csv)
-CSV_COL_ORDER = ["filename", "timestamp", "pred_label", "confidence"] + [f"p_{c}" for c in CLASS_NAMES]
-df_csv = df_csv.reindex(columns=CSV_COL_ORDER)
+    def _poll_latest_image(self):
+        """마지막 이미지 처리 후 9초 이상 새 이미지가 없으면 '신규 이미지 없음' 표시"""
+        now = time.monotonic()
+        last_seen = getattr(self, 'last_image_seen_at', 0.0)
 
-df_csv.to_csv(csv_path, index=False, encoding="utf-8-sig")
-print(f"[SAVE] CSV → {csv_path.resolve()}  ({len(df_csv)} rows)")
+        if now < getattr(self, "_status_hold_until", 0.0):
+            return
+        if now < getattr(self, "_no_image_grace_until", 0.0):
+            return
+        if self.pending_images or (self._backlog_thread and self._backlog_thread.isRunning()):
+            return
 
-# 필요 시 이후 분석용 DataFrame
-df = df_csv.copy()
+        if now - last_seen > 9.0:
+            self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
+            self._set_status("신규 이미지 없음 (폴더 감시 중)", hold_s=0.0)
 
-print(f"[SAVE] Panels → {OUT_ROOT.resolve()} (by date folder)")
-# === [/### 3] ===
+    def _main_tick(self):
+        """타이머 통합 틱: 대기 중인 이미지 처리 + '신규 이미지 없음' 상태 갱신"""
+        self._drain_pending_queue()
+        self._poll_latest_image()
 
+    def _is_after_last_processed(self, img_path: Path) -> bool:
+        """<장비#.csv> 기준 '마지막 처리된 시각(self.last_processed_dt)' 이후의 이미지인지 여부 확인"""
+        if self.last_processed_dt is None or not isinstance(self.last_processed_dt, QDateTime):
+            return True
+        if not self.last_processed_dt.isValid():
+            return True
+
+        img_dt = extract_image_datetime(img_path)
+        if not isinstance(img_dt, QDateTime) or not img_dt.isValid():
+            return True
+
+        base = _qdatetime_to_datetime(self.last_processed_dt)
+        cur = _qdatetime_to_datetime(img_dt)
+        if base is None or cur is None:
+            return True
+        return cur > base
+
+    @Slot(object)
+    def _enqueue_new_image(self, path_obj):
+        """watchdog에서 전달된 신규 이미지 경로를 검사 후 처리 대기 큐에 넣기"""
+        if path_obj is None:
+            return
+        path = Path(path_obj)
+        if path.suffix.lower() not in ALLOWED_IMAGE_EXTS:
+            return
+
+        if not self._is_after_last_processed(path):
+            return
+        if path.name in self.session_processed_images:
+            return
+        self.pending_images.append(path)
+
+        if not (self._backlog_thread and self._backlog_thread.isRunning()):
+            self._drain_pending_queue()
+
+    def _drain_pending_queue(self):
+        """큐에 쌓인 신규 이미지를 순차 처리"""
+        if self._is_processing_queue:
+            return
+        if self._backlog_thread and self._backlog_thread.isRunning():
+            return
+        self._is_processing_queue = True
+        try:
+            while self.pending_images:
+                path = self.pending_images.popleft()
+                if not isinstance(path, Path):
+                    path = Path(path)
+                if path.suffix.lower() not in ALLOWED_IMAGE_EXTS:
+                    continue
+                if path.name in self.session_processed_images:
+                    continue
+                self.process_single_image(path)
+        finally:
+            self._is_processing_queue = False
+
+    def _prepare_lot_from_csv(self, lot_number: str, attempt_value: int):
+        """Lot/Attempt 전환 시 초기화 처리 및 <Lot#.csv> 저장"""
+        lot_changed = (self.current_lot != lot_number)
+        attempt_changed = (
+            self.current_lot == lot_number
+            and self.current_attempt is not None
+            and self.current_attempt != attempt_value
+        )
+
+        # <Lot#.csv>는 'icing_info/lot details' 폴더에 저장
+        if self.lot_csv_path is None or lot_changed:
+            self.lot_csv_path = LOT_DETAILS_DIR / f"{lot_number}.csv"
+            self._csv_header_checked = False
+            self._reset_panel()
+            self.processed_images.clear()
+            self.session_processed_images.clear()
+
+        # Lot은 같고 Attempt만 다르면 같은 <Lot#.csv>에 계속 저장
+        elif attempt_changed:
+            self._reset_panel()
+            self.processed_images.clear()
+            self.session_processed_images.clear()
+
+        self.current_lot = lot_number
+        self.current_attempt = attempt_value
+
+    def _on_crop1_toggled(self, checked: bool):
+        """ROI 체크박스 ↔ 스핀박스 연동 토글"""
+        for s in (self.crop1_x, self.crop1_y, self.crop1_w, self.crop1_h):
+            s.setEnabled(bool(checked))
+
+        self.update_preview()
+
+    def process_single_image(self, img_path: Path):
+        """단일 이미지 처리 루틴 (파일명 파싱 → Lot/Attempt 상태 갱신 → 분류 → CSV 기록 → 장비 요약 → 미리보기·패널·상태 갱신 처리)"""
+        self.last_image_seen_at = time.monotonic()
+        try:
+            info = parse_filename(img_path.name)
+            lot_number = info['lot']
+            attempt_value = info['attempt']
+            img_name = img_path.name
+
+            if not self.current_equip:
+                self.current_equip = info['equip'] or None
+
+            self.device_info_box.setText(f"{info['equip']}_{info['lot']}_{info['process']}_{info['attempt']}")
+            self._prepare_lot_from_csv(lot_number, attempt_value)
+            starts = self._get_earliest_for(lot_number, attempt_value)
+
+            if img_name in self.processed_images:
+                return
+
+            # 여기부터 신규 이미지에 대한 실제 분류 판정
+            roi_rect = self._get_current_roi()
+            label, probs = self.classifier.predict(img_path, roi=roi_rect)
+            if label is None or probs is None:
+                self._set_status(f"오류: {img_name} 분류 실패")
+                self._mark_image_processed(img_name)
+                return
+
+            cur_dt = extract_image_datetime(img_path)
+            if isinstance(cur_dt, QDateTime) and cur_dt.isValid():
+                prev_start = starts.get(label)
+                if prev_start is None or cur_dt < prev_start:
+                    starts[label] = cur_dt
+            else:
+                cur_dt = None
+
+            row = [img_name, attempt_value, label]
+            row.extend([f"{p:.4f}" for p in probs])
+            self.save_csv(row)
+            self._update_equip_summary(info, starts, img_name, cur_dt)
+
+            if cur_dt and cur_dt.isValid():
+                old = _qdatetime_to_datetime(self.last_processed_dt) if self.last_processed_dt else None
+                new = _qdatetime_to_datetime(cur_dt)
+                if new is not None and (old is None or new > old):
+                    self.last_processed_dt = cur_dt
+
+            latest_img = safe_image_load(str(img_path), as_gray=False)
+            if latest_img is not None:
+                self.preview_label.show_image(latest_img, filename=img_name, roi=roi_rect)
+            else:
+                self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
+
+            self.panel_canvas.update_panel(img_name, probs, label, starts, cur_dt)
+            self._set_status(f"처리됨: {img_name} → {label}")
+            self._mark_image_processed(img_name)
+        except Exception as e:
+            self._set_status(f"오류: {e}")
+
+    def save_csv(self, row, max_retries=5, delay=0.2):
+        """<Lot#.csv>에 정보 저장 (Lot 변경 시마다 다른 파일로 저장)"""
+        if not self.lot_csv_path:
+            return False
+        attempt = 0
+        while attempt < max_retries:
+            try:
+                header_exists = self.lot_csv_path.exists()
+                with open(self.lot_csv_path, 'a', newline='', encoding='utf-8-sig') as f:
+                    writer = csv.writer(f)
+                    if not header_exists:
+                        writer.writerow(self.csv_header)
+                    writer.writerow(row)
+                return True
+            except Exception:
+                attempt += 1
+                time.sleep(delay)
+        return False
+
+    def _mark_image_processed(self, filename: str):
+        """현재 세션/Lot에서 이미 처리한 이미지명 기록"""
+        if not filename:
+            return
+        self.processed_images.add(filename)
+        self.session_processed_images.add(filename)
+
+    def update_preview(self):
+        """이미지 미리보기 / 상부 텍스트 갱신 (최신파일 기준)"""
+        try:
+            cands = [p for p in IMG_INPUT_DIR.iterdir() if p.suffix.lower() in ALLOWED_IMAGE_EXTS]
+            if not cands:
+                self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
+                return
+            latest = max(cands, key=lambda p: p.stat().st_mtime)
+            img = safe_image_load(str(latest), as_gray=False)
+            if img is None:
+                self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
+                return
+            self.preview_label.show_image(img, filename=latest.name, roi=self._get_current_roi())
+        except Exception:
+            self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
+
+    def _init_device_info_from_last_image(self):
+        """GUI 최초 실행 시 최신 이미지명으로 공정 정보 텍스트 초기화"""
+        if self.device_info_box.text():
+            return
+        try:
+            candidates = [p for p in IMG_INPUT_DIR.iterdir() if p.suffix.lower() in ALLOWED_IMAGE_EXTS]
+        except Exception:
+            return
+        if not candidates:
+            return
+        try:
+            latest = max(candidates, key=lambda p: p.stat().st_mtime)
+            info = parse_filename(latest.name)
+            self.current_equip = info['equip'] or None
+            self.device_info_box.setText(f"{info['equip']}_{info['lot']}_{info['process']}_{info['attempt']}")
+            # 장비명이 결정되면 요약 CSV에서 이전 상태 복원
+            self._load_equip_summary_from_csv()
+        except Exception:
+            return
+
+    def start_realtime(self):
+        """실시간 분류 시작 (백로그 → 라이브 테일 순)"""
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.pending_images.clear()
+        self._is_processing_queue = False
+        self.directory_watcher.start()
+        self.tail_timer.start()
+
+        now = time.monotonic()
+        self.last_image_seen_at = now
+        self._no_image_grace_until = now + 3.0
+
+        # 백로그
+        backlog: list[Path] = []
+        try:
+            for p in IMG_INPUT_DIR.iterdir():
+                if p.suffix.lower() not in ALLOWED_IMAGE_EXTS:
+                    continue
+                if not self._is_after_last_processed(p):
+                    continue
+                if p.name in self.session_processed_images:
+                    continue
+                backlog.append(p)
+        except Exception:
+            backlog = []
+
+        self._start_backlog_feeder(backlog)
+        self._set_status("실시간 분류 시작")
+
+    def stop_realtime(self):
+        """실시간 분류 중지"""
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        if self.tail_timer.isActive():
+            self.tail_timer.stop()
+        self.directory_watcher.stop()
+        self.pending_images.clear()
+        self._is_processing_queue = False
+        try:
+            if self._backlog_feeder:
+                self._backlog_feeder.stop()
+            if self._backlog_thread and self._backlog_thread.isRunning():
+                self._backlog_thread.quit()
+                self._backlog_thread.wait(2000)
+        except Exception:
+            pass
+        self._set_status("- 중지 -")
+
+    def _start_backlog_feeder(self, backlog):
+        """시작 시점에 남아 있는 백로그 이미지를 별도 스레드로 순차 처리"""
+        if not backlog:
+            self._set_status("백로그 없음. 라이브 감시 시작.", hold_s=3.0)
+            return
+        if self._backlog_thread and self._backlog_thread.isRunning():
+            return
+        self._backlog_thread = QThread()
+        self._backlog_feeder = BacklogFeeder(backlog)
+        self._backlog_feeder.moveToThread(self._backlog_thread)
+        self._backlog_thread.started.connect(self._backlog_feeder.run)
+        self._backlog_feeder.next_image.connect(self.process_single_image)
+        self._backlog_feeder.finished.connect(self._on_backlog_finished)
+        self._backlog_feeder.finished.connect(self._backlog_thread.quit)
+        self._backlog_thread.finished.connect(self._backlog_thread.deleteLater)
+        self._backlog_thread.finished.connect(lambda: setattr(self, "_backlog_thread", None))
+        self._backlog_thread.destroyed.connect(lambda: setattr(self, "_backlog_thread", None))
+        self._backlog_feeder.finished.connect(lambda: setattr(self, "_backlog_feeder", None))
+        self._backlog_thread.finished.connect(self._drain_pending_queue)
+        self._backlog_thread.start()
+        self._set_status(f"백로그 처리 시작: {len(backlog)}장")
+
+    @Slot()
+    def _on_backlog_finished(self):
+        self._set_status("백로그 처리 완료 → 실시간 감시 중")
+        self._drain_pending_queue()
+
+    def closeEvent(self, event):
+        """메인 윈도우 종료 시 현재 설정을 .ini에 자동 저장"""
+        try:
+            self.stop_realtime()
+            self.save_options()
+        except Exception:
+            pass
+        finally:
+            super().closeEvent(event)
+
+def main():
+    app = QApplication(sys.argv)
+    gui = IcingClassificationGUI()
+    gui.show()
+    if gui.auto_start_on_launch:
+        gui.start_realtime()
+    sys.exit(app.exec())
+
+
+if __name__ == '__main__':
+    main()
