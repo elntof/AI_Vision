@@ -1,7 +1,7 @@
 import os
 import sys
 from pathlib import Path
-from PIL import Image, ImageQt
+from PIL import Image, ImageQt, ImageDraw, ImageFont
 from datetime import datetime
 from PySide6.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QLabel, QHBoxLayout, QSpinBox,
@@ -447,6 +447,7 @@ class ImageSaverThread(QThread):
     update_status = Signal(str)
     update_preview = Signal()
     update_device_name = Signal(str)
+    allowed_state_changed = Signal(bool)
 
     def __init__(self, source_file, output_folder, crop_rect, get_format, get_quality, get_interval, get_max_files, get_allowed_process_rule):
         """이미지 저장에 필요한 파라미터(파일 경로, 형식, 크롭 영역 등)를 받으며 쓰레드 객체 초기화"""
@@ -462,6 +463,7 @@ class ImageSaverThread(QThread):
         self.running = False
         self._last_mtime = None
         self.csv_tracker = CsvTracker()
+        self._last_allowed_state = None
         self.setPriority(QThread.LowestPriority)
 
     def run(self):
@@ -511,7 +513,14 @@ class ImageSaverThread(QThread):
 
                 status_text = csv_row_info.get("status_text", "") or "UNKNOWN"
 
-                if not self._is_allowed_process(status_text):
+                is_allowed = self._is_allowed_process(status_text)
+
+                if is_allowed != self._last_allowed_state:
+                    # 허용/비허용 상태 전환 시 GUI에 알림 (미리보기 상태 업데이트용)
+                    self.allowed_state_changed.emit(is_allowed)
+                    self._last_allowed_state = is_allowed
+
+                if not is_allowed:
                     allowed_desc = self._describe_allowed_processes()
                     self.update_status.emit(f'저장 허용 공정이 아님 (현재: {status_text}, 허용: {allowed_desc})')
                     if not self._wait_until_next_change(poll_ms=200):
@@ -618,7 +627,6 @@ class ImageSaverThread(QThread):
             self.msleep(int(poll_ms))
         return False
 
-
 class PreviewLabel(QLabel):
     """QLabel: 이미지 미리보기(크롭 영역 표시) 클래스"""
 
@@ -628,12 +636,19 @@ class PreviewLabel(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.crop_rect = (0, 0, 100, 100)
         self.img = None
+        self.show_crop = True
 
     def set_image(self, pil_img, crop_rect=None):
         """PIL 이미지를 QLabel에 세팅 및 crop 정보 갱신"""
         self.img = pil_img.convert('L')
-        if crop_rect:
+
+        if crop_rect is not None:
             self.crop_rect = crop_rect
+            self.show_crop = True
+        else:
+            # None 이면 사각형 숨기기
+            self.show_crop = False
+
         self.update()
 
     def paintEvent(self, event):
@@ -651,18 +666,20 @@ class PreviewLabel(QLabel):
             offset_y = (h - img_h * scale) / 2
             painter = QPainter(self)
             painter.drawPixmap(int(offset_x), int(offset_y), scaled)
-            cx, cy, cw, ch = self.crop_rect
-            pen = QPen(QColor(255, 0, 0), 2)
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRect(
-                int(offset_x + cx * scale),
-                int(offset_y + cy * scale),
-                int(cw * scale),
-                int(ch * scale)
-            )
-            painter.end()
 
+            # show_crop이 True일 때만 크롭 사각형 그림
+            if self.show_crop:
+                cx, cy, cw, ch = self.crop_rect
+                pen = QPen(QColor(255, 0, 0), 2)
+                painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(
+                    int(offset_x + cx * scale),
+                    int(offset_y + cy * scale),
+                    int(cw * scale),
+                    int(ch * scale)
+                )
+            painter.end()
 
 class MainWindow(QWidget):
     """메인 GUI 윈도우 클래스 (설정 로드/저장, 사용자 입력 위젯, 이미지 저장 스레드 관리 등 주요 UI 관리)"""
@@ -703,6 +720,15 @@ class MainWindow(QWidget):
         self.stop_button = QPushButton('종료')
         self.stop_button.setEnabled(False)
         self.save_opt_button = QPushButton('설정 저장')
+
+        # 허용 공정 여부 관련 상태 (비허용 10초 경과 시 프리뷰 대체용)
+        self.disallowed_since = None
+        self.placeholder_active = False
+        self.last_preview_size = None
+        self.disallowed_timer = QTimer(self)
+        self.disallowed_timer.setInterval(1000)
+        self.disallowed_timer.timeout.connect(self._on_disallowed_timer)
+        self.disallowed_timer.start()
 
         # 윈도우 상부 텍스트 박스(장비/시작/종료/설정) 설정
         self.device_edit = QLineEdit()
@@ -930,6 +956,7 @@ class MainWindow(QWidget):
         self.image_thread.update_status.connect(self.status_label.setText)
         self.image_thread.update_preview.connect(self.update_preview)
         self.image_thread.update_device_name.connect(self.update_device_name_from_thread)
+        self.image_thread.allowed_state_changed.connect(self.on_allowed_state_changed)
         self.image_thread.start()
 
     def handle_auto_start(self):
@@ -998,6 +1025,8 @@ class MainWindow(QWidget):
 
     def update_preview(self):
         """소스 이미지를 불러와서 프리뷰와 크롭 미리보기 업데이트"""
+        # 허용 공정으로 복귀하면 대체 이미지를 제거하고 최신 이미지를 표시
+        self.placeholder_active = False
         if not self.source_file.exists():
             self.preview_label.clear()
             self.preview_label.setText('이미지 없음')
@@ -1007,11 +1036,59 @@ class MainWindow(QWidget):
             if img_gray is None:
                 raise RuntimeError("이미지 읽기 실패(쓰기중/락)")
             pil_img = Image.fromarray(img_gray)
+            self.last_preview_size = pil_img.size
             crop_rect = self.get_crop_rect()
             self.preview_label.set_image(pil_img, crop_rect)
         except Exception as e:
             self.preview_label.clear()
             self.preview_label.setText(str(e))
+
+    def _on_disallowed_timer(self):
+        """허용 공정이 아닌 상태가 10초 이상 지속되면 프리뷰를 경고 화면으로 교체"""
+        if self.disallowed_since is None or self.placeholder_active:
+            return
+
+        if time.time() - self.disallowed_since >= 10:
+            self._show_disallowed_placeholder()
+
+    def _show_disallowed_placeholder(self):
+        """검은 배경 위에 안내 문구를 추가한 대체 프리뷰 생성"""
+        size = self.last_preview_size or (self.preview_label.width() or 250, self.preview_label.height() or 250)
+        placeholder = Image.new("L", size, color=0)
+        draw = ImageDraw.Draw(placeholder)
+        message = "저장 허용 공정이 아님"
+
+        font_size = max(18, size[1] // 12)
+        try:
+            font = ImageFont.truetype("malgun.ttf", font_size)
+        except Exception:
+            font = ImageFont.load_default()
+
+        # 글자 크기 계산
+        try:
+            text_bbox = draw.textbbox((0, 0), message, font=font)
+            text_w = text_bbox[2] - text_bbox[0]
+            text_h = text_bbox[3] - text_bbox[1]
+        except AttributeError:
+            text_w, text_h = draw.textsize(message, font=font)
+
+        x = (size[0] - text_w) / 2
+        y = (size[1] - text_h) / 2
+        draw.text((x, y), message, fill=255, font=font)
+
+        # 검은 화면일 때 Crop 사각 박스 제거
+        self.preview_label.set_image(placeholder, crop_rect=None)
+        self.placeholder_active = True
+
+    def on_allowed_state_changed(self, is_allowed):
+        """허용/비허용 전환 시 타이머와 프리뷰 상태를 관리"""
+        if is_allowed:
+            self.disallowed_since = None
+            if self.placeholder_active:
+                self.update_preview()
+        else:
+            if self.disallowed_since is None:
+                self.disallowed_since = time.time()
 
     def save_options(self):
         """GUI 옵션을 설정 파일에 저장"""
