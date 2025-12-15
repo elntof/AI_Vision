@@ -64,6 +64,9 @@ NO_IMAGE_PLACEHOLDER_TEXT = "신규 이미지 없음"
 # 감시 대상 이미지 확장자 목록
 ALLOWED_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
 
+# 분류/ 판정 허용 공정
+ALLOWED_PULLER_MODES = {"BEFOFEED"}
+
 # ViT 분류 파라미터
 MODEL_NAME = "vit_small_patch16_224"
 CLASS_NAMES = ["Melted", "Icing", "Iced"]
@@ -239,7 +242,8 @@ def compute_lead_minutes(start_a: QDateTime | None, start_b: QDateTime | None) -
     dt_b = _qdatetime_to_datetime(start_b)
     if dt_a is None or dt_b is None or dt_b < dt_a:
         return ""
-    return f"{int(round((dt_b - dt_a).total_seconds() / 60.0))}"
+    minutes = (dt_b - dt_a).total_seconds() / 60.0
+    return f"{minutes:.1f}"
 
 def compute_current_lead_minutes(start_dt: QDateTime | None, cur_dt: QDateTime | None) -> str:
     """특정 시작 시각 대비 현재 시각 리드 타임(분)"""
@@ -247,7 +251,8 @@ def compute_current_lead_minutes(start_dt: QDateTime | None, cur_dt: QDateTime |
     cur = _qdatetime_to_datetime(cur_dt)
     if base is None or cur is None or cur < base:
         return ""
-    return f"{int(round((cur - base).total_seconds() / 60.0))}"
+    minutes = (cur - base).total_seconds() / 60.0
+    return f"{minutes:.1f}"
 
 class ViTClassifier:
     """학습된 ViT 모델을 사용한 3 클래스 분류기"""
@@ -277,42 +282,48 @@ class ViTClassifier:
         self.transform_gray = T.Compose([
             T.Resize((img_size, img_size)),
             T.ToTensor(),
+            # GRAY 1채널을 3채널로 복제
             T.Lambda(lambda t: t.expand(3, -1, -1)),
             T.Normalize(mean=[0.485, 0.456, 0.406],
                         std=[0.229, 0.224, 0.225]),
         ])
 
     @staticmethod
-    def _crop_with_roi(img: Image.Image, roi: tuple[int, int, int, int] | None):
-        if roi is None:
-            return img
-        W, H = img.size
-        clamped = clamp_roi_to_shape(roi, W, H)
+    def _crop_with_roi(img_np: np.ndarray, roi: tuple[int, int, int, int] | None):
+        """NumPy 이미지에 대해 ROI crop"""
+        if img_np is None or roi is None:
+            return img_np
+        h, w = img_np.shape[:2]
+        clamped = clamp_roi_to_shape(roi, w, h)
         if clamped is None:
-            return img
-        x, y, w, h = clamped
-        return img.crop((x, y, x + w, y + h))
+            return img_np
+        x, y, rw, rh = clamped
+        return img_np[y:y+rh, x:x+rw]
 
     def predict(self, image_path: Path, roi: tuple[int, int, int, int] | None = None):
         """이미지 경로를 입력받아 (라벨, 확률 리스트)를 반환"""
         try:
-            with Image.open(image_path) as img:
-                img = ImageOps.exif_transpose(img)
+            # 안전 로딩 (권한/락 문제 발생 시 0.2초 간격 재시도)
+            img_np = safe_image_load(str(image_path), as_gray=True, max_retries=5, delay=0.2)
+            if img_np is None:
+                raise OSError(f"이미지 로드 실패: {image_path}")
 
-                if img.mode != "L":
-                    img = img.convert("L")
+            img_np = self._crop_with_roi(img_np, roi)
 
-                img = self._crop_with_roi(img, roi)
-                tensor = self.transform_gray(img).unsqueeze(0).to(self.device)
+            # safe_image_load(as_gray=True)이므로 항상 그레이스케일 2D 배열이라고 가정
+            pil_img = Image.fromarray(img_np)   # mode 'L'
+
+            if pil_img.mode != "L":
+                pil_img = pil_img.convert("L")
+
+            tensor = self.transform_gray(pil_img).unsqueeze(0).to(self.device)
 
             with torch.no_grad():
                 logits = self.model(tensor)
                 raw_probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
 
-            # GUI/패널/CLASS_NAMES 순서: [Melted, Icing, Iced]
             if raw_probs.shape[0] == 3:
-                probs = np.array(
-                    [raw_probs[2], raw_probs[1], raw_probs[0]], dtype=np.float32)
+                probs = np.array([raw_probs[2], raw_probs[1], raw_probs[0]], dtype=np.float32)
             else:
                 probs = raw_probs.astype(np.float32)
 
@@ -464,18 +475,17 @@ class ClassificationPanel(QWidget):
         super().__init__(parent)
         self.setFixedSize(PANEL_W_PX, PANEL_H_PX)
         self.setMinimumSize(PANEL_W_PX, PANEL_H_PX)
-        self.filename = ""
+        self.header_text = ""
         self.probs = [0.0 for _ in CLASS_NAMES]
         self.pred_label = ""
         self.earliest: dict[str, QDateTime | None] = {name: None for name in CLASS_NAMES}
         self.current_dt: QDateTime | None = None
         self.setAutoFillBackground(False)
 
-    def update_panel(self, filename: str, probs, pred_label: str,
-                     earliest: dict, current_dt: QDateTime | None):
+    def update_panel(self, header_text: str, probs, pred_label: str, earliest: dict, current_dt: QDateTime | None):
         """패널 내용(파일명, 판정 확률, 각 단계 시작 시각, 현재시각)을 갱신"""
         try:
-            self.filename = filename or ""
+            self.header_text = header_text or ""
             self.pred_label = pred_label or ""
 
             if probs is None:
@@ -508,15 +518,15 @@ class ClassificationPanel(QWidget):
         painter.fillRect(panel_rect, QColor("white"))
 
         # 표시할 내용이 없으면 "결과 없음"
-        has_filename = bool(self.filename)
+        has_header = bool(self.header_text)
         has_probs = any(self.probs)
-        if not has_filename and not has_probs:
+        if not has_header and not has_probs:
             painter.setPen(QPen(Qt.gray))
             painter.drawText(panel_rect, Qt.AlignCenter, "결과 없음")
             painter.end()
             return
 
-        # 상단 파일명 + 리드타임 텍스트 영역
+        # 상단 기본 정보 + 리드타임 텍스트 영역
         outer = self.OUTER_MARGIN
         line_h = self.HEADER_LINE_HEIGHT
 
@@ -528,7 +538,7 @@ class ClassificationPanel(QWidget):
         title_font.setBold(True)
         painter.setFont(title_font)
         painter.setPen(QPen(Qt.black))
-        painter.drawText(int(header_x), int(header_y + line_h * 0), self.filename)
+        painter.drawText(int(header_x), int(header_y + line_h * 0), self.header_text)
 
         # 리드타임 계산
         lead_font = QFont(self.font())
@@ -641,6 +651,7 @@ class IcingClassificationGUI(QWidget):
         self._status_text: str = ""
         self._status_hold_until: float = 0.0
         self._no_image_grace_until: float = 0.0
+        self.last_image_seen_at: float = 0.0
 
         # 텍스트 박스 ('장비명_Lot#_Process')
         self.device_info_box = QLineEdit()
@@ -660,12 +671,20 @@ class IcingClassificationGUI(QWidget):
         self.csv_header = ['이미지 파일명', 'Attempt', '예측 라벨', 'Melted', 'Icing', 'Iced']
 
         self.processed_images: set[str] = set()
-        self.session_processed_images: set[str] = set()
         self.pending_images: deque[Path] = deque()
         self._is_processing_queue = False
-        self.current_process = None
-        self._csv_header_checked = False
 
+        # 허용 모드/리드타임/피딩 타임 관리
+        self.ALLOWED_PULLER_MODES = set(ALLOWED_PULLER_MODES)
+        self.no_new_image_grace_s = 9.0
+        self._feeding_logged_key: tuple[str, int, str] | None = None
+        self.last_allowed_image_info: dict[str, object] = {"equip": None, "lot": None, "attempt": None, "name": None, "dt": None}
+
+        # 연속 판정(5회) 기반 시작 시각 확정용 상태
+        self._streak_label: str | None = None
+        self._streak_count: int = 0
+        self._streak_start_dt: QDateTime | None = None
+        
         self.classifier = ViTClassifier(MODEL_NAME, CHECKPOINT_PATH, CLASS_NAMES, img_size=IMG_SIZE)
 
         # 채택 영역 설정의 기본값 지정
@@ -922,6 +941,32 @@ class IcingClassificationGUI(QWidget):
         key = (lot_number, int(attempt_value))
         return self.earliest_by_lot_attempt.setdefault(key, {name: None for name in CLASS_NAMES})
 
+    def _reset_label_streak(self):
+        """연속 판정 카운터 초기화"""
+        self._streak_label = None
+        self._streak_count = 0
+        self._streak_start_dt = None
+
+    def _reset_feeding_state(self):
+        """피딩 타임 기록 상태 초기화"""
+        self._feeding_logged_key = None
+        self.last_allowed_image_info = {"equip": None, "lot": None, "attempt": None, "name": None, "dt": None}
+
+    def _update_label_streak(self, label: str, cur_dt: QDateTime | None) -> QDateTime | None:
+        """동일 판정 5회 연속 시 최초 시각 반환"""
+        if label != self._streak_label:
+            self._streak_label = label
+            self._streak_count = 1
+            self._streak_start_dt = cur_dt if isinstance(cur_dt, QDateTime) and cur_dt.isValid() else None
+        else:
+            self._streak_count += 1
+            if self._streak_start_dt is None and isinstance(cur_dt, QDateTime) and cur_dt.isValid():
+                self._streak_start_dt = cur_dt
+
+        if self._streak_count >= 5 and isinstance(self._streak_start_dt, QDateTime) and self._streak_start_dt.isValid():
+            return self._streak_start_dt
+        return None
+
     def _reset_panel(self):
         """Lot / Attempt 전환 시 패널(리드타임/파일명 등) 초기화"""
         empty_earliest = {name: None for name in CLASS_NAMES}
@@ -942,13 +987,20 @@ class IcingClassificationGUI(QWidget):
         try:
             with open(self.equip_csv_path, "r", encoding="utf-8-sig", newline="") as f:
                 reader = csv.reader(f)
-                header = next(reader, None)
+                header = next(reader, None) or []
+                idx_map = {name: i for i, name in enumerate(header)}
                 for row in reader:
-                    if not row or len(row) < 10:
+                    if not row:
                         continue
-                    equip, lot, attempt_str = row[0], row[1], row[2]
-                    melted_str, icing_str, iced_str = row[3], row[4], row[5]
-                    last_img_name, last_time_str = row[8], row[9]
+                    def _get(name: str, fallback_idx: int | None = None):
+                        idx = idx_map.get(name, fallback_idx)
+                        if idx is None:
+                            return ""
+                        return row[idx] if idx < len(row) else ""
+
+                    equip, lot, attempt_str = _get("Equip", 0), _get("Lot", 1), _get("Attempt", 2)
+                    melted_str, icing_str, iced_str = _get("MeltedTime", 3), _get("IcingTime", 4), _get("IcedTime", 5)
+                    last_img_name, last_time_str = _get("LastImageName", 8), _get("LastImageTime", 9)
 
                     if equip and self.current_equip and equip != self.current_equip:
                         continue
@@ -1011,18 +1063,20 @@ class IcingClassificationGUI(QWidget):
         if iced_dt and iced_dt.isValid():
             starts["Iced"] = iced_dt
 
-        # device_info_box를 마지막 이미지 기준으로 맞추기
+        # device_info_box 및 패널 상단 기본 정보 복원
+        header_text = ""
         if last_img_name:
             info = parse_filename(last_img_name)
             if info['equip'] and info['lot'] and info['process']:
-                self.device_info_box.setText(f"{info['equip']}_{info['lot']}_{info['process']}_{info['attempt']}")
+                base_info = f"{info['equip']}_{info['lot']}_{info['process']}_{info['attempt']}"
+                self.device_info_box.setText(base_info)
+                header_text = f"[기본 정보]  {base_info}"
 
         # 패널 복원
-        self.panel_canvas.update_panel(last_img_name, None, "", starts, QDateTime.currentDateTime())
+        self.panel_canvas.update_panel(header_text, None, "", starts, QDateTime.currentDateTime())
 
-    def _update_equip_summary(self, info: dict, starts: dict[str, QDateTime | None],
-                              last_img_name: str, last_img_dt: QDateTime | None):
-        """<장비#.csv> 구성: Lot/Attempt 별 1행으로 Summary (Melted/Icing/Iced 시각, 리드타임, 마지막 이미지 정보 저장)"""
+    def _update_equip_summary(self, info: dict, starts: dict[str, QDateTime | None], last_img_name: str, last_img_dt: QDateTime | None, feeding_dt: QDateTime | None = None):
+        """<장비#.csv> 구성: Lot/Attempt 별 1행으로 Summary (Melted/Icing/Iced/Feeding 시각, 리드타임, 마지막 이미지 정보 저장)"""
         equip = info.get("equip") or ""
         lot = info.get("lot") or ""
         attempt_val = int(info.get("attempt") or 0)
@@ -1035,48 +1089,73 @@ class IcingClassificationGUI(QWidget):
         melted_dt = starts.get("Melted")
         icing_dt = starts.get("Icing")
         iced_dt = starts.get("Iced")
+        feeding_dt = feeding_dt if isinstance(feeding_dt, QDateTime) and feeding_dt.isValid() else None
 
         melted_str = self._qdatetime_to_str(melted_dt)
         icing_str = self._qdatetime_to_str(icing_dt)
         iced_str = self._qdatetime_to_str(iced_dt)
+        feeding_str = self._qdatetime_to_str(feeding_dt)
 
         melted_icing = compute_lead_minutes(melted_dt, icing_dt)
         icing_iced = compute_lead_minutes(icing_dt, iced_dt)
+        iced_feeding = compute_lead_minutes(iced_dt, feeding_dt)
 
         last_img_time_str = self._qdatetime_to_str(last_img_dt)
 
-        new_row = [equip, lot, str(attempt_val), melted_str, icing_str, iced_str, melted_icing, icing_iced, last_img_name or "", last_img_time_str]
+        new_row = [equip, lot, str(attempt_val), melted_str, icing_str, iced_str, feeding_str, melted_icing, icing_iced, iced_feeding, last_img_name or "", last_img_time_str]
 
-        header = ["Equip", "Lot", "Attempt", "MeltedTime", "IcingTime", "IcedTime", "MeltedToIcingMin", "IcingToIcedMin", "LastImageName", "LastImageTime"]
+        header = ["Equip", "Lot", "Attempt", "MeltedTime", "IcingTime", "IcedTime", "FeedingTime", "MeltedToIcing(min)", "IcingToIced(min)", "IcedToFeeding(min)", "LastImageName", "LastImageTime"]
 
-        rows: list[list[str]] = []
+        rows_dict: dict[tuple[str, int], list[str]] = {}
         if equip_csv_path.exists():
             try:
                 with open(equip_csv_path, "r", encoding="utf-8-sig", newline="") as f:
                     reader = csv.reader(f)
-                    _old_header = next(reader, None)
+                    _old_header = next(reader, None) or []
+                    idx_map = {name: i for i, name in enumerate(_old_header)}
+
                     for row in reader:
                         if not row:
                             continue
-                        rows.append(row)
+
+                        def _get(name: str):
+                            idx = idx_map.get(name)
+                            if idx is None or idx >= len(row):
+                                return ""
+                            return row[idx]
+
+                        equip_old = _get("Equip")
+                        lot_old = _get("Lot")
+                        attempt_old = _get("Attempt")
+                        melted_old = _get("MeltedTime")
+                        icing_old = _get("IcingTime")
+                        iced_old = _get("IcedTime")
+                        feeding_old = _get("FeedingTime")
+
+                        melted_dt_old = self._str_to_qdatetime(melted_old)
+                        icing_dt_old = self._str_to_qdatetime(icing_old)
+                        iced_dt_old = self._str_to_qdatetime(iced_old)
+                        feeding_dt_old = self._str_to_qdatetime(feeding_old)
+
+                        melted_icing_old = _get("MeltedToIcing(min)") or compute_lead_minutes(melted_dt_old, icing_dt_old)
+                        icing_iced_old = _get("IcingToIced(min)") or compute_lead_minutes(icing_dt_old, iced_dt_old)
+                        iced_feeding_old = _get("IcedToFeeding(min)") or compute_lead_minutes(iced_dt_old, feeding_dt_old)
+                        last_img_old = _get("LastImageName")
+                        last_time_old = _get("LastImageTime")
+
+                        try:
+                            attempt_key = int(attempt_old)
+                        except Exception:
+                            attempt_key = 0
+
+                        rows_dict[(lot_old, attempt_key)] = [equip_old, lot_old, str(attempt_key), melted_old, icing_old, iced_old, feeding_old,
+                                                             melted_icing_old, icing_iced_old, iced_feeding_old, last_img_old, last_time_old]
             except Exception as e:
                 print(f"⚠️ 장비 요약 CSV 읽기 실패: {e}")
 
         # Lot/Attempt 기준 upsert
-        replaced = False
-        for i, row in enumerate(rows):
-            if len(row) >= 3 and row[1] == lot:
-                try:
-                    old_attempt = int(row[2])
-                except Exception:
-                    old_attempt = 0
-                if old_attempt == attempt_val:
-                    rows[i] = new_row
-                    replaced = True
-                    break
-
-        if not replaced:
-            rows.append(new_row)
+        rows_dict[(lot, attempt_val)] = new_row
+        rows = list(rows_dict.values())
 
         try:
             with open(equip_csv_path, "w", encoding="utf-8-sig", newline="") as f:
@@ -1089,18 +1168,46 @@ class IcingClassificationGUI(QWidget):
     def _poll_latest_image(self):
         """마지막 이미지 처리 후 9초 이상 새 이미지가 없으면 '신규 이미지 없음' 표시"""
         now = time.monotonic()
-        last_seen = getattr(self, 'last_image_seen_at', 0.0)
+        last_seen = self.last_image_seen_at
 
-        if now < getattr(self, "_status_hold_until", 0.0):
+        if now < self._status_hold_until:
             return
-        if now < getattr(self, "_no_image_grace_until", 0.0):
+        if now < self._no_image_grace_until:
             return
         if self.pending_images or (self._backlog_thread and self._backlog_thread.isRunning()):
             return
 
-        if now - last_seen > 9.0:
+        if now - last_seen > self.no_new_image_grace_s:
             self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
             self._set_status("신규 이미지 없음 (폴더 감시 중)", hold_s=0.0)
+            self._record_feeding_time()
+
+    def _record_feeding_time(self):
+        """허용 공정 이미지 부재 시 FeedingTime/IcedToFeedingMin 기록"""
+        info = self.last_allowed_image_info
+        lot = info.get("lot") if isinstance(info, dict) else None
+        attempt_val = info.get("attempt") if isinstance(info, dict) else None
+        last_img_name = info.get("name") if isinstance(info, dict) else None
+        feeding_dt = info.get("dt") if isinstance(info, dict) else None
+        equip = info.get("equip") if isinstance(info, dict) else None
+
+        if lot is None or attempt_val is None:
+            return
+        if not isinstance(feeding_dt, QDateTime) or not feeding_dt.isValid():
+            return
+
+        equip_val = equip or self.current_equip
+        if not equip_val:
+            return
+
+        key = (lot, int(attempt_val), last_img_name or "")
+        if self._feeding_logged_key == key:
+            return
+
+        starts = self._get_earliest_for(lot, int(attempt_val))
+        self._update_equip_summary({"equip": equip_val, "lot": lot, "attempt": attempt_val},
+                                   starts, last_img_name or "", feeding_dt, feeding_dt)
+        self._feeding_logged_key = key
 
     def _main_tick(self):
         """타이머 통합 틱: 대기 중인 이미지 처리 + '신규 이미지 없음' 상태 갱신"""
@@ -1135,7 +1242,7 @@ class IcingClassificationGUI(QWidget):
 
         if not self._is_after_last_processed(path):
             return
-        if path.name in self.session_processed_images:
+        if path.name in self.processed_images:
             return
         self.pending_images.append(path)
 
@@ -1156,7 +1263,7 @@ class IcingClassificationGUI(QWidget):
                     path = Path(path)
                 if path.suffix.lower() not in ALLOWED_IMAGE_EXTS:
                     continue
-                if path.name in self.session_processed_images:
+                if path.name in self.processed_images:
                     continue
                 self.process_single_image(path)
         finally:
@@ -1174,16 +1281,19 @@ class IcingClassificationGUI(QWidget):
         # <Lot#.csv>는 'icing_info/lot details' 폴더에 저장
         if self.lot_csv_path is None or lot_changed:
             self.lot_csv_path = LOT_DETAILS_DIR / f"{lot_number}.csv"
-            self._csv_header_checked = False
             self._reset_panel()
             self.processed_images.clear()
-            self.session_processed_images.clear()
+            # Lot이 바뀔 때 연속 라벨 카운터 및 피딩 타임 기록 상태 초기화
+            self._reset_label_streak()
+            self._reset_feeding_state()
 
         # Lot은 같고 Attempt만 다르면 같은 <Lot#.csv>에 계속 저장
         elif attempt_changed:
             self._reset_panel()
             self.processed_images.clear()
-            self.session_processed_images.clear()
+            # Attempt가 바뀔 때 연속 라벨 카운터 및 피딩 타임 기록 상태 초기화
+            self._reset_label_streak()
+            self._reset_feeding_state()
 
         self.current_lot = lot_number
         self.current_attempt = attempt_value
@@ -1197,25 +1307,40 @@ class IcingClassificationGUI(QWidget):
 
     def process_single_image(self, img_path: Path):
         """단일 이미지 처리 루틴 (파일명 파싱 → Lot/Attempt 상태 갱신 → 분류 → CSV 기록 → 장비 요약 → 미리보기·패널·상태 갱신 처리)"""
-        self.last_image_seen_at = time.monotonic()
         try:
             info = parse_filename(img_path.name)
             lot_number = info['lot']
             attempt_value = info['attempt']
+            process_name = (info.get('process') or '').upper()
             img_name = img_path.name
 
             if not self.current_equip:
                 self.current_equip = info['equip'] or None
 
-            self.device_info_box.setText(f"{info['equip']}_{info['lot']}_{info['process']}_{info['attempt']}")
+            # 장비#_Lot#_Process_Attempt 기본 정보 문자열
+            base_info = f"{info['equip']}_{info['lot']}_{info['process']}_{info['attempt']}"
+            self.device_info_box.setText(base_info)
             self._prepare_lot_from_csv(lot_number, attempt_value)
             starts = self._get_earliest_for(lot_number, attempt_value)
 
             if img_name in self.processed_images:
                 return
 
-            # 여기부터 신규 이미지에 대한 실제 분류 판정
+            # 허용 공정 여부 확인
             roi_rect = self._get_current_roi()
+            if process_name not in self.ALLOWED_PULLER_MODES:
+                latest_img = safe_image_load(str(img_path), as_gray=False)
+                if latest_img is not None:
+                    self.preview_label.show_image(latest_img, filename=img_name, roi=roi_rect)
+                else:
+                    self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
+                self._set_status("지정된 Puller Mode Status가 아님.", hold_s=0.0)
+                self._mark_image_processed(img_name)
+                return
+
+            self.last_image_seen_at = time.monotonic()
+
+            # 여기부터 신규 이미지에 대한 실제 분류 판정
             label, probs = self.classifier.predict(img_path, roi=roi_rect)
             if label is None or probs is None:
                 self._set_status(f"오류: {img_name} 분류 실패")
@@ -1223,12 +1348,14 @@ class IcingClassificationGUI(QWidget):
                 return
 
             cur_dt = extract_image_datetime(img_path)
-            if isinstance(cur_dt, QDateTime) and cur_dt.isValid():
-                prev_start = starts.get(label)
-                if prev_start is None or cur_dt < prev_start:
-                    starts[label] = cur_dt
-            else:
+            if not (isinstance(cur_dt, QDateTime) and cur_dt.isValid()):
                 cur_dt = None
+
+            streak_dt = self._update_label_streak(label, cur_dt)
+            if streak_dt is not None:
+                prev_start = starts.get(label)
+                if prev_start is None or streak_dt < prev_start:
+                    starts[label] = streak_dt
 
             row = [img_name, attempt_value, label]
             row.extend([f"{p:.4f}" for p in probs])
@@ -1241,13 +1368,23 @@ class IcingClassificationGUI(QWidget):
                 if new is not None and (old is None or new > old):
                     self.last_processed_dt = cur_dt
 
+            self.last_allowed_image_info = {
+                "equip": self.current_equip or info.get("equip"),
+                "lot": lot_number,
+                "attempt": attempt_value,
+                "name": img_name,
+                "dt": cur_dt,
+            }
+            self._feeding_logged_key = None
+
             latest_img = safe_image_load(str(img_path), as_gray=False)
             if latest_img is not None:
                 self.preview_label.show_image(latest_img, filename=img_name, roi=roi_rect)
             else:
                 self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
 
-            self.panel_canvas.update_panel(img_name, probs, label, starts, cur_dt)
+            header_text = f"[기본 정보]  {base_info}"
+            self.panel_canvas.update_panel(header_text, probs, label, starts, cur_dt)
             self._set_status(f"처리됨: {img_name} → {label}")
             self._mark_image_processed(img_name)
         except Exception as e:
@@ -1277,7 +1414,6 @@ class IcingClassificationGUI(QWidget):
         if not filename:
             return
         self.processed_images.add(filename)
-        self.session_processed_images.add(filename)
 
     def update_preview(self):
         """이미지 미리보기 / 상부 텍스트 갱신 (최신파일 기준)"""
@@ -1324,6 +1460,9 @@ class IcingClassificationGUI(QWidget):
         self.directory_watcher.start()
         self.tail_timer.start()
 
+        self._reset_label_streak()
+        self._reset_feeding_state()
+
         now = time.monotonic()
         self.last_image_seen_at = now
         self._no_image_grace_until = now + 3.0
@@ -1336,7 +1475,7 @@ class IcingClassificationGUI(QWidget):
                     continue
                 if not self._is_after_last_processed(p):
                     continue
-                if p.name in self.session_processed_images:
+                if p.name in self.processed_images:
                     continue
                 backlog.append(p)
         except Exception:
