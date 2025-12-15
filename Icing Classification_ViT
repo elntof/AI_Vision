@@ -15,7 +15,7 @@ from torchvision import transforms as T
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox,
     QGroupBox, QSizePolicy, QLineEdit, QLayout, QCheckBox)
-from PySide6.QtCore import Qt, QTimer, QSettings, QThread, QObject, Signal, Slot, QDateTime
+from PySide6.QtCore import Qt, QTimer, QSettings, QThread, QObject, Signal, Slot, QDateTime, QRect
 from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QGuiApplication, QFont
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -480,7 +480,13 @@ class ClassificationPanel(QWidget):
         self.pred_label = ""
         self.earliest: dict[str, QDateTime | None] = {name: None for name in CLASS_NAMES}
         self.current_dt: QDateTime | None = None
+        self._show_completion_badge = False
         self.setAutoFillBackground(False)
+
+    def set_completion_badge(self, visible: bool):
+        """완료 배지 표시 설정"""
+        self._show_completion_badge = bool(visible)
+        self.update()
 
     def update_panel(self, header_text: str, probs, pred_label: str, earliest: dict, current_dt: QDateTime | None):
         """패널 내용(파일명, 판정 확률, 각 단계 시작 시각, 현재시각)을 갱신"""
@@ -612,6 +618,23 @@ class ClassificationPanel(QWidget):
             start_rect_top = int(boxes_top_y + side * 0.55)
             start_rect_h = int(side * 0.20)
             painter.drawText(int(x_left), start_rect_top, side, start_rect_h, Qt.AlignHCenter | Qt.AlignVCenter, start_str)
+
+        if self._show_completion_badge:
+            badge_w, badge_h = 54, 24
+            margin = 12
+            badge_x = panel_rect.right() - badge_w - margin
+            badge_y = panel_rect.top() + margin
+            badge_rect = QRect(int(badge_x), int(badge_y), int(badge_w), int(badge_h))
+
+            painter.setPen(Qt.NoPen)
+            painter.fillRect(badge_rect, QColor("#1e6bd6"))
+
+            badge_font = QFont(self.font())
+            badge_font.setPointSize(10)
+            badge_font.setBold(True)
+            painter.setFont(badge_font)
+            painter.setPen(QPen(Qt.white))
+            painter.drawText(badge_rect, Qt.AlignCenter, "완료")
 
         painter.end()
 
@@ -953,7 +976,8 @@ class IcingClassificationGUI(QWidget):
         self._feeding_logged_key = None
         self.last_allowed_image_info = {"equip": None, "lot": None, "attempt": None, "name": None, "dt": None}
         self.last_allowed_seen_at = 0.0
-        
+        self.panel_canvas.set_completion_badge(False)
+
     def _update_label_streak(self, label: str, cur_dt: QDateTime | None) -> QDateTime | None:
         """동일 판정 5회 연속 시 최초 시각 반환"""
         if label != self._streak_label:
@@ -973,6 +997,7 @@ class IcingClassificationGUI(QWidget):
         """Lot / Attempt 전환 시 패널(리드타임/파일명 등) 초기화"""
         empty_earliest = {name: None for name in CLASS_NAMES}
         self.panel_canvas.update_panel("", None, "", empty_earliest, None)
+        self.panel_canvas.set_completion_badge(False)
 
     def _load_equip_summary_from_csv(self):
         """<장비#.csv>를 기반으로 패널 정보 복원"""
@@ -1191,7 +1216,6 @@ class IcingClassificationGUI(QWidget):
             return
 
         if allowed_gap:
-            self._set_status("허용 공정 이미지 없음 (FeedingTime 기록)", hold_s=0.0)
             self._record_feeding_time()
 
     def _record_feeding_time(self):
@@ -1220,6 +1244,7 @@ class IcingClassificationGUI(QWidget):
         self._update_equip_summary({"equip": equip_val, "lot": lot, "attempt": attempt_val},
                                    starts, last_img_name or "", feeding_dt, feeding_dt)
         self._feeding_logged_key = key
+        self.panel_canvas.set_completion_badge(True)
 
     def _main_tick(self):
         """타이머 통합 틱: 대기 중인 이미지 처리 + '신규 이미지 없음' 상태 갱신"""
