@@ -652,6 +652,7 @@ class IcingClassificationGUI(QWidget):
         self._status_hold_until: float = 0.0
         self._no_image_grace_until: float = 0.0
         self.last_image_seen_at: float = 0.0
+        self.last_allowed_seen_at: float = 0.0
 
         # 텍스트 박스 ('장비명_Lot#_Process')
         self.device_info_box = QLineEdit()
@@ -951,7 +952,8 @@ class IcingClassificationGUI(QWidget):
         """피딩 타임 기록 상태 초기화"""
         self._feeding_logged_key = None
         self.last_allowed_image_info = {"equip": None, "lot": None, "attempt": None, "name": None, "dt": None}
-
+        self.last_allowed_seen_at = 0.0
+        
     def _update_label_streak(self, label: str, cur_dt: QDateTime | None) -> QDateTime | None:
         """동일 판정 5회 연속 시 최초 시각 반환"""
         if label != self._streak_label:
@@ -1166,9 +1168,11 @@ class IcingClassificationGUI(QWidget):
             print(f"❌ 장비 요약 CSV 저장 실패: {e}")
 
     def _poll_latest_image(self):
-        """마지막 이미지 처리 후 9초 이상 새 이미지가 없으면 '신규 이미지 없음' 표시"""
+        """허용 공정/신규 이미지 부재 여부에 따라 FeedingTime 기록/상태 갱신"""
         now = time.monotonic()
-        last_seen = self.last_image_seen_at
+
+        last_seen_any = self.last_image_seen_at
+        last_allowed_seen = self.last_allowed_seen_at
 
         if now < self._status_hold_until:
             return
@@ -1177,9 +1181,17 @@ class IcingClassificationGUI(QWidget):
         if self.pending_images or (self._backlog_thread and self._backlog_thread.isRunning()):
             return
 
-        if now - last_seen > self.no_new_image_grace_s:
+        no_new_images = now - last_seen_any > self.no_new_image_grace_s
+        allowed_gap = last_allowed_seen > 0.0 and (now - last_allowed_seen > self.no_new_image_grace_s)
+
+        if no_new_images:
             self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
             self._set_status("신규 이미지 없음 (폴더 감시 중)", hold_s=0.0)
+            self._record_feeding_time()
+            return
+
+        if allowed_gap:
+            self._set_status("허용 공정 이미지 없음 (FeedingTime 기록)", hold_s=0.0)
             self._record_feeding_time()
 
     def _record_feeding_time(self):
@@ -1314,6 +1326,9 @@ class IcingClassificationGUI(QWidget):
             process_name = (info.get('process') or '').upper()
             img_name = img_path.name
 
+            # 신규 이미지 도착 시각 기록 (허용/비허용 공정 공통)
+            self.last_image_seen_at = time.monotonic()
+
             if not self.current_equip:
                 self.current_equip = info['equip'] or None
 
@@ -1338,7 +1353,7 @@ class IcingClassificationGUI(QWidget):
                 self._mark_image_processed(img_name)
                 return
 
-            self.last_image_seen_at = time.monotonic()
+            self.last_allowed_seen_at = time.monotonic()
 
             # 여기부터 신규 이미지에 대한 실제 분류 판정
             label, probs = self.classifier.predict(img_path, roi=roi_rect)
