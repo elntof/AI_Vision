@@ -1471,7 +1471,7 @@ class ParticleDetectionGUI(QWidget):
             s.setEnabled(enabled2)
 
     def _mark_image_processed(self, filename: str):
-        """현재 Lot/세션 처리 목록에 이미지명 기록"""
+        """현재 세션/Lot에서 이미 처리한 이미지명 기록"""
         if not filename:
             return
         self.processed_images.add(filename)
@@ -1596,6 +1596,7 @@ class ParticleDetectionGUI(QWidget):
             return
 
     def _start_backlog_feeder(self, backlog):
+        """시작 시점에 남아 있는 백로그 이미지를 별도 스레드로 순차 처리"""
         if not backlog:
             self.status_label.setText("백로그 없음. 라이브 감시 시작.")
             self._drain_pending_queue()
@@ -1727,7 +1728,7 @@ class ParticleDetectionGUI(QWidget):
         self.status_label.setText("설정 저장됨.")
     
     def closeEvent(self, event):
-        """윈도우 종료 시 현재 설정을 .ini에 자동 저장"""
+        """메인 윈도우 종료 시 현재 설정을 .ini에 자동 저장"""
         try:
             self.stop_realtime()
             self.save_options()
