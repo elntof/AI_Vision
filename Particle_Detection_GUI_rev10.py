@@ -1621,11 +1621,13 @@ class ParticleDetectionGUI(QWidget):
 
 
     def _restart_backlog_scan(self):
+        """오탐 삭제 작업 후, 현재까지 처리되지 않은 이미지들을 다시 백로그로 구성해 순차 처리 재시작"""
         backlog = find_new_images(IMG_INPUT_DIR, self.session_processed_images)
         self._start_backlog_feeder(backlog)
 
 
     def _pause_ingestion_for_deletion(self):
+        """오탐 삭제 작업을 위해 이미지 입력(백로그/실시간 감시)을 일시 중지하고 기존 상태를 기록"""
         state = {
             'tail_timer': self.tail_timer.isActive(),
             'watcher': self.directory_watcher.is_running(),
@@ -1648,6 +1650,7 @@ class ParticleDetectionGUI(QWidget):
 
 
     def _resume_ingestion_after_deletion(self, state: dict):
+        """오탐 삭제 작업 종료 후, 중단 전 상태에 맞춰 백로그/실시간 감시를 재개"""
         if state.get('watcher'):
             self.directory_watcher.start()
         if state.get('tail_timer'):
@@ -2114,6 +2117,7 @@ class ParticleDetectionGUI(QWidget):
         self.graph_records.append((image_name, attempt_int, size_float))
 
     def _is_error_flagged(self, row) -> bool:
+        """CSV row에 'error flag' 값으로 오탐으로 마킹되어 있는지 여부를 판단"""
         try:
             if isinstance(row, dict):
                 flag_val = row.get('error flag', '')
@@ -2124,13 +2128,13 @@ class ParticleDetectionGUI(QWidget):
             return False
 
     def _ensure_csv_header_has_error_flag(self):
+        """현재 CSV에 'error flag' 컬럼이 없으면 헤더와 기존 데이터에 컬럼을 추가해 포맷을 보정"""
         if self._csv_header_checked:
             return
-        
         if not (self.csv_path and self.csv_path.exists()):
             self._csv_header_checked = True
             return
-        
+
         try:
             with open(self.csv_path, 'r', encoding='utf-8-sig', newline='') as f:
                 rows = list(csv.reader(f))
@@ -2138,17 +2142,13 @@ class ParticleDetectionGUI(QWidget):
             if not rows:
                 self._csv_header_checked = True
                 return
-
             header, data_rows = rows[0], rows[1:]
-
             if 'error flag' in header:
                 self._csv_header_checked = True
                 return
-
             header.append('error flag')
             for r in data_rows:
                 r.append('')
-
             with open(self.csv_path, 'w', encoding='utf-8-sig', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(header)
@@ -2243,6 +2243,7 @@ class ParticleDetectionGUI(QWidget):
         self._refresh_popup_images_from_history()
 
     def _refresh_popup_images_from_history(self):
+        """알림 팝업의 탐지 이력에서 최근 최대 5건의 탐지 이미지를 팝업용 큐에 재구성"""
         self._popup_images = deque(maxlen=5)
         if not self.detection_history:
             return
@@ -2253,6 +2254,7 @@ class ParticleDetectionGUI(QWidget):
                 self._popup_images.append((img_path, idx))
 
     def _add_detection_history_entry(self, event_path: Path, info: dict, event_dt: QDateTime):
+        """새로운 파티클 탐지 이벤트를 이력에 추가하고 정렬/카운트/팝업 이미지 목록을 갱신"""
         self.detection_history.append({
             'name': event_path.name,
             'path': event_path,
@@ -2264,6 +2266,7 @@ class ParticleDetectionGUI(QWidget):
         self.lot_event_count = len(self.detection_history)
 
     def _open_false_positive_dialog(self):
+        """알림 팝업에서 '오탐 삭제' 요청 시, 선택 삭제를 위한 DeletionDialog를 생성/표시"""
         if not self.detection_history:
             self._set_status('삭제할 파티클 탐지 이력이 없습니다.', hold_s=3.0)
             return
@@ -2275,6 +2278,7 @@ class ParticleDetectionGUI(QWidget):
         self._delete_dialog.show()
 
     def _handle_false_positive_deletion(self, selected_names: list[str], delete_all: bool):
+        """오탐 삭제 다이얼로그에서 선택된 항목을 기준으로 이력/CSV/이미지/그래프에서 해당 이벤트들을 제거"""
         names_set = {entry['name'] for entry in self.detection_history} if delete_all else set(selected_names)
         names_set = {name for name in names_set if name}
         if not names_set:
@@ -2307,6 +2311,7 @@ class ParticleDetectionGUI(QWidget):
             self._resume_ingestion_after_deletion(ingestion_state)
 
     def _rewrite_csv_excluding(self, names_set: set[str]):
+        """오탐 삭제로 선택된 이미지 집합을 기준으로 CSV를 다시 쓰며, 해당 행에는 error flag=1을 설정"""
         if not (self.csv_path and self.csv_path.exists()):
             return
         try:
@@ -2334,6 +2339,7 @@ class ParticleDetectionGUI(QWidget):
             self._set_status(f"CSV 삭제 실패: {e}", hold_s=3.0)
 
     def _refresh_alert_popup_after_deletion(self):
+        """오탐 삭제 후, 알림 팝업의 기본 정보/그래프/이미지/로그를 최신 이력 상태로 다시 반영"""
         if not self.alert_popup:
             return
         count_text = f"{len(self.detection_history)}회"
@@ -2358,7 +2364,7 @@ class ParticleDetectionGUI(QWidget):
         self._popup_images.append((path, event_count))
 
     def _parse_info_datetime(self, info: dict) -> QDateTime:
-        # info['date'] = YYYYMMDD, info['time'] = HHMM or HHMMSS
+        """파일명 파싱 정보(info)에서 날짜/시간(YYYYMMDD, HHMM(SS))을 QDateTime으로 변환"""
         yyyy = int(info['date'][0:4])
         mm = int(info['date'][4:6])
         dd = int(info['date'][6:8])
@@ -2371,6 +2377,7 @@ class ParticleDetectionGUI(QWidget):
         return qdt
 
     def _when_text(self, qdt: QDateTime) -> str:
+        """QDateTime 값을 팝업/로그용 시각 문자열로 포맷"""
         return qdt.toString('yy/MM/dd_HH:mm:ss')
 
     def _graph_pixmap(self) -> QPixmap:
@@ -2415,7 +2422,6 @@ class ParticleDetectionGUI(QWidget):
         pop.append_log(f"Particle 탐지 {len(self.detection_history)}회", event_dt)
         pop.start_blink()
 
-        # 이미 떠 있으면 내용만 갱신, 없으면 표시␊
         if not pop.isVisible():
             pop.show()
             pop.raise_()
@@ -2432,7 +2438,6 @@ class ParticleDetectionGUI(QWidget):
         self._popup_detect_dt = None
         if reason != 'ok':
             self.alert_popup = None
-
 
 def main():
     app = QApplication(sys.argv)
