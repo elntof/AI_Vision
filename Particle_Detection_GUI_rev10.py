@@ -1290,6 +1290,9 @@ class ParticleDetectionGUI(QWidget):
         self.stop_button = QPushButton('종료')
         self.stop_button.setEnabled(False)
         self.save_opt_button = QPushButton('설정 저장')
+        self.popup_button = QPushButton('팝업')
+        self.popup_button.setCursor(Qt.PointingHandCursor)
+        self.popup_button.setFlat(True)
         self.status_label = QLabel('- 대기 중 -')
         self.preview_label = ImagePreviewLabel()
         self.plot_canvas = ParticlePlotCanvas()
@@ -1336,7 +1339,11 @@ class ParticleDetectionGUI(QWidget):
         left_panel.addStretch()
 
         right_panel = QVBoxLayout()
-        right_panel.addSpacing(24)  # 이미지 미리보기 상단부 여백
+        popup_btn_layout = QHBoxLayout()
+        popup_btn_layout.addStretch()
+        popup_btn_layout.addWidget(self.popup_button)
+
+        right_panel.addLayout(popup_btn_layout)
         right_panel.addWidget(self.preview_label, alignment=Qt.AlignTop | Qt.AlignLeft)
         right_panel.addStretch()
 
@@ -1350,6 +1357,7 @@ class ParticleDetectionGUI(QWidget):
         self.start_button.clicked.connect(self.start_realtime)
         self.stop_button.clicked.connect(self.stop_realtime)
         self.save_opt_button.clicked.connect(self.save_options)
+        self.popup_button.clicked.connect(self._open_popup_manually)
 
         # Crop 영역 체크박스 (활성/비활성)
         self.crop1_enabled_cb.toggled.connect(self._on_crop1_toggled)
@@ -2400,6 +2408,47 @@ class ParticleDetectionGUI(QWidget):
             self.alert_popup.closedWithAction.connect(self._on_popup_closed)
             self.alert_popup.deleteRequested.connect(self._open_false_positive_dialog)
         return self.alert_popup
+
+    def _open_popup_manually(self):
+        """메인 창 우측 상단 '팝업' 버튼으로 현재 상태의 알림 팝업을 즉시 표시"""
+        self._refresh_popup_images_from_history()
+        pop = self._ensure_popup()
+
+        now = QDateTime.currentDateTime()
+        if self.detection_history:
+            last_entry = self.detection_history[-1]
+            base_info_text = last_entry.get('stem', '')
+            event_dt = last_entry.get('datetime') if isinstance(last_entry.get('datetime'), QDateTime) else now
+            when_text = self._when_text(event_dt)
+            first_dt = self.detection_history[0].get('datetime')
+            count_text = f"{len(self.detection_history)}회"
+            event_folder = last_entry.get('path')
+            event_folder = event_folder.parent if isinstance(event_folder, Path) else None
+        else:
+            base_info_text = ''
+            when_text = '-'
+            count_text = '0회'
+            first_dt = None
+            event_folder = None
+            event_dt = now
+
+        pop.set_info(base_info_text, when_text, count_text)
+        pop.set_first_detect_time(first_dt)
+        pop.set_graph_pixmap(self._graph_pixmap())
+        pop.set_images(list(self._popup_images))
+        pop.set_event_folder(event_folder)
+        pop.sync_detection_history(self.detection_history)
+        pop.append_log('수동 팝업 열기', now)
+
+        if self.detection_history:
+            pop.start_blink()
+        else:
+            pop.stop_blink()
+
+        if not pop.isVisible():
+            pop.show()
+        pop.raise_()
+        pop.activateWindow()
 
     def _maybe_open_or_update_popup(self, info: dict, event_image_path: Path, event_dt: QDateTime | None = None):
         """팝업 이미지 큐 갱신"""
