@@ -27,12 +27,12 @@ mpl.rcParams['font.family'] = 'Malgun Gothic'
 mpl.rcParams['axes.unicode_minus'] = False
 
 # 환경 플래그: 경로 및 저장동작 테스트(True) / 운영(False) 모드 구분
-LOAD_TEST_MODE = False
-SAVE_TEST_MODE = False
-INI_TEST_MODE  = False
+LOAD_TEST_MODE = True
+SAVE_TEST_MODE = True
+INI_TEST_MODE  = True
 
 # 실행파일 실행 시, "자동 시작 동작 수행" 여부 플래그 : 자동 시작(True) / 수동 시작(False)
-AUTO_START_ON_LAUNCH = True
+AUTO_START_ON_LAUNCH = False
 
 # 이미지/CSV/그래프/이벤트 파일 경로 설정
 if LOAD_TEST_MODE:
@@ -1214,7 +1214,6 @@ class ParticleDetectionGUI(QWidget):
         self.csv_header = ['이미지 파일명', 'Attempt 횟수', '밝기', 'adaptive_value', '파티클 발생 여부', '파티클 크기', '파티클_x', '파티클_y', 'error flag']
         self.processed_images: set[str] = set()
         self.session_processed_images: set[str] = set()
-        self.saved_graph_lots: set[str] = set()
         self.graph_records: list[tuple[str, int, float]] = []
         self.detection_history: list[dict] = []
         self.pending_images: deque[Path] = deque()
@@ -1229,11 +1228,13 @@ class ParticleDetectionGUI(QWidget):
         self.collecting_initial = True   # 최초 10장 워밍업 플래그
 
         # 허용 모드 집합 & 래치/홀드 상태
-        self.ALLOWED_PULLER_MODES = {"NECK"}  # 허용 모드
-        self.disallowed_mode_latched = False  # 비허용 모드 래치
-        self.status_hold_until = 0.0          # 상태 메시지 유지 만료 시각
-        self.last_image_seen_at = 0.0         # 마지막 새 이미지 관측 시각
-        self.no_new_image_grace_s = 9.0       # 신규 이미지 없음 표시 유예 초
+        self.ALLOWED_PULLER_MODES = {"NECK"}     # 허용 모드
+        self.disallowed_mode_latched = False     # 비허용 모드 래치
+        self.status_hold_until = 0.0             # 상태 메시지 유지 만료 시각
+        self.last_image_seen_at = 0.0            # 마지막 새 이미지 관측 시각
+        self.no_new_image_grace_s = 9.0          # 신규 이미지 없음 표시 유예 초
+        self.last_allowed_image_seen_at = 0.0    # 마지막 허용 공정 이미지 시각
+        self.last_snapshot_source_time = 0.0     # 마지막 스냅샷 기준 시각(중복 방지)
 
         # 팝업/무시/누적
         self.alert_popup: AlertPopup | None = None
@@ -1663,7 +1664,6 @@ class ParticleDetectionGUI(QWidget):
         self.collecting_initial = True
         self.prev_particles = []
         self.frame_buffer = []
-        self.saved_graph_lots.clear()
 
         self.show_noise_text = False
         self._update_noise_text()
@@ -1677,6 +1677,8 @@ class ParticleDetectionGUI(QWidget):
         self.directory_watcher.start()
         self.tail_timer.start()
         self.last_image_seen_at = time.monotonic()
+        self.last_allowed_image_seen_at = 0.0
+        self.last_snapshot_source_time = 0.0
 
         # 백로그 목록 구성 (processed_images 기준 미처리 파일 전체)
         backlog = find_new_images(IMG_INPUT_DIR, self.session_processed_images)
@@ -1741,20 +1743,69 @@ class ParticleDetectionGUI(QWidget):
         """watchdog 큐 처리 및 신규 이미지 부재 상태 갱신"""
         self._drain_pending_queue()
         now = time.monotonic()
+
+        # 허용 공정(NECK) 이미지가 끊긴 경우 별도 스냅샷 저장을 시도
+        if (self.last_allowed_image_seen_at > 0 and (now - self.last_allowed_image_seen_at) >= self.no_new_image_grace_s):
+            self._try_save_graph_snapshot(self.last_allowed_image_seen_at)
+
         if self.pending_images:
             return
         if now < self.status_hold_until:
             return
         if (now - self.last_image_seen_at) <= self.no_new_image_grace_s:
             return
+
+        # 신규 이미지가 끊겼을 때 그래프 스냅샷 저장 시도
+        self._try_save_graph_snapshot(self.last_image_seen_at)
         self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
         self._set_status("신규 이미지 없음 (폴더 감시 중)")
+
+    def _try_save_graph_snapshot(self, reference_time: float):
+        """그래프 스냅샷 저장 조건을 검사하여 중복 저장 없이 저장 (스냅샷 시각 기준)"""
+        # Lot 정보가 유효하지 않으면 스냅샷 시도하지 않음
+        if not (self.current_lot and self.current_lot != "LotUnknown"):
+            return
+        # 기준 시간이 유효하지 않으면 스냅샷 시도하지 않음
+        if reference_time <= 0:
+            return
+        # 이전에 이보다 나중 기준 시간으로 이미 저장한 경우 중복 저장 방지
+        if reference_time <= self.last_snapshot_source_time:
+            return
+        # 그래프 버퍼에 데이터가 전혀 없으면 스냅샷 저장하지 않음
+        if not self.graph_records:
+            return
+
+        if self._save_graph_snapshot_file(self.current_lot):
+            self.last_snapshot_source_time = reference_time
+
+    def _save_graph_snapshot_file(self, lot: str) -> bool:
+        """Lot 단위 그래프 스냅샷을 저장하고 동일 Lot의 이전 파일은 삭제"""
+        try:
+            out_dir = GRAPH_OUTPUT_DIR
+            os.makedirs(out_dir, exist_ok=True)
+
+            for old_path in out_dir.glob(f"{lot}_*.jpg"):
+                try:
+                    old_path.unlink()
+                except Exception:
+                    pass
+
+            ts = time.strftime('%Y%m%d_%H%M%S')
+            out_path = out_dir / f"{lot}_{ts}.jpg"
+            self.plot_canvas.fig.savefig(
+                str(out_path),
+                dpi=self.plot_canvas.fig.dpi,
+                bbox_inches='tight'
+            )
+            return True
+        except Exception as e:
+            self._set_status(f"그래프 이미지 저장 오류: {e}", hold_s=3.0)
+            return False
 
     @Slot()
     def _on_backlog_finished(self):
         """백로그 완료 콜백 → 라이브 감시 시작"""
         self.status_label.setText("백로그 완료. 라이브 감시 시작.")
-        # 최신 샘플 1장으로 미리보기 갱신
         self.update_preview()
         self._drain_pending_queue()
 
@@ -1774,32 +1825,11 @@ class ParticleDetectionGUI(QWidget):
 
             # Lot 변경 시 CSV 생성 + 그래프 초기화 + 워밍업 리셋 + 팝업 초기화
             if self.current_lot != lot_number:
-                # 직전 Lot 그래프 스냅샷 저장
-                try:
-                    prev_lot = self.current_lot
-                    prev_csv = self.csv_path
-                    if (
-                        prev_lot
-                        and prev_lot != "LotUnknown"
-                        and prev_csv
-                        and prev_csv.exists()
-                        and prev_lot not in self.saved_graph_lots
-                    ):
-                        out_dir = GRAPH_OUTPUT_DIR
-                        ts = time.strftime('%Y%m%d_%H%M%S')
-                        out_path = out_dir / f"{prev_lot}_{ts}.jpg"
-                        self.plot_canvas.fig.savefig(
-                            str(out_path),
-                            dpi=self.plot_canvas.fig.dpi,
-                            bbox_inches='tight'
-                        )
-                        self.saved_graph_lots.add(prev_lot)
-                except Exception as e:
-                    self._set_status(f"그래프 이미지 저장 오류: {e}", hold_s=3.0)
-
                 # 새 Lot로 전환 및 현재 공정 상태 동기화
                 self.current_lot = lot_number
                 self.current_process = process_name
+                self.last_allowed_image_seen_at = 0.0
+                self.last_snapshot_source_time = 0.0
 
                 new_lot_valid = bool(lot_number) and (lot_number != "LotUnknown")
                 self.csv_path = (CSV_OUTPUT_DIR / f"{lot_number}.csv") if new_lot_valid else None
@@ -1895,6 +1925,7 @@ class ParticleDetectionGUI(QWidget):
                 # 허용 모드 → 래치 해제
                 if self.disallowed_mode_latched:
                     self.disallowed_mode_latched = False
+                self.last_allowed_image_seen_at = self.last_image_seen_at
 
             # 현재 처리 대상 파일 기준으로 이미지 미리보기 표기 + 앵커값
             anchor_current = None
