@@ -652,6 +652,20 @@ class ImagePreviewLabel(QLabel):
         painter.end()
 
 
+class ClickableLabel(QLabel):
+    """클릭 라벨 생성 클래스"""
+    clicked = Signal()
+
+    def __init__(self, text: str = '', parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 class BacklogFeeder(QObject):
     """백로그 전용 워커(QThread) 클래스"""
     next_image = Signal(object)
@@ -1290,9 +1304,8 @@ class ParticleDetectionGUI(QWidget):
         self.stop_button = QPushButton('종료')
         self.stop_button.setEnabled(False)
         self.save_opt_button = QPushButton('설정 저장')
-        self.popup_button = QPushButton('팝업')
-        self.popup_button.setCursor(Qt.PointingHandCursor)
-        self.popup_button.setFlat(True)
+        self.popup_button = ClickableLabel('팝업')
+        self.popup_button.setStyleSheet("color: #0d3d89; font-weight: 600;")
         self.status_label = QLabel('- 대기 중 -')
         self.preview_label = ImagePreviewLabel()
         self.plot_canvas = ParticlePlotCanvas()
@@ -1339,6 +1352,7 @@ class ParticleDetectionGUI(QWidget):
         left_panel.addStretch()
 
         right_panel = QVBoxLayout()
+        right_panel.addSpacing(4)  # 이미지 미리보기 상단부 여백
         popup_btn_layout = QHBoxLayout()
         popup_btn_layout.addStretch()
         popup_btn_layout.addWidget(self.popup_button)
