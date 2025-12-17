@@ -398,6 +398,7 @@ class ParticlePlotCanvas(FigureCanvas):
     def update_plot(self, x_list, y_list, latest_index=None, attempt_list=None):
         """그래프 업데이트 (x: 이미지명, y: 파티클 크기, attempt_list: 각 포인트의 Attempt 정수)"""
         self.ax.cla()
+        self.fig.texts.clear()
 
         def shorten(label):
             """그래프 X축 날짜 레이블 단순화 (MM/DD_HH:MM)"""
@@ -407,10 +408,17 @@ class ParticlePlotCanvas(FigureCanvas):
         display_labels = [shorten(str(x)) for x in x_list]
         n = len(display_labels)
         if n == 0:
+            self.ax.set_facecolor('white')
+            self.ax.axis('off')
+            self.ax.set_xlim(0, 1)
+            self.ax.set_ylim(0, 1)
+            self.fig.text(0.5, 0.5, "결과 없음", ha='center', va='center', color='gray', fontsize=12, transform=self.fig.transFigure)
             self.draw()
             return
 
-        # X 좌표 및 틱 계산
+        self.ax.axis('on')
+
+        # X 좌표, 틱 계산 및 y 길이 보정
         if n <= self.tick_count:
             ticks = np.arange(n)
         else:
@@ -418,7 +426,6 @@ class ParticlePlotCanvas(FigureCanvas):
 
         x_coords = np.arange(n)
 
-        # y 길이 보정
         if len(y_list) < n:
             y_list = np.pad(y_list, (0, n - len(y_list)), mode='constant', constant_values=0)
 
