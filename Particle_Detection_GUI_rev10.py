@@ -1042,6 +1042,9 @@ class AlertPopup(QWidget):
         self._pix_labels: list[QWidget] = []
         self._event_folder_path: Path | None = None
 
+        # 로그 이력 보관
+        self._log_entries: list[tuple[QDateTime, str]] = []
+
     def start_blink(self):
         self._blink_timer.start(500)  # 0.5초 주기
         self._blink_red = False
@@ -1101,17 +1104,29 @@ class AlertPopup(QWidget):
     def append_log(self, text: str, when: QDateTime | None = None):
         if when is None:
             when = QDateTime.currentDateTime()
-        ts = when.toString('yy/MM/dd_HH:mm:ss')
-        self.log_edit.append(f"[{ts}] {text}")
+        self._log_entries.append((when, text))
+        self._render_logs()
+
+    def _render_logs(self):
+        self.log_edit.clear()
+        entries = sorted(self._log_entries, key=lambda x: x[0].toSecsSinceEpoch())
+        for when, text in entries:
+            ts = when.toString('yy/MM/dd_HH:mm:ss')
+            self.log_edit.append(f"[{ts}] {text}")
         if self.log_edit.verticalScrollBar() is not None:
             self.log_edit.verticalScrollBar().setValue(self.log_edit.verticalScrollBar().maximum())
 
     def sync_detection_history(self, history_entries: list[dict]):
-        self.log_edit.clear()
+        non_detection_logs = [(dt, txt) for dt, txt in self._log_entries if not txt.startswith('Particle 탐지 ')]
+
+        detection_logs: list[tuple[QDateTime, str]] = []
         for idx, entry in enumerate(history_entries, start=1):
             when = entry.get('datetime')
             when_dt = when if isinstance(when, QDateTime) else QDateTime()
-            self.append_log(f"Particle 탐지 {idx:02d}회", when_dt)
+            detection_logs.append((when_dt, f"Particle 탐지 {idx:02d}회"))
+
+        self._log_entries = detection_logs + non_detection_logs
+        self._render_logs()
 
     def set_images(self, image_infos):
         # 기존 라벨 제거
@@ -1203,8 +1218,9 @@ class AlertPopup(QWidget):
         snooze_min = self.ignore_min_spin.value() if self.ignore_cb.isChecked() else 0
         now = QDateTime.currentDateTime()
         if snooze_min > 0:
-            self.append_log(f"{snooze_min:02d}분 팝업 무시 체크", now)
-        if reason == 'ok':
+            action = '확인 종료' if reason == 'ok' else '창 종료'
+            self.append_log(f"{snooze_min:02d}분 팝업 무시 체크 후 {action}", now)
+        elif reason == 'ok':
             self.append_log('확인 종료', now)
         else:
             self.append_log('창 종료', now)
@@ -2334,6 +2350,9 @@ class ParticleDetectionGUI(QWidget):
 
             self.lot_event_count = len(self.detection_history)
             self._refresh_popup_images_from_history()
+            if self.alert_popup:
+                now = QDateTime.currentDateTime()
+                self.alert_popup.append_log(f"{len(to_delete):02d}건 이미지 선택 삭제", now)
             self._refresh_alert_popup_after_deletion()
             self._set_status(f"오탐 {len(to_delete)}건 삭제 완료", hold_s=3.0)
         finally:
