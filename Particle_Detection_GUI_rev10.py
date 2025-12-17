@@ -387,6 +387,7 @@ class ParticlePlotCanvas(FigureCanvas):
         self.fig, self.ax = plt.subplots()
         super().__init__(self.fig)
         self.setParent(parent)
+        self.is_empty_plot = True
         self.tick_count = 10   # X축 틱 고정 개수
         W_PX, H_PX = 442, 238  # 그래프 크기 조정
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
@@ -408,6 +409,7 @@ class ParticlePlotCanvas(FigureCanvas):
         display_labels = [shorten(str(x)) for x in x_list]
         n = len(display_labels)
         if n == 0:
+            self.is_empty_plot = True
             self.ax.set_facecolor('white')
             self.ax.axis('off')
             self.ax.set_xlim(0, 1)
@@ -415,6 +417,8 @@ class ParticlePlotCanvas(FigureCanvas):
             self.fig.text(0.5, 0.5, "결과 없음", ha='center', va='center', color='gray', fontsize=12, transform=self.fig.transFigure)
             self.draw()
             return
+
+        self.is_empty_plot = False
 
         self.ax.axis('on')
 
@@ -2431,8 +2435,9 @@ class ParticleDetectionGUI(QWidget):
     def _graph_pixmap(self) -> QPixmap:
         """현재 Matplotlib Figure를 PNG로 렌더링 후 QPixmap 반환"""
         buf = io.BytesIO()
+        bbox_opt = None if getattr(self.plot_canvas, 'is_empty_plot', False) else 'tight'
         try:
-            self.plot_canvas.fig.savefig(buf, format='png', dpi=self.plot_canvas.fig.dpi, bbox_inches='tight')
+            self.plot_canvas.fig.savefig(buf, format='png', dpi=self.plot_canvas.fig.dpi, bbox_inches=bbox_opt)
             buf.seek(0)
             qimg = QImage.fromData(buf.read(), 'PNG')
             pm = QPixmap.fromImage(qimg)
