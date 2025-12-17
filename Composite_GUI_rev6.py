@@ -18,11 +18,9 @@ import numpy as np
 import cv2
 import ast
 
-
 # 메인 윈도우 기본 위치 (모니터 좌측 하단 기준 offset)
 WINDOW_OFFSET_X = 100
 WINDOW_OFFSET_Y = 200
-
 
 # ======== SMB 연결 정보 (카메라PC의 호스트명으로 장비PC와의 네트워크 자동 설정) ========
 host_name = socket.gethostname()
@@ -74,7 +72,6 @@ domain = ''                        # 도메인이 없으면 빈 문자열
 share_name = 'data'                # 설정 IP의 하위 폴더명
 # ===============================================================================
 
-
 def maintain_max_files(output_folder, max_files):
     """저장 폴더 내 파일이 설정 값(장) 초과 시 오래된 파일 삭제"""
     files = list(output_folder.glob('*.*'))
@@ -87,36 +84,6 @@ def maintain_max_files(output_folder, max_files):
             f.unlink()
         except Exception as e:
             print(f'파일 삭제 실패: {f} - {e}')
-
-
-def retrieve_csv_text(filename):
-    """SMB에서 지정한 CSV 파일 내용을 cp949 인코딩으로 읽어 반환"""
-    conn = None
-    for port_try in [139, 445]:
-        try:
-            is_direct_tcp = (port_try == 445)
-            conn = SMBConnection(username, password, client_name, server_name,
-                                 domain=domain, use_ntlm_v2=True, is_direct_tcp=is_direct_tcp)
-            connected = conn.connect(server_ip, port_try)
-            if connected:
-                file_obj = io.BytesIO()
-                conn.retrieveFile(share_name, filename, file_obj)
-                file_obj.seek(0)
-                csv_text = file_obj.read().decode('cp949')
-                conn.close()
-                return csv_text
-            else:
-                conn.close()
-        except Exception:
-            pass
-        finally:
-            if conn:
-                try:
-                    conn.close()
-                except:
-                    pass
-    return None
-
 
 def parse_datetime(date_str, time_str):
     """CSV의 'Date'와 'Time' 칼럼 값을 활용하여 datetime 객체로 변환"""
@@ -153,7 +120,6 @@ def parse_datetime(date_str, time_str):
     except Exception:
         return None
 
-
 def extract_row_info(row):
     """CSV에서 장비명, Lot#, Status, 날짜/시간 등의 정보 추출 후 딕셔너리로 반환"""
     if row is None:
@@ -173,6 +139,7 @@ def extract_row_info(row):
     neck_attempt_raw = row.get('Neck Attempts', '')
     bottom_heater_raw = row.get('Bottom Heater Set Point', '')
     seed_lift_raw = row.get('Seed Lift Set Point', '')
+    gas_pressure_raw = row.get('Gas Pressure Set Point', '')
 
     dt_full = parse_datetime(date_str, time_str)
     if dt_full:
@@ -180,7 +147,7 @@ def extract_row_info(row):
     else:
         date_time = ''
 
-    equipment = host_name[3:5]  # host_name에서 4~5번째 글자로 장비명 추출
+    equipment = host_name[3:5]
     lot_number = run_number
 
     puller_status_str = puller_status_raw.strip() if isinstance(puller_status_raw, str) else str(puller_status_raw)
@@ -197,19 +164,22 @@ def extract_row_info(row):
     try:
         bottom_heater = float(bottom_heater_raw)
     except (ValueError, TypeError):
-        bottom_heater = 0
+        bottom_heater = 0.0
 
     try:
         seed_lift = float(seed_lift_raw)
     except (ValueError, TypeError):
-        seed_lift = 0
+        seed_lift = 0.0
+
+    try:
+        gas_pressure = float(gas_pressure_raw)
+    except (ValueError, TypeError):
+        gas_pressure = 0.0
 
     status_map = {
         0: "IDLE",
         4: "TAKEOVER",
         5: "PUMPDOWN",
-        90: "PULLOUT",
-        94: "POST-PULLOUT"
     }
 
     if puller_status is not None:
@@ -235,6 +205,12 @@ def extract_row_info(row):
             status_text = "TAIL"
         elif 80 <= puller_status <= 89:
             status_text = "SHUTDOWN"
+        elif 90 <= puller_status <= 99:
+            # [mode 90~99 조건 下] ① BH Power ≥ 5 & Gas Pressure == 20 → "BEFOFEED" / ② 아니면 "PULLOUT"
+            if bottom_heater >= 5 and gas_pressure == 20:
+                status_text = "BEFOFEED"
+            else:
+                status_text = "PULLOUT"
         else:
             status_text = f"알 수 없는 상태({puller_status})"
 
@@ -250,13 +226,11 @@ def extract_row_info(row):
         "lot_number": lot_number,
         "status_display": status_display,
         "status_text": status_text,
-        "puller_status": puller_status  # 현재 공정 상태 판별을 위해 원시 모드 값도 전달
+        "puller_status": puller_status
     }
 
-
 # Attempt_NEW 계산 (온라인/스트리밍)
-INTEREST_STATUSES = ("NECK", "CROWN", "SHOULDER", "BODY")
-
+INTEREST_STATUSES = ("NECK", "CROWN", "SHOULDER", "BODY", "BEFOFEED")
 
 def find_closest_row_and_attempt(csv_text, target_dt):
     """Attempt_NEW를 온라인 방식으로 계산 (현재시각 이하 중 가장 늦은 행 선택)"""
@@ -359,39 +333,11 @@ def safe_read_gray(path, retries=5, delay=0.2):
         time.sleep(delay)
     return None
 
-
-def find_latest_csv_with_meta():
-    """최신 CSV의 파일명과 메타데이터(mtime, size)를 함께 반환"""
-    conn = None
-    for port_try in [139, 445]:
-        try:
-            is_direct_tcp = (port_try == 445)
-            conn = SMBConnection(username, password, client_name, server_name,
-                                 domain=domain, use_ntlm_v2=True, is_direct_tcp=is_direct_tcp)
-            if conn.connect(server_ip, port_try):
-                files = conn.listPath(share_name, '/')
-                csv_files = [f for f in files if f.filename.lower().endswith('.csv')]
-                if not csv_files:
-                    return None
-                latest = max(csv_files, key=lambda f: f.last_write_time)
-                return {
-                    "name": latest.filename,
-                    "mtime": latest.last_write_time,
-                    "size": getattr(latest, "file_size", None)
-                }
-        except Exception:
-            pass
-        finally:
-            if conn:
-                try:
-                    conn.close()
-                except:
-                    pass
-    return None
-
-
 class CsvTracker:
     """CSV 접근 최적화용 트래커 (루프당 1회 디렉터리 스캔)"""
+
+    DIR_SCAN_INTERVAL_SEC = 600  # 새 Lot 탐지용 전체 디렉터리 스캔 주기 (10분)
+
     def __init__(self):
         self.name = None
         self.mtime = None
@@ -401,12 +347,97 @@ class CsvTracker:
         self.cached_attempt = 0
         self.cached_info = {"status_text": "", "lot_number": "", "status_display": "", "puller_status": None}
 
+        self.conn = None
+        self.last_dir_scan_ts = 0
+
+    def _reset_connection(self):
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+        self.conn = None
+
+    def _connect(self):
+        if self.conn:
+            return True
+
+        for port_try in [139, 445]:
+            try:
+                is_direct_tcp = (port_try == 445)
+                conn = SMBConnection(username, password, client_name, server_name, domain=domain, use_ntlm_v2=True, is_direct_tcp=is_direct_tcp)
+                if conn.connect(server_ip, port_try):
+                    self.conn = conn
+                    return True
+            except Exception:
+                pass
+
+        self._reset_connection()
+        return False
+
+    def _get_file_attributes(self, filename):
+        if not self._connect():
+            return None
+
+        for path in (filename, f"/{filename}"):
+            try:
+                return self.conn.getAttributes(share_name, path)
+            except Exception:
+                continue
+
+        self._reset_connection()
+        return None
+
+    def _scan_latest_csv(self):
+        if not self._connect():
+            return None
+
+        try:
+            files = self.conn.listPath(share_name, '/')
+            csv_files = [f for f in files if f.filename.lower().endswith('.csv')]
+            if not csv_files:
+                return None
+
+            latest = max(csv_files, key=lambda f: f.last_write_time)
+            return {"name": latest.filename, "mtime": latest.last_write_time, "size": getattr(latest, "file_size", None)}
+        except Exception:
+            self._reset_connection()
+            return None
+
+    def _retrieve_csv_text(self, filename):
+        if not self._connect():
+            return None
+
+        try:
+            file_obj = io.BytesIO()
+            self.conn.retrieveFile(share_name, filename, file_obj)
+            file_obj.seek(0)
+            return file_obj.read().decode('cp949')
+        except Exception:
+            self._reset_connection()
+            return None
+
     def get_info(self, now_dt):
-        # 1) 디렉터리 스캔으로 최신 CSV + 메타데이터 획득
-        latest = find_latest_csv_with_meta()
+        now_ts = time.time()
+        latest_meta = None
+
+        # 현재 선택된 최신 Lot CSV의 메타데이터만 조회하여 append 여부 확인 (Composite.bmp 변경 시)
+        if self.name:
+            attr = self._get_file_attributes(self.name)
+            if attr:
+                latest_meta = {"name": self.name, "mtime": attr.last_write_time, "size": getattr(attr, "file_size", None)}
+
+        # 새 Lot 탐지는 느린 주기로 전체 디렉터리 스캔
+        need_dir_scan = (not self.name or (now_ts - self.last_dir_scan_ts >= self.DIR_SCAN_INTERVAL_SEC) or latest_meta is None)
+
+        if need_dir_scan:
+            scanned = self._scan_latest_csv()
+            if scanned:
+                latest_meta = scanned
+                self.last_dir_scan_ts = now_ts
 
         # 최신 CSV 자체가 없으면 캐시 초기화/유지
-        if latest is None:
+        if latest_meta is None:
             if self.text is None:
                 self.cached_attempt = 0
                 self.cached_info = {"status_text": "", "lot_number": "", "status_display": "", "puller_status": None}
@@ -414,30 +445,29 @@ class CsvTracker:
 
         need_reload = False
 
-        # 2) 파일명이 바뀐 경우(새 Lot 시작) → 본문 읽기 시도
-        if self.name != latest["name"]:
+        # 파일명이 바뀐 경우(새 Lot 시작) → 본문 읽기 시도
+        if self.name != latest_meta["name"]:
             need_reload = True
 
-        # 3) 파일명은 같지만 메타데이터가 변한 경우 → 본문 읽기 시도
-        elif (latest.get("mtime") != self.mtime) or (latest.get("size") != self.size):
+        # 파일명은 같지만 메타데이터가 변한 경우 → 본문 읽기 시도
+        elif (latest_meta.get("mtime") != self.mtime) or (latest_meta.get("size") != self.size):
             need_reload = True
 
-        # 4) 본문 읽기/파싱
+        # 본문 읽기/파싱
         if need_reload:
-            # 본문 읽기
-            new_text = retrieve_csv_text(latest["name"])
-            if new_text:  # 성공한 경우에만 상태 갱신 (실패 시 캐시/상태 유지 후 다음 루프에서 재시도)
+            new_text = self._retrieve_csv_text(latest_meta["name"])
+            if new_text:
                 self.text = new_text
-                self.name = latest["name"]
-                self.mtime = latest["mtime"]
-                self.size = latest["size"]
+                self.name = latest_meta["name"]
+                self.mtime = latest_meta["mtime"]
+                self.size = latest_meta["size"]
 
                 # Process 정보 파싱 + Attempt 재계산
                 _, attempt_new, info = find_closest_row_and_attempt(self.text, now_dt)
                 self.cached_attempt = attempt_new
                 self.cached_info = info
 
-        # 5) 변경 없음 → 캐시 그대로 반환
+        # 변경 없음 → 캐시 그대로 반환
         return self.cached_attempt, self.cached_info
 
 
@@ -595,7 +625,6 @@ class ImageSaverThread(QThread):
         if allow_all:
             return True
 
-        # 비교는 대소문자만 무시 (철자/형태는 그대로 구분)
         normalized = (status_text or "").upper().strip()
         effective_allowed = allowed_set or {"NECK"}
 
@@ -673,12 +702,7 @@ class PreviewLabel(QLabel):
                 pen = QPen(QColor(255, 0, 0), 2)
                 painter.setPen(pen)
                 painter.setBrush(Qt.NoBrush)
-                painter.drawRect(
-                    int(offset_x + cx * scale),
-                    int(offset_y + cy * scale),
-                    int(cw * scale),
-                    int(ch * scale)
-                )
+                painter.drawRect(int(offset_x + cx * scale), int(offset_y + cy * scale), int(cw * scale), int(ch * scale))
             painter.end()
 
 class MainWindow(QWidget):
@@ -711,9 +735,9 @@ class MainWindow(QWidget):
         self.output_folder = Path('Images')
         self.output_folder.mkdir(exist_ok=True)
 
-        self._allowed_process_raw = "NECK"
+        self._allowed_process_raw = "ALL"
         self._allowed_process_allow_all = False
-        self._allowed_process_set = {"NECK"}
+        self._allowed_process_set = set()
 
         self.status_label = QLabel('대기 중.')
         self.start_button = QPushButton('시작')
@@ -937,7 +961,6 @@ class MainWindow(QWidget):
         clamped_y = max(min_y, min(int(round(y)), max_y))
         return clamped_x, clamped_y
 
-
     def start_saving(self):
         """이미지 저장 쓰레드 시작"""
         self.start_button.setEnabled(False)
@@ -1136,9 +1159,9 @@ class MainWindow(QWidget):
         qual = int(self.settings.value('jpeg_quality', 90))
         self.quality_slider.setValue(qual)
 
-        allowed_processes_value = self.settings.value('allowed_processes', 'NECK')
+        allowed_processes_value = self.settings.value('allowed_processes', 'ALL')
         if allowed_processes_value is None:
-            allowed_processes_value = 'NECK'
+            allowed_processes_value = 'ALL'
         self._set_allowed_processes(allowed_processes_value)
 
     def update_device_name_from_thread(self, full_device_name):
@@ -1189,7 +1212,7 @@ class MainWindow(QWidget):
 
 
 def run_gui():
-    """QApplication 인스턴스의 중복 실행 문제 방지"""
+    """QApplication 인스턴스 생성 및 초기 Lot 표시"""
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
@@ -1202,9 +1225,15 @@ def run_gui():
 
     window = MainWindow()
 
-    latest_meta = find_latest_csv_with_meta()
-    latest_csv_fname = latest_meta["name"] if latest_meta else None
-    host_and_csvname = f"{host_name} / {latest_csv_fname.rsplit('.',1)[0] if latest_csv_fname else 'N/A'}"
+    # CsvTracker를 이용해 최신 Lot CSV 이름 조회
+    tracker = CsvTracker()
+    try:
+        tracker.get_info(datetime.now())
+        latest_csv_fname = tracker.name
+    finally:
+        tracker._reset_connection()
+
+    host_and_csvname = f"{host_name} / {latest_csv_fname.rsplit('.', 1)[0] if latest_csv_fname else 'N/A'}"
     window.device_edit.setText(host_and_csvname)
 
     window.show()
