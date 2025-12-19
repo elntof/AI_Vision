@@ -103,7 +103,6 @@ NO_IMAGE_PLACEHOLDER_TEXT = "신규 이미지 없음"
 # 감시 대상 이미지 확장자 목록
 ALLOWED_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
 
-
 def safe_image_load(image_path, as_gray=False, max_retries=5, delay=0.2):
     """안전 이미지 로딩 (재시도 최대 5회)"""
     flag = cv2.IMREAD_GRAYSCALE if as_gray else cv2.IMREAD_UNCHANGED
@@ -118,21 +117,17 @@ def safe_image_load(image_path, as_gray=False, max_retries=5, delay=0.2):
         time.sleep(delay)
     return None
 
-
 def _numpy_to_qimage(npimg) -> QImage:
     """NumPy 이미지를 QImage로 변환 (채널 수에 따라 자동 변환)"""
     if npimg is None:
         return QImage()
-
     if npimg.ndim == 2:
         h, w = npimg.shape
         return QImage(npimg.data, w, h, w, QImage.Format_Grayscale8).copy()
-
     if npimg.shape[2] == 3:
         rgb = cv2.cvtColor(npimg, cv2.COLOR_BGR2RGB)
         h, w, _ = rgb.shape
         return QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
-
     if npimg.shape[2] == 4:
         rgba = cv2.cvtColor(npimg, cv2.COLOR_BGRA2RGBA)
         h, w, _ = rgba.shape
@@ -141,7 +136,6 @@ def _numpy_to_qimage(npimg) -> QImage:
     gray = cv2.cvtColor(npimg, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     return QImage(gray.data, w, h, w, QImage.Format_Grayscale8).copy()
-
 
 def pixmap_from_numpy(npimg, target_size: tuple[int, int] | None = None) -> QPixmap:
     """NumPy 이미지를 QPixmap으로 변환 후 필요 시 스케일링"""
@@ -153,14 +147,12 @@ def pixmap_from_numpy(npimg, target_size: tuple[int, int] | None = None) -> QPix
         pm = pm.scaled(*target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
     return pm
 
-
 def load_pixmap_from_path(img_path: Path, target_size: tuple[int, int] | None = None) -> QPixmap:
     """파일 경로에서 이미지를 로드 후 QPixmap으로 변환"""
     img = safe_image_load(str(img_path), as_gray=False)
     if img is None:
         return QPixmap()
     return pixmap_from_numpy(img, target_size)
-
 
 def compute_anchor_brightness(gray_img):
     """70% 최빈 구간 앵커 밝기 계산"""
@@ -208,7 +200,6 @@ def compute_anchor_brightness(gray_img):
     anchor = int(round(float((bins * weights).sum() / denom)))
     return max(0, min(anchor, 255))
 
-
 def compute_adaptive_threshold(anchor_current: int | float | None) -> int:
     """앵커 밝기에 따라 동적으로 조정된 이진화 임계값 계산"""
     if anchor_current is None:
@@ -217,7 +208,6 @@ def compute_adaptive_threshold(anchor_current: int | float | None) -> int:
     adaptive_value = MANUAL_THRESHOLD + ADAPTIVE_THRESHOLD_GAIN * (float(anchor_current) - ANCHOR_BRIGHTNESS_REF)
     adaptive_value = max(0.0, min(255.0, adaptive_value))
     return int(round(adaptive_value))
-
 
 def extract_image_datetime(path: Path) -> QDateTime:
     """파일명으로부터 QDateTime 추출 (YYYYMMDD_HHMMSS 형태 지원)"""
@@ -239,9 +229,7 @@ def extract_image_datetime(path: Path) -> QDateTime:
     except Exception:
         return QDateTime()
 
-
-def particle_detection(image_source, exclude_boxes, threshold=None,
-                       area_min=PARTICLE_AREA_MIN, area_max=PARTICLE_AREA_MAX):
+def particle_detection(image_source, exclude_boxes, threshold=None, area_min=PARTICLE_AREA_MIN, area_max=PARTICLE_AREA_MAX):
     """파티클 탐지 (OpenCV 파이프라인)"""
     if isinstance(image_source, np.ndarray):
         img = image_source
@@ -292,12 +280,10 @@ def particle_detection(image_source, exclude_boxes, threshold=None,
         print(f"❌ 오류: {e}")
         return None, None, None
 
-
 def find_new_images(img_dir, processed_set):
     """디렉토리 내 신규 이미지 탐색 (파일명 기준)"""
     all_imgs = sorted([p for p in img_dir.glob('*') if p.suffix.lower() in ALLOWED_IMAGE_EXTS])
     return [p for p in all_imgs if p.name not in processed_set]
-
 
 class _ImageFileEventHandler(FileSystemEventHandler):
     """watchdog 이벤트 핸들러 (신규 이미지 감지)"""
@@ -322,7 +308,6 @@ class _ImageFileEventHandler(FileSystemEventHandler):
 
     def on_moved(self, event):
         self._handle_path(getattr(event, 'dest_path', None))
-
 
 class ImageDirectoryWatcher(QObject):
     """watchdog 기반 이미지 디렉토리 감시기"""
@@ -364,7 +349,6 @@ class ImageDirectoryWatcher(QObject):
     def is_running(self) -> bool:
         return self._observer is not None
 
-
 def parse_filename(fname: str):
     """파일명 파서 (형식: EQUIP_Lot#_Process_Attempt_YYYYMMDD_HHMM(SS).ext)"""
     stem = Path(fname).stem
@@ -379,7 +363,6 @@ def parse_filename(fname: str):
         'stem':    stem,
         'name':    Path(fname).name,
     }
-
 
 class ParticlePlotCanvas(FigureCanvas):
     def __init__(self, parent=None, width=None, height=None, dpi=96):
@@ -490,7 +473,6 @@ class ParticlePlotCanvas(FigureCanvas):
         self.ax.grid(True, axis='y', linestyle='--', linewidth=1.0, alpha=0.6, color='#bbbbbb')
 
         self.draw()
-
 
 class ImagePreviewLabel(QLabel):
     """이미지 미리보기 및 crop 박스 표시 (박스 2개 + Noise 정보 텍스트)"""
@@ -662,7 +644,6 @@ class ImagePreviewLabel(QLabel):
 
         painter.end()
 
-
 class ClickableLabel(QLabel):
     """클릭 라벨 생성 클래스"""
     clicked = Signal()
@@ -697,7 +678,6 @@ class BacklogFeeder(QObject):
                 break
             self.next_image.emit(p)
         self.finished.emit()
-
 
 class DeletionDialog(QDialog):
     """오탐 삭제를 위한 팝업"""
@@ -845,7 +825,6 @@ class DeletionDialog(QDialog):
         except Exception:
             return '- [기본 정보] -'
 
-
 class AlertPopup(QWidget):
     """탐지 팝업(AlertPopup) 클래스"""
     closedWithAction = Signal(str, int)
@@ -909,7 +888,7 @@ class AlertPopup(QWidget):
         top_right.setContentsMargins(0, 0, 0, 0)
         top_right.setSpacing(6)
 
-        # ── 1줄: 무시 옵션 + 확인 버튼 ─────────────────────────────
+        # 팝업 무시 옵션 & 확인 버튼
         top_row = QHBoxLayout()
         top_row.setContentsMargins(0, 0, 0, 0)
         top_row.setSpacing(6)
@@ -923,7 +902,7 @@ class AlertPopup(QWidget):
         top_row.addWidget(self.btn_ok)
         top_row.addWidget(self.btn_delete)
 
-        # ── 2줄: "저장 폴더로 이동" 버튼 ─────────────────────────────
+        # "저장 폴더로 이동" 버튼
         top_right.addLayout(top_row)
         top_right.addWidget(self.btn_open_folder, alignment=Qt.AlignRight)
 
@@ -1231,7 +1210,6 @@ class AlertPopup(QWidget):
         self.closedWithAction.emit(reason, snooze_min)
         self.close()
 
-
 class ParticleDetectionGUI(QWidget):
     """메인 GUI 위젯 클래스"""
 
@@ -1392,8 +1370,7 @@ class ParticleDetectionGUI(QWidget):
         main_hbox.addLayout(right_panel)
 
         # 시그널 연결 (미리보기 즉시 반영)
-        for s in [self.crop1_x, self.crop1_y, self.crop1_w, self.crop1_h,
-                  self.crop2_x, self.crop2_y, self.crop2_w, self.crop2_h]:
+        for s in [self.crop1_x, self.crop1_y, self.crop1_w, self.crop1_h, self.crop2_x, self.crop2_y, self.crop2_w, self.crop2_h]:
             s.valueChanged.connect(self.update_preview)
         self.start_button.clicked.connect(self.start_realtime)
         self.stop_button.clicked.connect(self.stop_realtime)
@@ -1668,12 +1645,10 @@ class ParticleDetectionGUI(QWidget):
         self._backlog_thread.start()
         self.status_label.setText(f"백로그 처리 시작: {len(backlog)}장")
 
-
     def _restart_backlog_scan(self):
         """오탐 삭제 작업 후, 현재까지 처리되지 않은 이미지들을 다시 백로그로 구성해 순차 처리 재시작"""
         backlog = find_new_images(IMG_INPUT_DIR, self.session_processed_images)
         self._start_backlog_feeder(backlog)
-
 
     def _pause_ingestion_for_deletion(self):
         """오탐 삭제 작업을 위해 이미지 입력(백로그/실시간 감시)을 일시 중지하고 기존 상태를 기록"""
@@ -1844,11 +1819,7 @@ class ParticleDetectionGUI(QWidget):
 
             ts = time.strftime('%Y%m%d_%H%M%S')
             out_path = out_dir / f"{lot}_{ts}.jpg"
-            self.plot_canvas.fig.savefig(
-                str(out_path),
-                dpi=self.plot_canvas.fig.dpi,
-                bbox_inches='tight'
-            )
+            self.plot_canvas.fig.savefig(str(out_path), dpi=self.plot_canvas.fig.dpi, bbox_inches='tight')
             return True
         except Exception as e:
             self._set_status(f"그래프 이미지 저장 오류: {e}", hold_s=3.0)
@@ -1963,10 +1934,7 @@ class ParticleDetectionGUI(QWidget):
 
                 # 미리보기는 최신 이미지로 갱신하되 앵커값은 숨김
                 if gray_prev is not None:
-                    self.preview_label.show_image(
-                        gray_prev, [self.get_box1(), self.get_box2()],
-                        filename=img_path.name
-                    )
+                    self.preview_label.show_image(gray_prev, [self.get_box1(), self.get_box2()], filename=img_path.name)
                 else:
                     self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
                 self.preview_label.set_anchor_value(None)
@@ -2004,13 +1972,7 @@ class ParticleDetectionGUI(QWidget):
                 self._update_noise_text()
 
                 # 후보 파티클만 수집(판정/CSV/그래프/이벤트 저장 없음)
-                _, _, particle_info = particle_detection(
-                    gray_prev,
-                    [self.get_box1(), self.get_box2()],
-                    adaptive_value,
-                    area_min=WARMUP_NOISE_AREA_MIN,
-                    area_max=PARTICLE_AREA_MAX
-                )
+                _, _, particle_info = particle_detection(gray_prev, [self.get_box1(), self.get_box2()], adaptive_value, area_min=WARMUP_NOISE_AREA_MIN, area_max=PARTICLE_AREA_MAX)
                 if particle_info is None:
                     # 로딩/후보 추출 실패 시 스킵
                     self.status_label.setText(f"오류: {img_path.name} 로딩/후보 추출 실패 (워밍업)")
@@ -2139,7 +2101,6 @@ class ParticleDetectionGUI(QWidget):
 
         except Exception as e:
             self.status_label.setText(f"오류: {e}")
-
 
     def _record_graph_row(self, row):
         """그래프 버퍼에 행 추가"""
