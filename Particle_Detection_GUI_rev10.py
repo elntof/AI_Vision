@@ -27,12 +27,12 @@ mpl.rcParams['font.family'] = 'Malgun Gothic'
 mpl.rcParams['axes.unicode_minus'] = False
 
 # 환경 플래그: 경로 및 저장동작 테스트(True) / 운영(False) 모드 구분
-LOAD_TEST_MODE = True
-SAVE_TEST_MODE = True
-INI_TEST_MODE  = True
+LOAD_TEST_MODE = False
+SAVE_TEST_MODE = False
+INI_TEST_MODE  = False
 
 # 실행파일 실행 시, "자동 시작 동작 수행" 여부 플래그 : 자동 시작(True) / 수동 시작(False)
-AUTO_START_ON_LAUNCH = False
+AUTO_START_ON_LAUNCH = True
 
 # 이미지/CSV/그래프/이벤트 파일 경로 설정
 if LOAD_TEST_MODE:
@@ -63,7 +63,6 @@ if INI_TEST_MODE:
     INI_SETTINGS_PATH = ini_base_dir / "ParticleDetectionApp.ini"
 else:
     INI_SETTINGS_PATH = Path(r'D:/AI Vision/ParticleDetectionApp.ini')
-
 
 # 폴더 미리 생성
 os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
@@ -1249,10 +1248,12 @@ class ParticleDetectionGUI(QWidget):
         # 허용 모드 집합 & 래치/홀드 상태
         self.ALLOWED_PULLER_MODES = {"NECK"}     # 허용 모드
         self.disallowed_mode_latched = False     # 비허용 모드 래치
+        self.disallowed_entered_at = 0.0         # 비허용 모드 진입 시각
         self.status_hold_until = 0.0             # 상태 메시지 유지 만료 시각
-        self.last_image_seen_at = 0.0            # 마지막 새 이미지 관측 시각
+        self.last_image_seen_at = 0.0            # 마지막 새 이미지 관측/처리 시각
         self.no_new_image_grace_s = 9.0          # 신규 이미지 없음 표시 유예 초
-        self.last_allowed_image_seen_at = 0.0    # 마지막 허용 공정 이미지 시각
+        self.last_allowed_image_seen_at = 0.0    # 마지막 허용 공정 이미지 시각 (스냅샷 트리거로 사용X)
+        self.lot_loaded_at = 0.0                 # Lot 로드 시각
         self.last_snapshot_source_time = 0.0     # 마지막 스냅샷 기준 시각(중복 방지)
 
         # 팝업/무시/누적
@@ -1514,6 +1515,9 @@ class ParticleDetectionGUI(QWidget):
             return
         if path.name in self.session_processed_images:
             return
+        
+        self.last_image_seen_at = time.monotonic()
+
         self.pending_images.append(path)
         if not (self._backlog_thread and self._backlog_thread.isRunning()):
             self._drain_pending_queue()
@@ -1705,7 +1709,12 @@ class ParticleDetectionGUI(QWidget):
         self.tail_timer.start()
         self.last_image_seen_at = time.monotonic()
         self.last_allowed_image_seen_at = 0.0
+        self.lot_loaded_at = time.monotonic()
         self.last_snapshot_source_time = 0.0
+
+        # 비허용 모드 진입 타이머 초기화
+        self.disallowed_mode_latched = False
+        self.disallowed_entered_at = 0.0
 
         # 백로그 목록 구성 (processed_images 기준 미처리 파일 전체)
         backlog = find_new_images(IMG_INPUT_DIR, self.session_processed_images)
@@ -1767,30 +1776,42 @@ class ParticleDetectionGUI(QWidget):
             super().closeEvent(event)
 
     def process_new_images_tick(self):
-        """watchdog 큐 처리 및 신규 이미지 부재 상태 갱신"""
+        """watchdog 큐 처리 및 신규 이미지 부재 상태 갱신 + 스냅샷 트리거"""
         self._drain_pending_queue()
         now = time.monotonic()
 
-        # 허용 공정(NECK) 이미지가 끊긴 경우 별도 스냅샷 저장을 시도
-        if (self.last_allowed_image_seen_at > 0 and (now - self.last_allowed_image_seen_at) >= self.no_new_image_grace_s):
-            self._try_save_graph_snapshot(self.last_allowed_image_seen_at)
+        # (A) 비허용 공정으로 "진입"한 뒤 9초 지나면 1회 스냅샷 저장
+        if self.disallowed_mode_latched and self.disallowed_entered_at > 0:
+            if (now - self.disallowed_entered_at) >= self.no_new_image_grace_s:
+                self._try_save_graph_snapshot(self.disallowed_entered_at)
 
-        if self.pending_images:
-            return
-        if now < self.status_hold_until:
-            return
-        if (now - self.last_image_seen_at) <= self.no_new_image_grace_s:
-            return
+        # (B) 마지막 이미지 유입/처리 이후 9초 지나면 1회 스냅샷 저장
+        if self.last_image_seen_at > 0 and (now - self.last_image_seen_at) >= self.no_new_image_grace_s:
+            self._try_save_graph_snapshot(self.last_image_seen_at)
 
-        # 신규 이미지가 끊겼을 때 그래프 스냅샷 저장 시도
-        self._try_save_graph_snapshot(self.last_image_seen_at)
-        self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
-        self._set_status("신규 이미지 없음 (폴더 감시 중)")
+            # 신규 이미지가 한동안 없으면 UI 안내 (스냅샷 저장과 독립)
+            if not self.pending_images and now >= self.status_hold_until:
+                self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
+                self._set_status("신규 이미지 없음 (폴더 감시 중)")
+
+    def _get_snapshot_lot(self) -> str | None:
+        """스냅샷 저장 시 사용할 Lot 정보를 반환 (current_lot → CSV 파일명 순)"""
+        if self.current_lot and self.current_lot != "LotUnknown":
+            return self.current_lot
+
+        if self.csv_path and self.csv_path.exists():
+            lot_candidate = self.csv_path.stem
+            if lot_candidate:
+                self.current_lot = lot_candidate
+                return lot_candidate
+
+        return None
 
     def _try_save_graph_snapshot(self, reference_time: float):
         """그래프 스냅샷 저장 조건을 검사하여 중복 저장 없이 저장 (스냅샷 시각 기준)"""
+        lot_for_snapshot = self._get_snapshot_lot()
         # Lot 정보가 유효하지 않으면 스냅샷 시도하지 않음
-        if not (self.current_lot and self.current_lot != "LotUnknown"):
+        if not lot_for_snapshot:
             return
         # 기준 시간이 유효하지 않으면 스냅샷 시도하지 않음
         if reference_time <= 0:
@@ -1802,7 +1823,7 @@ class ParticleDetectionGUI(QWidget):
         if not self.graph_records:
             return
 
-        if self._save_graph_snapshot_file(self.current_lot):
+        if self._save_graph_snapshot_file(lot_for_snapshot):
             self.last_snapshot_source_time = reference_time
 
     def _save_graph_snapshot_file(self, lot: str) -> bool:
@@ -1852,7 +1873,12 @@ class ParticleDetectionGUI(QWidget):
                 self.current_lot = lot_number
                 self.current_process = process_name
                 self.last_allowed_image_seen_at = 0.0
+                self.lot_loaded_at = time.monotonic()
                 self.last_snapshot_source_time = 0.0
+
+                # Lot 바뀌면 비허용 모드 상태도 초기화
+                self.disallowed_mode_latched = False
+                self.disallowed_entered_at = 0.0
 
                 new_lot_valid = bool(lot_number) and (lot_number != "LotUnknown")
                 self.csv_path = (CSV_OUTPUT_DIR / f"{lot_number}.csv") if new_lot_valid else None
@@ -1926,8 +1952,11 @@ class ParticleDetectionGUI(QWidget):
 
             # 허용 모드 체크
             if process_name not in self.ALLOWED_PULLER_MODES:
-                # 비허용 모드 → 래치 온 (상태 고정)
-                self.disallowed_mode_latched = True
+                # 비허용 모드 → "진입" 순간만 기록 (진입 후 9초 지나면 1회 저장)
+                if not self.disallowed_mode_latched:
+                    self.disallowed_mode_latched = True
+                    self.disallowed_entered_at = self.last_image_seen_at  # (폴더 유입/처리 시각 둘 중 뭐든 OK)
+
                 self.show_noise_text = False
                 self._update_noise_text()
                 self._set_status("지정된 Puller Mode Status가 아님.")
@@ -1942,9 +1971,11 @@ class ParticleDetectionGUI(QWidget):
                 self._mark_image_processed(img_path.name)
                 return
             else:
-                # 허용 모드 → 래치 해제
+                # 허용 모드 → 래치 해제 + 비허용 진입 타이머 리셋
                 if self.disallowed_mode_latched:
                     self.disallowed_mode_latched = False
+                    self.disallowed_entered_at = 0.0
+
                 self.last_allowed_image_seen_at = self.last_image_seen_at
 
             # 현재 처리 대상 파일 기준으로 이미지 미리보기 표기 + 앵커값
@@ -2501,7 +2532,6 @@ def main():
     if gui.auto_start_on_launch:
         gui.start_realtime()
     sys.exit(app.exec())
-
 
 if __name__ == '__main__':
     main()
