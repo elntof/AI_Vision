@@ -137,9 +137,9 @@ def extract_row_info(row):
     run_number = row.get('Run Number', '')
     puller_status_raw = row.get('Puller Mode Status', '')
     neck_attempt_raw = row.get('Neck Attempts', '')
+    max_light_raw = row.get('Camera 1 Max Light', '')
     bottom_heater_raw = row.get('Bottom Heater Set Point', '')
     seed_lift_raw = row.get('Seed Lift Set Point', '')
-    gas_pressure_raw = row.get('Gas Pressure Set Point', '')
 
     dt_full = parse_datetime(date_str, time_str)
     if dt_full:
@@ -160,6 +160,10 @@ def extract_row_info(row):
     except (ValueError, TypeError):
         neck_attempt = 0
     try:
+        max_light = float(max_light_raw)
+    except (ValueError, TypeError):
+        max_light = 0.0
+    try:
         bottom_heater = float(bottom_heater_raw)
     except (ValueError, TypeError):
         bottom_heater = 0.0
@@ -167,10 +171,6 @@ def extract_row_info(row):
         seed_lift = float(seed_lift_raw)
     except (ValueError, TypeError):
         seed_lift = 0.0
-    try:
-        gas_pressure = float(gas_pressure_raw)
-    except (ValueError, TypeError):
-        gas_pressure = 0.0
 
     status_map = {0: "IDLE", 4: "TAKEOVER", 5: "PUMPDOWN"}
 
@@ -182,8 +182,10 @@ def extract_row_info(row):
         elif 20 <= puller_status <= 29:
             status_text = "STABILIZATION"
         elif 30 <= puller_status <= 39:
-            # [mode 30~39 조건 下] ② BH Power≥10 → "REMELT" / ② Neck Att≥1 & Seed Lift≥0.1 → "NECK" / ③ 아니면 "NECK(STAB)"
-            if bottom_heater >= 10:
+            # [mode 30~39 조건 下] ① Max Light==0 & BH Power≥5 → "BEFOFEED" / ② BH Power≥10 → "REMELT" / ③ Neck Att≥1 & Seed Lift≥0.1 → "NECK" / ④ 아니면 "NECK(STAB)"
+            if max_light == 0 and bottom_heater >= 5:
+                status_text = "BEFOFEED"
+            elif bottom_heater >= 10:
                 status_text = "REMELT"
             else:
                 status_text = "NECK" if (neck_attempt >= 1 and seed_lift >= 0.1) else "NECK(STAB)"
@@ -198,8 +200,8 @@ def extract_row_info(row):
         elif 80 <= puller_status <= 89:
             status_text = "SHUTDOWN"
         elif 90 <= puller_status <= 99:
-            # [mode 90~99 조건 下] ① BH Power ≥ 5 & Gas Pressure == 20 → "BEFOFEED" / ② 아니면 "PULLOUT"
-            if bottom_heater >= 5 and gas_pressure == 20:
+            # [mode 90~99 조건 下] ① Max Light==0 & BH Power≥5 → "BEFOFEED" / ② 아니면 "PULLOUT"
+            if max_light == 0 and bottom_heater >= 5:
                 status_text = "BEFOFEED"
             else:
                 status_text = "PULLOUT"
@@ -218,7 +220,8 @@ def extract_row_info(row):
         "lot_number": lot_number,
         "status_display": status_display,
         "status_text": status_text,
-        "puller_status": puller_status
+        "puller_status": puller_status,
+        "max_light": max_light
     }
 
 # Attempt_NEW 계산 (온라인/스트리밍)
