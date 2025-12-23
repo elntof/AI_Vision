@@ -155,32 +155,24 @@ def extract_row_info(row):
         puller_status = int(float(puller_status_str))
     except (ValueError, TypeError):
         puller_status = None
-
     try:
         neck_attempt = int(float(neck_attempt_raw))
     except (ValueError, TypeError):
         neck_attempt = 0
-
     try:
         bottom_heater = float(bottom_heater_raw)
     except (ValueError, TypeError):
         bottom_heater = 0.0
-
     try:
         seed_lift = float(seed_lift_raw)
     except (ValueError, TypeError):
         seed_lift = 0.0
-
     try:
         gas_pressure = float(gas_pressure_raw)
     except (ValueError, TypeError):
         gas_pressure = 0.0
 
-    status_map = {
-        0: "IDLE",
-        4: "TAKEOVER",
-        5: "PUMPDOWN",
-    }
+    status_map = {0: "IDLE", 4: "TAKEOVER", 5: "PUMPDOWN"}
 
     if puller_status is not None:
         if puller_status in status_map:
@@ -276,14 +268,12 @@ def find_closest_row_and_attempt(csv_text, target_dt):
                 first_row = row
                 first_info = info
                 first_attempt = attempt_now
-
             # 전체 최신 행
             if (last_dt is None) or (row_dt >= last_dt):
                 last_dt = row_dt
                 last_row = row
                 last_info = info
                 last_attempt = attempt_now
-
             # target_dt 이하 중 가장 늦은 행 선택
             if row_dt <= target_dt:
                 if (selected_dt is None) or (row_dt >= selected_dt):
@@ -339,6 +329,7 @@ class CsvTracker:
     DIR_SCAN_INTERVAL_SEC = 600  # 새 Lot 탐지용 전체 디렉터리 스캔 주기 (10분)
 
     def __init__(self):
+        """CSV 및 SMB 연결 상태, 캐시 정보를 초기화"""
         self.name = None
         self.mtime = None
         self.size = None
@@ -349,16 +340,26 @@ class CsvTracker:
 
         self.conn = None
         self.last_dir_scan_ts = 0
+        self.net_connected = False
 
     def _reset_connection(self):
+        """SMB 연결을 종료하고, CSV/캐시 관련 상태를 초기화"""
         if self.conn:
             try:
                 self.conn.close()
             except Exception:
                 pass
         self.conn = None
+        self.net_connected = False
+        self.name = None
+        self.mtime = None
+        self.size = None
+        self.text = None
+        self.cached_attempt = 0
+        self.cached_info = {"status_text": "", "lot_number": "", "status_display": "", "puller_status": None}
 
     def _connect(self):
+        """SMB 서버에 연결을 시도하고, 성공 시 연결 객체를 보관"""
         if self.conn:
             return True
 
@@ -368,14 +369,17 @@ class CsvTracker:
                 conn = SMBConnection(username, password, client_name, server_name, domain=domain, use_ntlm_v2=True, is_direct_tcp=is_direct_tcp)
                 if conn.connect(server_ip, port_try):
                     self.conn = conn
+                    self.net_connected = True
                     return True
             except Exception:
                 pass
 
         self._reset_connection()
+        self.net_connected = False
         return False
 
     def _get_file_attributes(self, filename):
+        """SMB를 통해 주어진 파일의 속성(mtime, size 등)을 조회"""
         if not self._connect():
             return None
 
@@ -389,6 +393,7 @@ class CsvTracker:
         return None
 
     def _scan_latest_csv(self):
+        """SMB 공유 폴더에서 가장 최신 CSV 파일을 찾아 메타 정보를 반환"""
         if not self._connect():
             return None
 
@@ -405,6 +410,7 @@ class CsvTracker:
             return None
 
     def _retrieve_csv_text(self, filename):
+        """SMB에서 CSV 파일을 다운로드하여 cp949 문자열로 읽기"""
         if not self._connect():
             return None
 
@@ -418,10 +424,14 @@ class CsvTracker:
             return None
 
     def get_info(self, now_dt):
+        """현재 시각 기준으로 최신 CSV에서 Attempt와 공정 정보를 계산해 반환"""
+        if not self._connect():
+            return None, None
+
         now_ts = time.time()
         latest_meta = None
 
-        # 현재 선택된 최신 Lot CSV의 메타데이터만 조회하여 append 여부 확인 (Composite.bmp 변경 시)
+        # 현재 선택된 최신 Lot CSV의 메타데이터만 조회
         if self.name:
             attr = self._get_file_attributes(self.name)
             if attr:
@@ -436,7 +446,6 @@ class CsvTracker:
                 latest_meta = scanned
                 self.last_dir_scan_ts = now_ts
 
-        # 최신 CSV 자체가 없으면 캐시 초기화/유지
         if latest_meta is None:
             if self.text is None:
                 self.cached_attempt = 0
@@ -462,18 +471,14 @@ class CsvTracker:
                 self.mtime = latest_meta["mtime"]
                 self.size = latest_meta["size"]
 
-                # Process 정보 파싱 + Attempt 재계산
                 _, attempt_new, info = find_closest_row_and_attempt(self.text, now_dt)
                 self.cached_attempt = attempt_new
                 self.cached_info = info
 
-        # 변경 없음 → 캐시 그대로 반환
         return self.cached_attempt, self.cached_info
-
 
 class ImageSaverThread(QThread):
     """이미지 저장 및 CSV 정보를 활용, 주기적으로 이미지 파일을 저장하는 쓰레드"""
-
     update_status = Signal(str)
     update_preview = Signal()
     update_device_name = Signal(str)
@@ -536,6 +541,12 @@ class ImageSaverThread(QThread):
                 # 최신 attempt/info 조회
                 attempt_new, csv_row_info = self.csv_tracker.get_info(now)
 
+                if attempt_new is None or csv_row_info is None:
+                    self.update_status.emit('NET_DISCONNECTED')
+                    if not self._wait_until_next_change(poll_ms=500):
+                        return
+                    continue
+
                 # 장비명/CSV 파일명 GUI 갱신
                 latest_csv_fname = self.csv_tracker.name
                 device_name_full = f"{host_name} / {latest_csv_fname.rsplit('.', 1)[0] if latest_csv_fname else 'N/A'}"
@@ -546,7 +557,6 @@ class ImageSaverThread(QThread):
                 is_allowed = self._is_allowed_process(status_text)
 
                 if is_allowed != self._last_allowed_state:
-                    # 허용/비허용 상태 전환 시 GUI에 알림 (미리보기 상태 업데이트용)
                     self.allowed_state_changed.emit(is_allowed)
                     self._last_allowed_state = is_allowed
 
@@ -635,7 +645,6 @@ class ImageSaverThread(QThread):
         allow_all, allowed_set = self.get_allowed_process_rule()
         if allow_all:
             return "ALL"
-
         if not allowed_set:
             return "NECK"
 
@@ -648,10 +657,8 @@ class ImageSaverThread(QThread):
             try:
                 cur_mtime = self.source_file.stat().st_mtime
                 if prev_mtime is None or cur_mtime != prev_mtime:
-                    # 변경 감지됨 → 다음 루프에서 기존 흐름(200ms 디바운스 → CSV 확인/파싱)으로 이어짐
                     return True
             except Exception:
-                # 파일이 없거나 접근 실패 시 잠시 대기 후 재시도
                 pass
             self.msleep(int(poll_ms))
         return False
@@ -675,7 +682,6 @@ class PreviewLabel(QLabel):
             self.crop_rect = crop_rect
             self.show_crop = True
         else:
-            # None 이면 사각형 숨기기
             self.show_crop = False
 
         self.update()
@@ -696,7 +702,6 @@ class PreviewLabel(QLabel):
             painter = QPainter(self)
             painter.drawPixmap(int(offset_x), int(offset_y), scaled)
 
-            # show_crop이 True일 때만 크롭 사각형 그림
             if self.show_crop:
                 cx, cy, cw, ch = self.crop_rect
                 pen = QPen(QColor(255, 0, 0), 2)
@@ -1007,8 +1012,7 @@ class MainWindow(QWidget):
         event.accept()
 
     def get_crop_rect(self):
-        return (self.crop_x.value(), self.crop_y.value(),
-                self.crop_w.value(), self.crop_h.value())
+        return (self.crop_x.value(), self.crop_y.value(), self.crop_w.value(), self.crop_h.value())
 
     def get_selected_formats(self):
         formats = []
@@ -1048,7 +1052,6 @@ class MainWindow(QWidget):
 
     def update_preview(self):
         """소스 이미지를 불러와서 프리뷰와 크롭 미리보기 업데이트"""
-        # 허용 공정으로 복귀하면 대체 이미지를 제거하고 최신 이미지를 표시
         self.placeholder_active = False
         if not self.source_file.exists():
             self.preview_label.clear()
@@ -1177,13 +1180,11 @@ class MainWindow(QWidget):
         elif isinstance(value, str):
             s = value.strip()
             if s.startswith('[') and s.endswith(']'):
-                # 리스트 문자열이면 안전하게 파싱 시도
                 try:
                     parsed = ast.literal_eval(s)
                     if isinstance(parsed, (list, tuple, set)):
                         tokens = [str(v).strip() for v in parsed if str(v).strip()]
                     else:
-                        # 리스트가 아니면 수동 분해
                         tokens = [p.strip() for p in s.strip('[]').split(',')]
                 except Exception:
                     tokens = [p.strip() for p in s.strip('[]').split(',')]
@@ -1194,7 +1195,6 @@ class MainWindow(QWidget):
 
         upper_tokens = {t.upper() for t in tokens if t}
 
-        # raw는 항상 "표준 문자열"로 유지
         self._allowed_process_raw = 'ALL' if 'ALL' in upper_tokens else ', '.join(tokens) if tokens else 'NECK'
 
         if 'ALL' in upper_tokens:
@@ -1210,7 +1210,6 @@ class MainWindow(QWidget):
     def get_allowed_process_rule(self):
         return (self._allowed_process_allow_all, set(self._allowed_process_set))
 
-
 def run_gui():
     """QApplication 인스턴스 생성 및 초기 Lot 표시"""
     app = QApplication.instance()
@@ -1225,7 +1224,6 @@ def run_gui():
 
     window = MainWindow()
 
-    # CsvTracker를 이용해 최신 Lot CSV 이름 조회
     tracker = CsvTracker()
     try:
         tracker.get_info(datetime.now())
@@ -1238,7 +1236,6 @@ def run_gui():
 
     window.show()
     app.exec()
-
 
 if __name__ == '__main__':
     run_gui()
