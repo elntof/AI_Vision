@@ -239,6 +239,29 @@ def _qdatetime_to_datetime(qdt: QDateTime | None):
     except Exception:
         return None
 
+def _safe_float(value, default: float = 0.0) -> float:
+    """float 변환 실패 시 기본값 반환"""
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+def _csv_get(row: list, idx_map: dict, name: str, default: str = "") -> str:
+    """CSV row에서 컬럼명 기반 안전 조회"""
+    idx = idx_map.get(name)
+    if idx is None or idx >= len(row):
+        return default
+    return row[idx]
+
+def _compute_lead_minutes(start_dt: QDateTime | None, end_dt: QDateTime | None) -> str:
+    """두 시각 차이를 분 단위로 계산"""
+    dt_start = _qdatetime_to_datetime(start_dt)
+    dt_end = _qdatetime_to_datetime(end_dt)
+    if dt_start is None or dt_end is None or dt_end < dt_start:
+        return ""
+    minutes = (dt_end - dt_start).total_seconds() / 60.0
+    return f"{minutes:.1f}"
+
 def format_mmdd_hhmm(qdt: QDateTime | None) -> str:
     """MM/DD HH:mm 포맷 문자열"""
     if qdt is None or not isinstance(qdt, QDateTime) or not qdt.isValid():
@@ -247,21 +270,11 @@ def format_mmdd_hhmm(qdt: QDateTime | None) -> str:
 
 def compute_lead_minutes(start_a: QDateTime | None, start_b: QDateTime | None) -> str:
     """두 시각 차이를 분 단위로 계산"""
-    dt_a = _qdatetime_to_datetime(start_a)
-    dt_b = _qdatetime_to_datetime(start_b)
-    if dt_a is None or dt_b is None or dt_b < dt_a:
-        return ""
-    minutes = (dt_b - dt_a).total_seconds() / 60.0
-    return f"{minutes:.1f}"
+    return _compute_lead_minutes(start_a, start_b)
 
 def compute_current_lead_minutes(start_dt: QDateTime | None, cur_dt: QDateTime | None) -> str:
     """특정 시작 시각 대비 현재 시각 리드 타임(분)"""
-    base = _qdatetime_to_datetime(start_dt)
-    cur = _qdatetime_to_datetime(cur_dt)
-    if base is None or cur is None or cur < base:
-        return ""
-    minutes = (cur - base).total_seconds() / 60.0
-    return f"{minutes:.1f}"
+    return _compute_lead_minutes(start_dt, cur_dt)
 
 class ViTClassifier:
     """학습된 ViT 모델을 사용한 3 클래스 분류기"""
@@ -1077,12 +1090,6 @@ class IcingClassificationGUI(QWidget):
                 # 확률 컬럼 인덱스(없을 수도 있으니 안전 처리)
                 prob_idxs = [idx_map.get(cn, None) for cn in CLASS_NAMES]
 
-                def _safe_float(x):
-                    try:
-                        return float(x)
-                    except Exception:
-                        return 0.0
-
                 for row in reader:
                     if not row:
                         continue
@@ -1163,14 +1170,8 @@ class IcingClassificationGUI(QWidget):
                         if not row:
                             continue
 
-                        def _get(name: str):
-                            idx = idx_map.get(name)
-                            if idx is None or idx >= len(row):
-                                return ""
-                            return row[idx]
-
-                        start_lot = _get(start_lot_key)
-                        start_attempt = _get(start_attempt_key)
+                        start_lot = _csv_get(row, idx_map, start_lot_key)
+                        start_attempt = _csv_get(row, idx_map, start_attempt_key)
                         if not start_lot:
                             continue
                         try:
@@ -1178,9 +1179,9 @@ class IcingClassificationGUI(QWidget):
                         except Exception:
                             start_attempt_val = 0
 
-                        feeding_dt = self._str_to_qdatetime(_get("FeedingTime"))
-                        end_lot = _get(end_lot_key) if end_lot_key in idx_map else ""
-                        end_attempt = _get(end_attempt_key) if end_attempt_key in idx_map else ""
+                        feeding_dt = self._str_to_qdatetime(_csv_get(row, idx_map, "FeedingTime"))
+                        end_lot = _csv_get(row, idx_map, end_lot_key) if end_lot_key in idx_map else ""
+                        end_attempt = _csv_get(row, idx_map, end_attempt_key) if end_attempt_key in idx_map else ""
                         try:
                             end_attempt_val = int(end_attempt) if end_attempt != "" else None
                         except Exception:
@@ -1358,14 +1359,8 @@ class IcingClassificationGUI(QWidget):
                 if not r:
                     continue
 
-                def _get(colname: str) -> str:
-                    j = idx.get(colname)
-                    if j is None or j >= len(r):
-                        return ""
-                    return r[j]
-
-                lot_val = _get(start_lot_key)
-                attempt_val = _get(start_attempt_key)
+                lot_val = _csv_get(r, idx, start_lot_key)
+                attempt_val = _csv_get(r, idx, start_attempt_key)
                 try:
                     attempt_val_int = int(attempt_val)
                 except Exception:
@@ -1433,38 +1428,32 @@ class IcingClassificationGUI(QWidget):
                         if not row:
                             continue
 
-                        def _get(name: str):
-                            j = idx_map.get(name)
-                            if j is None or j >= len(row):
-                                return ""
-                            return row[j]
-
-                        equip_old = _get("Equip")
-                        start_lot_old = _get(start_lot_key)
-                        start_attempt_old = _get(start_attempt_key)
+                        equip_old = _csv_get(row, idx_map, "Equip")
+                        start_lot_old = _csv_get(row, idx_map, start_lot_key)
+                        start_attempt_old = _csv_get(row, idx_map, start_attempt_key)
 
                         try:
                             start_attempt_key_val = int(start_attempt_old)
                         except Exception:
                             start_attempt_key_val = 0
 
-                        end_lot_old = _get("End_Lot")
-                        end_attempt_old = _get("End_Attempt")
-                        melted_old = _get("MeltedTime")
-                        icing_old = _get("IcingTime")
-                        iced_old = _get("IcedTime")
-                        feeding_old = _get("FeedingTime")
+                        end_lot_old = _csv_get(row, idx_map, "End_Lot")
+                        end_attempt_old = _csv_get(row, idx_map, "End_Attempt")
+                        melted_old = _csv_get(row, idx_map, "MeltedTime")
+                        icing_old = _csv_get(row, idx_map, "IcingTime")
+                        iced_old = _csv_get(row, idx_map, "IcedTime")
+                        feeding_old = _csv_get(row, idx_map, "FeedingTime")
 
                         melted_dt_old = self._str_to_qdatetime(melted_old)
                         icing_dt_old = self._str_to_qdatetime(icing_old)
                         iced_dt_old = self._str_to_qdatetime(iced_old)
                         feeding_dt_old = self._str_to_qdatetime(feeding_old)
 
-                        melted_icing_old = _get("MeltedToIcing(min)") or compute_lead_minutes(melted_dt_old, icing_dt_old)
-                        icing_iced_old = _get("IcingToIced(min)") or compute_lead_minutes(icing_dt_old, iced_dt_old)
-                        iced_feeding_old = _get("IcedToFeeding(min)") or compute_lead_minutes(iced_dt_old, feeding_dt_old)
-                        last_img_old = _get("LastImageName")
-                        last_time_old = _get("LastImageTime")
+                        melted_icing_old = _csv_get(row, idx_map, "MeltedToIcing(min)") or compute_lead_minutes(melted_dt_old, icing_dt_old)
+                        icing_iced_old = _csv_get(row, idx_map, "IcingToIced(min)") or compute_lead_minutes(icing_dt_old, iced_dt_old)
+                        iced_feeding_old = _csv_get(row, idx_map, "IcedToFeeding(min)") or compute_lead_minutes(iced_dt_old, feeding_dt_old)
+                        last_img_old = _csv_get(row, idx_map, "LastImageName")
+                        last_time_old = _csv_get(row, idx_map, "LastImageTime")
 
                         rows_dict[(start_lot_old, start_attempt_key_val)] = [
                             equip_old,
