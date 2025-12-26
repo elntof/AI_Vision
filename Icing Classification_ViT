@@ -88,10 +88,6 @@ DEFAULT_ROI_RECT = (40, 0, 200, 555)
 # 그래프 패널 크기
 PANEL_W_PX, PANEL_H_PX = 405, 270
 
-# CSV header
-EQUIP_SUMMARY_HEADER = ["Equip", "Start_Lot", "Start_Attempt", "End_Lot", "End_Attempt", "MeltedTime", "IcingTime", "IcedTime", "FeedingTime",
-                        "MeltedToIcing(min)", "IcingToIced(min)", "IcedToFeeding(min)", "LastImageName", "LastImageTime"]
-
 def clamp_roi_to_shape(roi: tuple[int, int, int, int] | None, width: int, height: int):
     """이미지 크기에 맞춰 ROI를 보정"""
     if roi is None:
@@ -266,10 +262,6 @@ def compute_current_lead_minutes(start_dt: QDateTime | None, cur_dt: QDateTime |
         return ""
     minutes = (cur - base).total_seconds() / 60.0
     return f"{minutes:.1f}"
-
-def is_valid_qdt(qdt) -> bool:
-    """QDateTime 유효성 공통 체크"""
-    return isinstance(qdt, QDateTime) and qdt.isValid()
 
 class ViTClassifier:
     """학습된 ViT 모델을 사용한 3 클래스 분류기"""
@@ -1204,7 +1196,7 @@ class IcingClassificationGUI(QWidget):
 
         # Cycle 단위로 리플레이한 결과를 모아 장비 요약을 재작성
         summary_rows: list[list[str]] = []
-        latest_ctx: tuple[tuple[str, int], dict[str, QDateTime | None], str, QDateTime | None, set[str], str, list[float]] | None = None
+        latest_ctx: tuple[tuple[str, int], dict[str, QDateTime | None], str, QDateTime | None, set[str]] | None = None
         latest_py_dt = None
 
         for cycle_csv in sorted(LOT_DETAILS_DIR.glob("*.csv")):
@@ -1268,14 +1260,17 @@ class IcingClassificationGUI(QWidget):
         if not summary_rows:
             return
 
+        header = ["Equip", "Start_Lot", "Start_Attempt", "End_Lot", "End_Attempt", "MeltedTime", "IcingTime", "IcedTime", "FeedingTime",
+                  "MeltedToIcing(min)", "IcingToIced(min)", "IcedToFeeding(min)", "LastImageName", "LastImageTime"]
+
         try:
             with open(self.equip_csv_path, "w", encoding="utf-8-sig", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow(EQUIP_SUMMARY_HEADER)
+                writer.writerow(header)
                 writer.writerows(summary_rows)
         except Exception as e:
             print(f"❌ 장비 요약 CSV 재작성 실패: {e}")
-        
+
         if latest_ctx is None:
             return
 
@@ -1413,6 +1408,13 @@ class IcingClassificationGUI(QWidget):
         equip_csv_path = CSV_OUTPUT_DIR / f"{equip}.csv"
         self.equip_csv_path = equip_csv_path
 
+        header = [
+            "Equip", "Start_Lot", "Start_Attempt", "End_Lot", "End_Attempt",
+            "MeltedTime", "IcingTime", "IcedTime", "FeedingTime",
+            "MeltedToIcing(min)", "IcingToIced(min)", "IcedToFeeding(min)",
+            "LastImageName", "LastImageTime"
+        ]
+
         # 기존 CSV 로드
         rows_dict: dict[tuple[str, int], list[str]] = {}
         existing_feeding_dt_for_this_cycle: QDateTime | None = None
@@ -1533,7 +1535,7 @@ class IcingClassificationGUI(QWidget):
         try:
             with open(equip_csv_path, "w", encoding="utf-8-sig", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow(EQUIP_SUMMARY_HEADER)
+                writer.writerow(header)
                 writer.writerows(rows)
         except Exception as e:
             print(f"❌ 장비 요약 CSV 저장 실패: {e}")
@@ -1583,9 +1585,8 @@ class IcingClassificationGUI(QWidget):
 
         if lot is None or attempt_val is None:
             return False
-        if not is_valid_qdt(feeding_dt):
+        if not isinstance(feeding_dt, QDateTime) or not feeding_dt.isValid():
             return False
-
 
         equip_val = equip or self.current_equip
         if not equip_val:
@@ -1608,7 +1609,9 @@ class IcingClassificationGUI(QWidget):
 
     def _is_after_last_processed(self, img_path: Path) -> bool:
         """<장비#.csv> 기준 '마지막 처리된 시각(self.last_processed_dt)' 이후의 이미지인지 여부 확인"""
-        if not is_valid_qdt(self.last_processed_dt):
+        if self.last_processed_dt is None or not isinstance(self.last_processed_dt, QDateTime):
+            return True
+        if not self.last_processed_dt.isValid():
             return True
 
         img_dt = extract_image_datetime(img_path)
@@ -1793,7 +1796,7 @@ class IcingClassificationGUI(QWidget):
             self.last_allowed_seen_at = time.monotonic()
 
             cur_dt = extract_image_datetime(img_path)
-            if not is_valid_qdt(cur_dt):
+            if not (isinstance(cur_dt, QDateTime) and cur_dt.isValid()):
                 cur_dt = None
 
             self._prepare_cycle_from_image(lot_number, attempt_value, cur_dt)
