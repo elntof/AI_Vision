@@ -21,12 +21,12 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 # 환경 플래그: 경로 및 저장동작 테스트(True) / 운영(False) 모드 구분
-LOAD_TEST_MODE = True
-SAVE_TEST_MODE = True
-INI_TEST_MODE = True
+LOAD_TEST_MODE = False
+SAVE_TEST_MODE = False
+INI_TEST_MODE = False
 
 # 실행파일 실행 시, "자동 시작 동작 수행" 여부 플래그 : 자동 시작(True) / 수동 시작(False)
-AUTO_START_ON_LAUNCH = False
+AUTO_START_ON_LAUNCH = True
 
 # 이미지/CSV/INI 경로 설정
 if LOAD_TEST_MODE:
@@ -162,16 +162,7 @@ def parse_filename(fname: str):
     except Exception:
         equip = lot = process = date_str = time_str = ''
         attempt = 0
-    return {
-        'equip': equip,
-        'lot': lot,
-        'process': process,
-        'attempt': attempt,
-        'date': date_str,
-        'time': time_str,
-        'stem': stem,
-        'name': Path(fname).name,
-    }
+    return {'equip': equip, 'lot': lot, 'process': process, 'attempt': attempt, 'date': date_str, 'time': time_str, 'stem': stem, 'name': Path(fname).name}
 
 def extract_image_datetime(path: Path) -> QDateTime:
     """파일명으로부터 QDateTime 추출 (YYMMDD_HHMMSS 형식 지원, 실패 시 mtime 사용)"""
@@ -293,9 +284,9 @@ class ViTClassifier:
                 cleaned = {k.replace("model.", "").replace("module.", ""): v for k, v in state.items()}
                 self.model.load_state_dict(cleaned, strict=False)
             except Exception as e:
-                print(f"❌ 모델 가중치 로드 실패: {e}")
+                print(f"모델 가중치 로드 실패: {e}")
         else:
-            print(f"⚠️ 체크포인트가 존재하지 않습니다: {checkpoint}")
+            print(f"체크포인트가 존재하지 않습니다: {checkpoint}")
 
         self.model.to(self.device)
         self.model.eval()
@@ -663,7 +654,6 @@ class ClassificationPanel(QWidget):
             painter.drawText(badge_rect, Qt.AlignCenter, "완료")
 
         painter.end()
-
 
 class BacklogFeeder(QObject):
     """이미지 백로그를 천천히 하나씩 흘려 보내는 전용 worker"""
@@ -1086,8 +1076,6 @@ class IcingClassificationGUI(QWidget):
 
                 name_idx = idx_map.get("이미지 파일명", 0)
                 label_idx = idx_map.get("예측 라벨", 2)
-
-                # 확률 컬럼 인덱스(없을 수도 있으니 안전 처리)
                 prob_idxs = [idx_map.get(cn, None) for cn in CLASS_NAMES]
 
                 for row in reader:
@@ -1100,7 +1088,6 @@ class IcingClassificationGUI(QWidget):
                     label = row[label_idx] or ""
                     processed.add(img_name)
 
-                    # row에서 확률(없으면 0.0)
                     probs = []
                     for pi in prob_idxs:
                         if pi is None or pi >= len(row):
@@ -1125,7 +1112,6 @@ class IcingClassificationGUI(QWidget):
                         if last_img_dt is None or img_dt > last_img_dt:
                             updated_last = True
                     else:
-                        # 타임스탬프 파싱 실패 시: last가 아직 없으면 일단 채움(최소 표시용)
                         if last_img_dt is None and not last_img_name:
                             updated_last = True
 
@@ -1136,7 +1122,7 @@ class IcingClassificationGUI(QWidget):
                         last_probs = probs
 
         except Exception as e:
-            print(f"⚠️ Cycle CSV 로드 실패({cycle_path.name}): {e}")
+            print(f"Cycle CSV 로드 실패({cycle_path.name}): {e}")
 
         return starts, processed, last_img_name, last_img_dt, last_label, last_probs
 
@@ -1193,7 +1179,7 @@ class IcingClassificationGUI(QWidget):
                             "end_attempt": end_attempt_val,
                         }
             except Exception as e:
-                print(f"⚠️ 장비 요약 CSV 읽기 실패: {e}")
+                print(f"장비 요약 CSV 읽기 실패: {e}")
 
         # Cycle 단위로 리플레이한 결과를 모아 장비 요약을 재작성
         summary_rows: list[list[str]] = []
@@ -1235,22 +1221,9 @@ class IcingClassificationGUI(QWidget):
             icing_iced = compute_lead_minutes(icing_dt, iced_dt)
             iced_feeding = compute_lead_minutes(iced_dt, feeding_dt)
 
-            summary_rows.append([
-                self.current_equip,
-                start_lot,
-                str(start_attempt),
-                end_lot,
-                "" if end_attempt_val is None else str(end_attempt_val),
-                self._qdatetime_to_str(melted_dt),
-                self._qdatetime_to_str(icing_dt),
-                self._qdatetime_to_str(iced_dt),
-                self._qdatetime_to_str(feeding_dt),
-                melted_icing,
-                icing_iced,
-                iced_feeding,
-                last_img_name or "",
-                self._qdatetime_to_str(last_img_dt),
-            ])
+            summary_rows.append([self.current_equip, start_lot, str(start_attempt), end_lot, "" if end_attempt_val is None else str(end_attempt_val),
+                self._qdatetime_to_str(melted_dt), self._qdatetime_to_str(icing_dt), self._qdatetime_to_str(iced_dt), self._qdatetime_to_str(feeding_dt),
+                melted_icing, icing_iced, iced_feeding, last_img_name or "", self._qdatetime_to_str(last_img_dt)])
 
             if last_img_dt and isinstance(last_img_dt, QDateTime) and last_img_dt.isValid():
                 py_dt = _qdatetime_to_datetime(last_img_dt)
@@ -1270,7 +1243,7 @@ class IcingClassificationGUI(QWidget):
                 writer.writerow(header)
                 writer.writerows(summary_rows)
         except Exception as e:
-            print(f"❌ 장비 요약 CSV 재작성 실패: {e}")
+            print(f"장비 요약 CSV 재작성 실패: {e}")
 
         if latest_ctx is None:
             return
@@ -1367,10 +1340,8 @@ class IcingClassificationGUI(QWidget):
                     attempt_val_int = None
 
                 if lot_val == start_lot and attempt_val_int == start_attempt:
-                    # FeedingTime 비움
                     if feed_idx < len(r):
                         r[feed_idx] = ""
-                    # 리드타임도 같이 비움(선택)
                     if iced_to_feed_idx is not None and iced_to_feed_idx < len(r):
                         r[iced_to_feed_idx] = ""
                     changed = True
@@ -1403,12 +1374,8 @@ class IcingClassificationGUI(QWidget):
         equip_csv_path = CSV_OUTPUT_DIR / f"{equip}.csv"
         self.equip_csv_path = equip_csv_path
 
-        header = [
-            "Equip", "Start_Lot", "Start_Attempt", "End_Lot", "End_Attempt",
-            "MeltedTime", "IcingTime", "IcedTime", "FeedingTime",
-            "MeltedToIcing(min)", "IcingToIced(min)", "IcedToFeeding(min)",
-            "LastImageName", "LastImageTime"
-        ]
+        header = ["Equip", "Start_Lot", "Start_Attempt", "End_Lot", "End_Attempt", "MeltedTime", "IcingTime", "IcedTime", "FeedingTime",
+                  "MeltedToIcing(min)", "IcingToIced(min)", "IcedToFeeding(min)", "LastImageName", "LastImageTime"]
 
         # 기존 CSV 로드
         rows_dict: dict[tuple[str, int], list[str]] = {}
@@ -1455,22 +1422,9 @@ class IcingClassificationGUI(QWidget):
                         last_img_old = _csv_get(row, idx_map, "LastImageName")
                         last_time_old = _csv_get(row, idx_map, "LastImageTime")
 
-                        rows_dict[(start_lot_old, start_attempt_key_val)] = [
-                            equip_old,
-                            start_lot_old,
-                            str(start_attempt_key_val),
-                            end_lot_old,
-                            end_attempt_old,
-                            melted_old,
-                            icing_old,
-                            iced_old,
-                            feeding_old,
-                            melted_icing_old,
-                            icing_iced_old,
-                            iced_feeding_old,
-                            last_img_old,
-                            last_time_old,
-                        ]
+                        rows_dict[(start_lot_old, start_attempt_key_val)] = [equip_old, start_lot_old, str(start_attempt_key_val), end_lot_old, end_attempt_old,
+                                                                             melted_old, icing_old, iced_old, feeding_old, melted_icing_old, icing_iced_old, iced_feeding_old,
+                                                                             last_img_old, last_time_old]
 
                         # 이번 Cycle의 기존 FeedingTime 저장
                         if start_lot_old == start_lot and start_attempt_key_val == start_attempt_val:
@@ -1478,7 +1432,7 @@ class IcingClassificationGUI(QWidget):
                                 existing_feeding_dt_for_this_cycle = feeding_dt_old
 
             except Exception as e:
-                print(f"⚠️ 장비 요약 CSV 읽기 실패: {e}")
+                print(f"장비 요약 CSV 읽기 실패: {e}")
 
         # FeedingTime 결정 (입력 feeding_dt가 없으면 기존 값 유지)
         incoming_feeding_dt = feeding_dt if isinstance(feeding_dt, QDateTime) and feeding_dt.isValid() else None
@@ -1500,22 +1454,8 @@ class IcingClassificationGUI(QWidget):
 
         last_img_time_str = self._qdatetime_to_str(last_img_dt)
 
-        new_row = [
-            equip,
-            start_lot,
-            str(start_attempt_val),
-            end_lot,
-            str(end_attempt_val),
-            melted_str,
-            icing_str,
-            iced_str,
-            feeding_str,
-            melted_icing,
-            icing_iced,
-            iced_feeding,
-            last_img_name or "",
-            last_img_time_str,
-        ]
+        new_row = [equip, start_lot, str(start_attempt_val), end_lot, str(end_attempt_val), melted_str, icing_str, iced_str, feeding_str,
+                   melted_icing, icing_iced, iced_feeding, last_img_name or "", last_img_time_str]
 
         # upsert & 저장
         rows_dict[(start_lot, start_attempt_val)] = new_row
@@ -1527,23 +1467,21 @@ class IcingClassificationGUI(QWidget):
                 writer.writerow(header)
                 writer.writerows(rows)
         except Exception as e:
-            print(f"❌ 장비 요약 CSV 저장 실패: {e}")
+            print(f"장비 요약 CSV 저장 실패: {e}")
 
     def _poll_latest_image(self):
         """FeedingTime 기록 트리거 (비허용 공정으로 '진입'한 후 9초 경과 or 마지막 이미지 유입/처리 이후 9초 경과)"""
         now = time.monotonic()
 
         # (A) 비허용 공정 진입 후 9초 경과 트리거
-        if (
-            self.disallowed_mode_latched
+        if (self.disallowed_mode_latched
             and self.disallowed_entered_at > 0.0
             and (not self._feeding_trigger_a_fired)
-            and (now - self.disallowed_entered_at) >= self.no_new_image_grace_s
-        ):
+            and (now - self.disallowed_entered_at) >= self.no_new_image_grace_s):
             if self._record_feeding_time(trigger="A"):
                 self._feeding_trigger_a_fired = True
 
-        # (B) 이미지 유입 중단 상태 감지
+        # (B) 이미지 유입 중단 후 후 9초 경과 트리거
         if now < self._status_hold_until:
             return
         if now < self._no_image_grace_until:
@@ -1556,12 +1494,18 @@ class IcingClassificationGUI(QWidget):
             self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
             self._set_status("신규 이미지 없음 (폴더 감시 중)", hold_s=0.0)
 
-            # ✅ 이미 B 트리거가 fired 되었어도 화면은 갱신되게 하고,
-            #    FeedingTime 기록만 1회로 제한
             if not self._feeding_trigger_b_fired:
                 if self._record_feeding_time(trigger="B"):
                     self._feeding_trigger_b_fired = True
             return
+
+    def _is_cycle_stage_times_ready(self, starts: dict[str, QDateTime | None]) -> bool:
+        """Melted/Icing/Iced 시작 시각이 모두 기록됐는지 체크"""
+        for k in ("Melted", "Icing", "Iced"):
+            dt = starts.get(k)
+            if not isinstance(dt, QDateTime) or not dt.isValid():
+                return False
+        return True
 
     def _record_feeding_time(self, trigger: str) -> bool:
         """FeedingTime 기록"""
@@ -1584,24 +1528,27 @@ class IcingClassificationGUI(QWidget):
         if self.current_cycle_start_lot is None or self.current_cycle_start_attempt is None:
             return False
 
+        # Melted/Icing/Iced 3개가 모두 기록된 경우에만 FeedingTime 기록
         starts = self._get_earliest_for(self.current_cycle_start_lot, self.current_cycle_start_attempt)
+        if not self._is_cycle_stage_times_ready(starts):
+            return False
+
         self._update_equip_summary({"equip": equip_val, "lot": lot, "attempt": attempt_val}, starts, last_img_name or "", feeding_dt, feeding_dt)
         self.current_cycle_completed = True
 
+        # 최근 cycle candidate 갱신
         try:
-            if (
-                self.current_cycle_start_lot is not None
+            if (self.current_cycle_start_lot is not None
                 and self.current_cycle_start_attempt is not None
                 and isinstance(self.cycle_csv_path, Path)
                 and isinstance(feeding_dt, QDateTime)
-                and feeding_dt.isValid()
-            ):
+                and feeding_dt.isValid()):
                 self._recent_cycle_candidate = {
                     "cycle_csv_path": self.cycle_csv_path,
                     "cycle_key": (self.current_cycle_start_lot, int(self.current_cycle_start_attempt)),
                     "last_dt": feeding_dt,
                     "feeding_dt": feeding_dt,
-                    "completed": True,
+                    "completed": True
                 }
         except Exception:
             pass
@@ -1675,21 +1622,57 @@ class IcingClassificationGUI(QWidget):
         """Cycle 전환 여부를 판단하고 <Cycle 상세 csv> 경로/상태를 준비"""
 
         cand = self._recent_cycle_candidate
-        if (
-            cand
-            and isinstance(cur_dt, QDateTime) and cur_dt.isValid()
-            and (self.cycle_csv_path is None or cand.get("cycle_csv_path") == self.cycle_csv_path)
-        ):
+
+        # FeedingTime 여부와 무관하게 마지막 처리 시각 대비 60분 이상이면 강제 새 cycle 시작
+        if isinstance(cur_dt, QDateTime) and cur_dt.isValid():
+            ref_dt = None
+
+            if isinstance(cand, dict):
+                ref_dt = cand.get("last_dt")
+
+            if not (isinstance(ref_dt, QDateTime) and ref_dt.isValid()):
+                ref_dt = self.last_processed_dt
+
+            if isinstance(ref_dt, QDateTime) and ref_dt.isValid():
+                cur_py = _qdatetime_to_datetime(cur_dt)
+                ref_py = _qdatetime_to_datetime(ref_dt)
+
+                if cur_py is not None and ref_py is not None:
+                    diff_min = (cur_py - ref_py).total_seconds() / 60.0
+
+                    # 60분 이상 "미래" 갭일 때만 새 cycle
+                    if diff_min >= 60.0:
+                        self.current_cycle_start_lot = lot_number
+                        self.current_cycle_start_attempt = attempt_value
+                        self.cycle_csv_path = LOT_DETAILS_DIR / f"{lot_number}_{attempt_value}.csv"
+                        self.current_cycle_completed = False
+
+                        self._reset_panel()
+                        self.processed_images.clear()
+                        self._reset_label_streak()
+
+                        keep_last = (
+                            isinstance(self.last_allowed_image_info, dict)
+                            and isinstance(self.last_allowed_image_info.get("dt"), QDateTime)
+                            and self.last_allowed_image_info["dt"].isValid()
+                            and self.last_allowed_image_info.get("lot") is not None
+                            and self.last_allowed_image_info.get("attempt") is not None
+                        )
+                        self._reset_feeding_state(keep_last_allowed=keep_last)
+
+                        self._recent_cycle_candidate = None
+                        return
+
+        cand_completed = bool(cand.get("completed")) if isinstance(cand, dict) else False
+
+        if (cand_completed and isinstance(cur_dt, QDateTime) and cur_dt.isValid()
+            and (self.cycle_csv_path is None or cand.get("cycle_csv_path") == self.cycle_csv_path)):
             cycle_path = cand.get("cycle_csv_path")
             cycle_key = cand.get("cycle_key")
             last_dt = cand.get("last_dt")
             feeding_dt = cand.get("feeding_dt")
 
-            if (
-                isinstance(cycle_path, Path)
-                and isinstance(cycle_key, tuple)
-                and isinstance(last_dt, QDateTime) and last_dt.isValid()
-            ):
+            if (isinstance(cycle_path, Path) and isinstance(cycle_key, tuple) and isinstance(last_dt, QDateTime) and last_dt.isValid()):
                 cur_py = _qdatetime_to_datetime(cur_dt)
                 last_py = _qdatetime_to_datetime(last_dt)
 
@@ -1734,13 +1717,11 @@ class IcingClassificationGUI(QWidget):
             self.processed_images.clear()
             self._reset_label_streak()
 
-            keep_last = (
-                isinstance(self.last_allowed_image_info, dict)
-                and isinstance(self.last_allowed_image_info.get("dt"), QDateTime)
-                and self.last_allowed_image_info["dt"].isValid()
-                and self.last_allowed_image_info.get("lot") is not None
-                and self.last_allowed_image_info.get("attempt") is not None
-            )
+            keep_last = (isinstance(self.last_allowed_image_info, dict)
+                         and isinstance(self.last_allowed_image_info.get("dt"), QDateTime)
+                         and self.last_allowed_image_info["dt"].isValid()
+                         and self.last_allowed_image_info.get("lot") is not None
+                         and self.last_allowed_image_info.get("attempt") is not None)
 
             self._reset_feeding_state(keep_last_allowed=keep_last)
 
@@ -1836,13 +1817,11 @@ class IcingClassificationGUI(QWidget):
                     self.last_processed_dt = cur_dt
 
             try:
-                if (
-                    self.current_cycle_start_lot is not None
+                if (self.current_cycle_start_lot is not None
                     and self.current_cycle_start_attempt is not None
                     and isinstance(self.cycle_csv_path, Path)
                     and isinstance(self.last_processed_dt, QDateTime)
-                    and self.last_processed_dt.isValid()
-                ):
+                    and self.last_processed_dt.isValid()):
                     self._recent_cycle_candidate = {
                         "cycle_csv_path": self.cycle_csv_path,
                         "cycle_key": (self.current_cycle_start_lot, int(self.current_cycle_start_attempt)),
@@ -2050,7 +2029,6 @@ def main():
     if gui.auto_start_on_launch:
         gui.start_realtime()
     sys.exit(app.exec())
-
 
 if __name__ == '__main__':
     main()
