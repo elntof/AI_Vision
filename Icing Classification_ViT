@@ -1258,9 +1258,8 @@ class IcingClassificationGUI(QWidget):
             icing_iced = compute_lead_minutes(icing_dt, iced_dt)
             iced_feeding = compute_lead_minutes(iced_dt, feeding_dt)
 
-            summary_rows.append([self.current_equip, start_lot, str(start_attempt), end_lot, "" if end_attempt_val is None else str(end_attempt_val),
-                self._qdatetime_to_str(melted_dt), self._qdatetime_to_str(icing_dt), self._qdatetime_to_str(iced_dt), self._qdatetime_to_str(feeding_dt),
-                melted_icing, icing_iced, iced_feeding, last_img_name or "", self._qdatetime_to_str(last_img_dt)])
+            summary_rows.append([self.current_equip, start_lot, str(start_attempt), end_lot, "" if end_attempt_val is None else str(end_attempt_val), self._qdatetime_to_str(melted_dt),
+                                 self._qdatetime_to_str(icing_dt), self._qdatetime_to_str(iced_dt), self._qdatetime_to_str(feeding_dt), melted_icing, icing_iced, iced_feeding])
 
             if last_img_dt and isinstance(last_img_dt, QDateTime) and last_img_dt.isValid():
                 py_dt = _qdatetime_to_datetime(last_img_dt)
@@ -1268,8 +1267,7 @@ class IcingClassificationGUI(QWidget):
                     latest_py_dt = py_dt
                     latest_ctx = (cycle_key, starts.copy(), last_img_name, last_img_dt, processed, last_label, last_probs)
 
-        header = ["Equip", "Start_Lot", "Start_Attempt", "End_Lot", "End_Attempt", "MeltedTime", "IcingTime", "IcedTime", "FeedingTime",
-                  "MeltedToIcing(min)", "IcingToIced(min)", "IcedToFeeding(min)", "LastImageName", "LastImageTime"]
+        header = ["Equip", "Start_Lot", "Start_Attempt", "End_Lot", "End_Attempt", "MeltedTime", "IcingTime", "IcedTime", "FeedingTime", "MeltedToIcing(min)", "IcingToIced(min)", "IcedToFeeding(min)"]
 
         if summary_rows:
             try:
@@ -1386,8 +1384,6 @@ class IcingClassificationGUI(QWidget):
                 self._qdatetime_to_str(iced_dt),
                 self._qdatetime_to_str(feeding_dt),
                 melted_icing, icing_iced, iced_feeding,
-                last_img_name or "",
-                self._qdatetime_to_str(last_img_dt),
             ])
 
         # streak 상태 복원
@@ -1396,8 +1392,7 @@ class IcingClassificationGUI(QWidget):
         if not summary_rows:
             return
 
-        header = ["Equip", "Start_Lot", "Start_Attempt", "End_Lot", "End_Attempt", "MeltedTime", "IcingTime", "IcedTime", "FeedingTime",
-                "MeltedToIcing(min)", "IcingToIced(min)", "IcedToFeeding(min)", "LastImageName", "LastImageTime"]
+        header = ["Equip", "Start_Lot", "Start_Attempt", "End_Lot", "End_Attempt", "MeltedTime", "IcingTime", "IcedTime", "FeedingTime", "MeltedToIcing(min)", "IcingToIced(min)", "IcedToFeeding(min)"]
 
         try:
             with open(equip_csv_path, "w", encoding="utf-8-sig", newline="") as f:
