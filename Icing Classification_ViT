@@ -1839,6 +1839,11 @@ class IcingClassificationGUI(QWidget):
             for p in IMG_INPUT_DIR.iterdir():
                 if p.suffix.lower() not in ALLOWED_IMAGE_EXTS:
                     continue
+                # 비허용 공정 이미지는 순회/대기하지 않고 건너뜀
+                info = parse_filename(p.name)
+                process_name = (info.get("process") or "").upper()
+                if process_name not in self.ALLOWED_PULLER_MODES:
+                    continue
                 if not self._is_after_last_processed(p):
                     continue
                 if p.name in self.processed_images:
