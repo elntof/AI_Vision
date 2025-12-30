@@ -1156,6 +1156,53 @@ class IcingClassificationGUI(QWidget):
 
         return starts, processed, last_img_name, last_img_dt, last_label, last_probs
 
+    def _read_existing_equip_summary(self, equip_csv_path: Path) -> dict[tuple[str, int], dict[str, object]]:
+        """<장비 요약 csv>를 읽어 FeedingTime 등 기존 요약 정보를 유지하기 위한 헬퍼"""
+        existing_summary: dict[tuple[str, int], dict[str, object]] = {}
+        if not equip_csv_path.exists():
+            return existing_summary
+
+        try:
+            with open(equip_csv_path, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, None) or []
+                idx_map = {name: i for i, name in enumerate(header)}
+
+                start_lot_key = "Start_Lot" if "Start_Lot" in idx_map else "Lot"
+                start_attempt_key = "Start_Attempt" if "Start_Attempt" in idx_map else "Attempt"
+                end_lot_key = "End_Lot"
+                end_attempt_key = "End_Attempt"
+
+                for row in reader:
+                    if not row:
+                        continue
+
+                    start_lot = _csv_get(row, idx_map, start_lot_key)
+                    start_attempt = _csv_get(row, idx_map, start_attempt_key)
+                    if not start_lot:
+                        continue
+                    try:
+                        start_attempt_val = int(start_attempt)
+                    except Exception:
+                        start_attempt_val = 0
+
+                    feeding_dt = self._str_to_qdatetime(_csv_get(row, idx_map, "FeedingTime"))
+                    end_lot = _csv_get(row, idx_map, end_lot_key) if end_lot_key in idx_map else ""
+                    end_attempt = _csv_get(row, idx_map, end_attempt_key) if end_attempt_key in idx_map else ""
+                    try:
+                        end_attempt_val = int(end_attempt) if end_attempt != "" else None
+                    except Exception:
+                        end_attempt_val = None
+
+                    existing_summary[(start_lot, start_attempt_val)] = {
+                        "feeding_dt": feeding_dt,
+                        "end_lot": end_lot,
+                        "end_attempt": end_attempt_val,
+                    }
+        except Exception as e:
+            print(f"장비 요약 CSV 읽기 실패: {e}")
+
+        return existing_summary
 
     def _load_equip_summary_from_csv(self):
         """<Cycle 상세 csv>를 리플레이해서 <장비#.csv> 정보를 재구성"""
@@ -1169,47 +1216,7 @@ class IcingClassificationGUI(QWidget):
         self._reset_label_streak()
         self._recent_cycle_candidate = None
 
-        existing_summary: dict[tuple[str, int], dict[str, object]] = {}
-        if self.equip_csv_path.exists():
-            try:
-                with open(self.equip_csv_path, "r", encoding="utf-8-sig", newline="") as f:
-                    reader = csv.reader(f)
-                    header = next(reader, None) or []
-                    idx_map = {name: i for i, name in enumerate(header)}
-
-                    start_lot_key = "Start_Lot" if "Start_Lot" in idx_map else "Lot"
-                    start_attempt_key = "Start_Attempt" if "Start_Attempt" in idx_map else "Attempt"
-                    end_lot_key = "End_Lot"
-                    end_attempt_key = "End_Attempt"
-
-                    for row in reader:
-                        if not row:
-                            continue
-
-                        start_lot = _csv_get(row, idx_map, start_lot_key)
-                        start_attempt = _csv_get(row, idx_map, start_attempt_key)
-                        if not start_lot:
-                            continue
-                        try:
-                            start_attempt_val = int(start_attempt)
-                        except Exception:
-                            start_attempt_val = 0
-
-                        feeding_dt = self._str_to_qdatetime(_csv_get(row, idx_map, "FeedingTime"))
-                        end_lot = _csv_get(row, idx_map, end_lot_key) if end_lot_key in idx_map else ""
-                        end_attempt = _csv_get(row, idx_map, end_attempt_key) if end_attempt_key in idx_map else ""
-                        try:
-                            end_attempt_val = int(end_attempt) if end_attempt != "" else None
-                        except Exception:
-                            end_attempt_val = None
-
-                        existing_summary[(start_lot, start_attempt_val)] = {
-                            "feeding_dt": feeding_dt,
-                            "end_lot": end_lot,
-                            "end_attempt": end_attempt_val,
-                        }
-            except Exception as e:
-                print(f"장비 요약 CSV 읽기 실패: {e}")
+        existing_summary = self._read_existing_equip_summary(self.equip_csv_path)
 
         # Cycle 단위로 리플레이한 결과를 모아 장비 요약을 재작성
         summary_rows: list[list[str]] = []
@@ -1261,19 +1268,17 @@ class IcingClassificationGUI(QWidget):
                     latest_py_dt = py_dt
                     latest_ctx = (cycle_key, starts.copy(), last_img_name, last_img_dt, processed, last_label, last_probs)
 
-        if not summary_rows:
-            return
-
         header = ["Equip", "Start_Lot", "Start_Attempt", "End_Lot", "End_Attempt", "MeltedTime", "IcingTime", "IcedTime", "FeedingTime",
                   "MeltedToIcing(min)", "IcingToIced(min)", "IcedToFeeding(min)", "LastImageName", "LastImageTime"]
 
-        try:
-            with open(self.equip_csv_path, "w", encoding="utf-8-sig", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(header)
-                writer.writerows(summary_rows)
-        except Exception as e:
-            print(f"장비 요약 CSV 재작성 실패: {e}")
+        if summary_rows:
+            try:
+                with open(self.equip_csv_path, "w", encoding="utf-8-sig", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(header)
+                    writer.writerows(summary_rows)
+            except Exception as e:
+                print(f"장비 요약 CSV 재작성 실패: {e}")
 
         if latest_ctx is None:
             return
@@ -1315,183 +1320,90 @@ class IcingClassificationGUI(QWidget):
 
         self._reset_label_streak()
 
-    def _clear_feeding_time_for_cycle(self, cycle_key: tuple[str, int]):
-        """장비 요약 CSV에서 특정 Cycle(Start_Lot, Start_Attempt)의 FeedingTime을 비워 '미완료'로 되돌림"""
-        try:
-            if not isinstance(cycle_key, tuple) or len(cycle_key) != 2:
-                return
-            start_lot, start_attempt = cycle_key
-            try:
-                start_attempt = int(start_attempt)
-            except Exception:
-                return
-
-            equip_csv_path = self.equip_csv_path
-            if not isinstance(equip_csv_path, Path) or not equip_csv_path.exists():
-                if self.current_equip:
-                    equip_csv_path = CSV_OUTPUT_DIR / f"{self.current_equip}.csv"
-                else:
-                    return
-            if not equip_csv_path.exists():
-                return
-
-            with open(equip_csv_path, "r", encoding="utf-8-sig", newline="") as f:
-                reader = csv.reader(f)
-                header = next(reader, None) or []
-                rows = list(reader)
-
-            if not header or not rows:
-                return
-
-            idx = {name: i for i, name in enumerate(header)}
-            start_lot_key = "Start_Lot" if "Start_Lot" in idx else "Lot"
-            start_attempt_key = "Start_Attempt" if "Start_Attempt" in idx else "Attempt"
-
-            feed_idx = idx.get("FeedingTime", None)
-            iced_to_feed_idx = idx.get("IcedToFeeding(min)", None)
-
-            if feed_idx is None:
-                return
-
-            changed = False
-            for r in rows:
-                if not r:
-                    continue
-
-                lot_val = _csv_get(r, idx, start_lot_key)
-                attempt_val = _csv_get(r, idx, start_attempt_key)
-                try:
-                    attempt_val_int = int(attempt_val)
-                except Exception:
-                    attempt_val_int = None
-
-                if lot_val == start_lot and attempt_val_int == start_attempt:
-                    if feed_idx < len(r):
-                        r[feed_idx] = ""
-                    if iced_to_feed_idx is not None and iced_to_feed_idx < len(r):
-                        r[iced_to_feed_idx] = ""
-                    changed = True
-                    break
-
-            if not changed:
-                return
-
-            with open(equip_csv_path, "w", encoding="utf-8-sig", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(header)
-                writer.writerows(rows)
-
-        except Exception:
+    def _rebuild_equip_summary(self, feeding_override: dict[tuple[str, int], QDateTime | None] | None = None):
+        """FeedingTime 시점에만 <Cycle 상세 csv>를 집계해 <장비 요약 csv>를 재생성"""
+        if not self.current_equip:
             return
 
-    def _update_equip_summary(self, info: dict, starts: dict[str, QDateTime | None], last_img_name: str, last_img_dt: QDateTime | None, feeding_dt: QDateTime | None = None):
-        """<장비#.csv> 구성: Cycle별 1행 Summary (Melted/Icing/Iced/Feeding 시각, 리드타임, 마지막 이미지 정보 저장)"""
-        equip = info.get("equip") or ""
-        end_lot = info.get("lot") or ""
-        end_attempt_val = int(info.get("attempt") or 0)
-        if not equip:
-            return
-
-        start_lot = self.current_cycle_start_lot or end_lot
-        start_attempt_val = int(self.current_cycle_start_attempt or end_attempt_val)
-        if not start_lot:
-            return
-
-        equip_csv_path = CSV_OUTPUT_DIR / f"{equip}.csv"
+        equip_csv_path = CSV_OUTPUT_DIR / f"{self.current_equip}.csv"
         self.equip_csv_path = equip_csv_path
 
+        # 기존 요약 정보(FeedingTime 등)를 보존하기 위해 먼저 읽어둔다
+        existing_summary = self._read_existing_equip_summary(equip_csv_path)
+
+        # 상태 보존: 실시간 판정 streak 상태는 요약 재생성에 의해 흔들리지 않도록 저장/복원
+        saved_streak = (self._streak_label, self._streak_count, self._streak_start_dt)
+
+        summary_rows: list[list[str]] = []
+        for cycle_csv in sorted(LOT_DETAILS_DIR.glob("*.csv")):
+            cycle_key = self._parse_cycle_filename(cycle_csv)
+            if cycle_key is None:
+                continue
+            start_lot, start_attempt = cycle_key
+
+            starts, _, last_img_name, last_img_dt, _, _ = self._load_cycle_details(cycle_csv)
+
+            # End 정보
+            end_lot = ""
+            end_attempt_val: int | None = None
+            if last_img_name:
+                end_info = parse_filename(last_img_name)
+                end_lot = end_info.get("lot") or ""
+                try:
+                    end_attempt_val = int(end_info.get("attempt") or 0)
+                except Exception:
+                    end_attempt_val = None
+
+            # FeedingTime 결정: override가 있으면 우선, 없으면 기존 요약에서 유지
+            existing = existing_summary.get(cycle_key, {})
+
+            feeding_dt: QDateTime | None = None
+            if feeding_override is not None and cycle_key in feeding_override:
+                ov = feeding_override.get(cycle_key)
+                feeding_dt = ov if (isinstance(ov, QDateTime) and ov.isValid()) else None
+            else:
+                ft = existing.get("feeding_dt")
+                feeding_dt = ft if (isinstance(ft, QDateTime) and ft.isValid()) else None
+
+            # end_lot/end_attempt도 가능하면 기존 요약값을 우선 유지
+            end_lot = existing.get("end_lot") or end_lot
+            end_attempt_val = existing.get("end_attempt") if existing.get("end_attempt") is not None else end_attempt_val
+
+            melted_dt = starts.get("Melted")
+            icing_dt = starts.get("Icing")
+            iced_dt = starts.get("Iced")
+
+            melted_icing = compute_lead_minutes(melted_dt, icing_dt)
+            icing_iced = compute_lead_minutes(icing_dt, iced_dt)
+            iced_feeding = compute_lead_minutes(iced_dt, feeding_dt)
+
+            summary_rows.append([
+                self.current_equip,
+                start_lot, str(start_attempt),
+                end_lot, "" if end_attempt_val is None else str(end_attempt_val),
+                self._qdatetime_to_str(melted_dt),
+                self._qdatetime_to_str(icing_dt),
+                self._qdatetime_to_str(iced_dt),
+                self._qdatetime_to_str(feeding_dt),
+                melted_icing, icing_iced, iced_feeding,
+                last_img_name or "",
+                self._qdatetime_to_str(last_img_dt),
+            ])
+
+        # streak 상태 복원
+        self._streak_label, self._streak_count, self._streak_start_dt = saved_streak
+
+        if not summary_rows:
+            return
+
         header = ["Equip", "Start_Lot", "Start_Attempt", "End_Lot", "End_Attempt", "MeltedTime", "IcingTime", "IcedTime", "FeedingTime",
-                  "MeltedToIcing(min)", "IcingToIced(min)", "IcedToFeeding(min)", "LastImageName", "LastImageTime"]
-
-        # 기존 CSV 로드
-        rows_dict: dict[tuple[str, int], list[str]] = {}
-        existing_feeding_dt_for_this_cycle: QDateTime | None = None
-
-        if equip_csv_path.exists():
-            try:
-                with open(equip_csv_path, "r", encoding="utf-8-sig", newline="") as f:
-                    reader = csv.reader(f)
-                    _old_header = next(reader, None) or []
-                    idx_map = {name: i for i, name in enumerate(_old_header)}
-
-                    start_lot_key = "Start_Lot" if "Start_Lot" in idx_map else "Lot"
-                    start_attempt_key = "Start_Attempt" if "Start_Attempt" in idx_map else "Attempt"
-
-                    for row in reader:
-                        if not row:
-                            continue
-
-                        equip_old = _csv_get(row, idx_map, "Equip")
-                        start_lot_old = _csv_get(row, idx_map, start_lot_key)
-                        start_attempt_old = _csv_get(row, idx_map, start_attempt_key)
-
-                        try:
-                            start_attempt_key_val = int(start_attempt_old)
-                        except Exception:
-                            start_attempt_key_val = 0
-
-                        end_lot_old = _csv_get(row, idx_map, "End_Lot")
-                        end_attempt_old = _csv_get(row, idx_map, "End_Attempt")
-                        melted_old = _csv_get(row, idx_map, "MeltedTime")
-                        icing_old = _csv_get(row, idx_map, "IcingTime")
-                        iced_old = _csv_get(row, idx_map, "IcedTime")
-                        feeding_old = _csv_get(row, idx_map, "FeedingTime")
-
-                        melted_dt_old = self._str_to_qdatetime(melted_old)
-                        icing_dt_old = self._str_to_qdatetime(icing_old)
-                        iced_dt_old = self._str_to_qdatetime(iced_old)
-                        feeding_dt_old = self._str_to_qdatetime(feeding_old)
-
-                        melted_icing_old = _csv_get(row, idx_map, "MeltedToIcing(min)") or compute_lead_minutes(melted_dt_old, icing_dt_old)
-                        icing_iced_old = _csv_get(row, idx_map, "IcingToIced(min)") or compute_lead_minutes(icing_dt_old, iced_dt_old)
-                        iced_feeding_old = _csv_get(row, idx_map, "IcedToFeeding(min)") or compute_lead_minutes(iced_dt_old, feeding_dt_old)
-                        last_img_old = _csv_get(row, idx_map, "LastImageName")
-                        last_time_old = _csv_get(row, idx_map, "LastImageTime")
-
-                        rows_dict[(start_lot_old, start_attempt_key_val)] = [equip_old, start_lot_old, str(start_attempt_key_val), end_lot_old, end_attempt_old,
-                                                                             melted_old, icing_old, iced_old, feeding_old, melted_icing_old, icing_iced_old, iced_feeding_old,
-                                                                             last_img_old, last_time_old]
-
-                        # 이번 Cycle의 기존 FeedingTime 저장
-                        if start_lot_old == start_lot and start_attempt_key_val == start_attempt_val:
-                            if isinstance(feeding_dt_old, QDateTime) and feeding_dt_old.isValid():
-                                existing_feeding_dt_for_this_cycle = feeding_dt_old
-
-            except Exception as e:
-                print(f"장비 요약 CSV 읽기 실패: {e}")
-
-        # FeedingTime 결정 (입력 feeding_dt가 없으면 기존 값 유지)
-        incoming_feeding_dt = feeding_dt if isinstance(feeding_dt, QDateTime) and feeding_dt.isValid() else None
-        effective_feeding_dt = incoming_feeding_dt or existing_feeding_dt_for_this_cycle
-
-        # 새 row 계산
-        melted_dt = starts.get("Melted")
-        icing_dt = starts.get("Icing")
-        iced_dt = starts.get("Iced")
-
-        melted_str = self._qdatetime_to_str(melted_dt)
-        icing_str = self._qdatetime_to_str(icing_dt)
-        iced_str = self._qdatetime_to_str(iced_dt)
-        feeding_str = self._qdatetime_to_str(effective_feeding_dt)
-
-        melted_icing = compute_lead_minutes(melted_dt, icing_dt)
-        icing_iced = compute_lead_minutes(icing_dt, iced_dt)
-        iced_feeding = compute_lead_minutes(iced_dt, effective_feeding_dt)
-
-        last_img_time_str = self._qdatetime_to_str(last_img_dt)
-
-        new_row = [equip, start_lot, str(start_attempt_val), end_lot, str(end_attempt_val), melted_str, icing_str, iced_str, feeding_str,
-                   melted_icing, icing_iced, iced_feeding, last_img_name or "", last_img_time_str]
-
-        # upsert & 저장
-        rows_dict[(start_lot, start_attempt_val)] = new_row
-        rows = list(rows_dict.values())
+                "MeltedToIcing(min)", "IcingToIced(min)", "IcedToFeeding(min)", "LastImageName", "LastImageTime"]
 
         try:
             with open(equip_csv_path, "w", encoding="utf-8-sig", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow(header)
-                writer.writerows(rows)
+                writer.writerows(summary_rows)
         except Exception as e:
             print(f"장비 요약 CSV 저장 실패: {e}")
 
@@ -1538,7 +1450,6 @@ class IcingClassificationGUI(QWidget):
         info = self.last_allowed_image_info
         lot = info.get("lot") if isinstance(info, dict) else None
         attempt_val = info.get("attempt") if isinstance(info, dict) else None
-        last_img_name = info.get("name") if isinstance(info, dict) else None
         feeding_dt = info.get("dt") if isinstance(info, dict) else None
         equip = info.get("equip") if isinstance(info, dict) else None
 
@@ -1559,7 +1470,9 @@ class IcingClassificationGUI(QWidget):
         if not self._is_cycle_stage_times_ready(starts):
             return False
 
-        self._update_equip_summary({"equip": equip_val, "lot": lot, "attempt": attempt_val}, starts, last_img_name or "", feeding_dt, feeding_dt)
+        # FeedingTime 입력 시점에만 Cycle 상세 csv를 집계해 요약을 재생성
+        cycle_key = (self.current_cycle_start_lot, int(self.current_cycle_start_attempt))
+        self._rebuild_equip_summary({cycle_key: feeding_dt})
         self.current_cycle_completed = True
 
         # 최근 cycle candidate 갱신
@@ -1575,7 +1488,7 @@ class IcingClassificationGUI(QWidget):
         self._poll_latest_image()
 
     def _is_after_last_processed(self, img_path: Path) -> bool:
-        """<장비#.csv> 기준 '마지막 처리된 시각(self.last_processed_dt)' 이후의 이미지인지 여부 확인"""
+        """<Cycle 상세 csv> 기반으로 '마지막 처리된 시각(self.last_processed_dt)' 이후 이미지인지 여부 확인"""
         if self.last_processed_dt is None or not isinstance(self.last_processed_dt, QDateTime):
             return True
         if not self.last_processed_dt.isValid():
@@ -1665,7 +1578,6 @@ class IcingClassificationGUI(QWidget):
             cycle_path = cand.get("cycle_csv_path")
             cycle_key = cand.get("cycle_key")
             last_dt = cand.get("last_dt")
-            feeding_dt = cand.get("feeding_dt")
 
             if (isinstance(cycle_path, Path) and isinstance(cycle_key, tuple) and isinstance(last_dt, QDateTime) and last_dt.isValid()):
                 cur_py = _qdatetime_to_datetime(cur_dt)
@@ -1677,16 +1589,10 @@ class IcingClassificationGUI(QWidget):
 
                 # last_dt와 60분 이내면 Cycle 이어붙이기(resume)
                 if diff_min is not None and 0.0 <= diff_min < 60.0:
-                    # 1) FeedingTime이 찍혀 있었고, 그 이후 이미지가 들어오면 FeedingTime 무효화
-                    if isinstance(feeding_dt, QDateTime) and feeding_dt.isValid():
-                        f_py = _qdatetime_to_datetime(feeding_dt)
-                        if cur_py is not None and f_py is not None and cur_py > f_py:
-                            self._clear_feeding_time_for_cycle(cycle_key)
-
-                    # 2) Cycle 상세 재로딩
+                    # 1) FeedingTime 롤백 없이 Cycle 상세 재로딩으로 이어붙이기 (요약은 다음 FeedingTime 때 재생성)
                     starts, processed, _, last_img_dt, _, _ = self._load_cycle_details(cycle_path)
 
-                    # 3) 상태 복원 (진행중으로 전환)
+                    # 2) 상태 복원 (진행중으로 전환)
                     self.current_cycle_start_lot, self.current_cycle_start_attempt = cycle_key
                     self.cycle_csv_path = cycle_path
                     self.processed_images = processed
@@ -1696,7 +1602,7 @@ class IcingClassificationGUI(QWidget):
                     if isinstance(last_img_dt, QDateTime) and last_img_dt.isValid():
                         self.last_processed_dt = last_img_dt
 
-                    # 4) resume 직후 candidate는 항상 진행중으로 갱신
+                    # 3) resume 직후 candidate는 항상 진행중으로 갱신
                     last_dt_candidate = (
                         last_img_dt if (isinstance(last_img_dt, QDateTime) and last_img_dt.isValid())
                         else last_dt
@@ -1739,7 +1645,7 @@ class IcingClassificationGUI(QWidget):
         self._mark_image_processed(img_name)
 
     def process_single_image(self, img_path: Path):
-        """단일 이미지 처리 루틴 (파일명 파싱 → Cycle 상태 갱신 → 분류 → CSV 기록 → 장비 요약 → 미리보기·패널·상태 갱신 처리)"""
+        """단일 이미지 처리 루틴 (파일명 파싱 → Cycle 상태 갱신 → 분류 → 상세 CSV 기록 → 미리보기·패널·상태 갱신 처리)"""
         try:
             info = parse_filename(img_path.name)
             lot_number = info['lot']
@@ -1799,7 +1705,7 @@ class IcingClassificationGUI(QWidget):
             row = [img_name, attempt_value, label]
             row.extend([f"{p:.4f}" for p in probs])
             self.save_csv(row)
-            self._update_equip_summary(info, starts, img_name, cur_dt)
+            # 장비 요약 CSV는 FeedingTime 시점에만 재생성 (실시간 갱신은 메모리 기반)
 
             if cur_dt and cur_dt.isValid():
                 old = _qdatetime_to_datetime(self.last_processed_dt) if self.last_processed_dt else None
