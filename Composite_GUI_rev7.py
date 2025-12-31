@@ -1,113 +1,341 @@
 import os
 import sys
-import time
-import re
-import csv
-from datetime import datetime
 from pathlib import Path
-from collections import deque
+from PIL import Image, ImageQt, ImageDraw, ImageFont
+from datetime import datetime, timedelta
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QPushButton, QVBoxLayout, QLabel, QHBoxLayout, QSpinBox,
+    QSlider, QCheckBox, QGroupBox, QGridLayout, QLineEdit, QSizePolicy
+)
+from PySide6.QtCore import QThread, Signal, Qt, QSettings, QTimer
+from PySide6.QtGui import QPixmap, QPainter, QColor, QPen, QGuiApplication
+import socket
+import csv
+import io
+from smb.SMBConnection import SMBConnection
+import time
 import numpy as np
 import cv2
-import torch
-import timm
-from PIL import Image, ImageOps
-from torchvision import transforms as T
-from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox,
-    QGroupBox, QSizePolicy, QLineEdit, QLayout, QCheckBox)
-from PySide6.QtCore import Qt, QTimer, QSettings, QThread, QObject, Signal, Slot, QDateTime, QRect
-from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QGuiApplication, QFont
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-
-# 환경 플래그: 경로 및 저장동작 테스트(True) / 운영(False) 모드 구분
-LOAD_TEST_MODE = True
-SAVE_TEST_MODE = True
-INI_TEST_MODE = True
-
-# 실행파일 실행 시, "자동 시작 동작 수행" 여부 플래그 : 자동 시작(True) / 수동 시작(False)
-AUTO_START_ON_LAUNCH = False
-
-# 이미지/CSV/INI 경로 설정
-if LOAD_TEST_MODE:
-    IMG_INPUT_DIR = Path('./Images')
-else:
-    IMG_INPUT_DIR = Path(r'D:/AI Vision/Images')
-
-if SAVE_TEST_MODE:
-    CSV_OUTPUT_DIR = Path('./icing_info')
-else:
-    CSV_OUTPUT_DIR = Path(r'D:/AI Vision/icing_info')
-
-LOT_DETAILS_DIR = CSV_OUTPUT_DIR / "lot details"
-
-if INI_TEST_MODE:
-    try:
-        ini_base_dir = Path(os.path.dirname(os.path.abspath(__file__)))
-    except Exception:
-        ini_base_dir = Path(os.getcwd())
-    INI_SETTINGS_PATH = ini_base_dir / "IcingClassificationApp.ini"
-else:
-    INI_SETTINGS_PATH = Path(r'D:/AI Vision/IcingClassificationApp.ini')
-
-# 출력 경로 생성
-os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
-os.makedirs(LOT_DETAILS_DIR, exist_ok=True)
+import ast
 
 # 메인 윈도우 기본 위치 (모니터 좌측 하단 기준 offset)
 WINDOW_OFFSET_X = 100
 WINDOW_OFFSET_Y = 200
 
-# 신규 이미지 부재 시 미리보기 플레이스홀더 텍스트
-NO_IMAGE_PLACEHOLDER_TEXT = "신규 이미지 없음"
-DISALLOWED_PLACEHOLDER_TEXT = "허용 공정이 아님"
+# ======== SMB 연결 정보 (카메라PC의 호스트명으로 장비PC와의 네트워크 자동 설정) ========
+host_name = socket.gethostname()
+if host_name.endswith('C'):
+    username = host_name[:-1]
+else:
+    username = host_name
+lookup_username = username.upper()
 
-# 감시 대상 이미지 확장자 목록
-ALLOWED_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
+# username-IP 매핑 리스트
+equipment_ip_map = {
+    "PU-X1": "172.29.136.61" , "PU-X2": "172.29.136.62" , "PU-X3": "172.29.136.63" , "PU-X4": "172.29.136.64" ,
+    "PU-X5": "172.29.136.65" , "PU-X6": "172.29.136.66" , "PU-X7": "172.29.136.67" , "PU-X8": "172.29.136.68" ,
+    "PU-X9": "172.29.136.69" , "PU-Y0": "172.29.136.70" , "PU-Y1": "172.29.136.71" , "PU-Y2": "172.29.136.72" ,
+    "PU-Y3": "172.29.136.73" , "PU-Y4": "172.29.136.74" , "PU-Y5": "172.29.136.75" , "PU-Y6": "172.29.136.76" ,
+    "PU-Y7": "172.29.136.77" , "PU-Y8": "172.29.136.78" , "PU-Y9": "172.29.136.79" , "PU-Z0": "172.29.136.80" ,
+    "PU-Z1": "172.29.136.81" , "PU-Z2": "172.29.136.82" , "PU-Z3": "172.29.136.83" , "PU-Z4": "172.29.136.84" ,
+    "PU-Z5": "172.29.136.85" , "PU-Z6": "172.29.136.86" , "PU-Z7": "172.29.136.87" , "PU-Z8": "172.29.136.88" ,
+    "PU-Z9": "172.29.136.89" , "PU-A0": "172.29.136.90" , "PU-A1": "172.29.136.91" , "PU-A2": "172.29.136.92" ,
+    "PU-A3": "172.29.136.93" , "PU-A4": "172.29.136.94" , "PU-A5": "172.29.136.95" , "PU-A6": "172.29.136.96" ,
+    "PU-A7": "172.29.136.97" , "PU-A8": "172.29.136.98" , "PU-A9": "172.29.136.99" , "PU-B0": "172.29.136.100",
+    "PU-B1": "172.29.136.101", "PU-B2": "172.29.136.102", "PU-B3": "172.29.136.103", "PU-B4": "172.29.136.104",
+    "PU-B5": "172.29.136.105", "PU-B6": "172.29.136.106", "PU-B7": "172.29.136.107", "PU-B8": "172.29.136.108",
+    "PU-B9": "172.29.136.109", "PU-C0": "172.29.136.110", "PU-C1": "172.29.136.111", "PU-C2": "172.29.136.112",
+    "PU-C3": "172.29.136.113", "PU-C4": "172.29.136.114", "PU-C5": "172.29.136.115", "PU-C6": "172.29.136.116",
+    "PU-C7": "172.29.136.117", "PU-C8": "172.29.136.118", "PU-C9": "172.29.136.119", "PU-D0": "172.29.136.120",
+    "PU-D1": "172.29.136.121", "PU-D2": "172.29.136.122", "PU-R1": "172.28.37.201" , "PU-R2": "172.28.37.202" ,
+    "PU-R3": "172.28.37.203" , "PU-R4": "172.28.37.204" , "PU-R5": "172.28.37.205" , "PU-R6": "172.28.37.206" ,
+    "PU-R7": "172.28.37.207" , "PU-R8": "172.28.37.208" , "PU-R9": "172.28.37.209" , "PU-S0": "172.28.37.210" ,
+    "PU-S1": "172.28.37.211" , "PU-S2": "172.28.37.212" , "PU-S3": "172.28.37.213" , "PU-S4": "172.28.37.214" ,
+    "PU-S5": "172.28.37.215" , "PU-S6": "172.28.37.216" , "PU-S7": "172.28.37.217" , "PU-S8": "172.28.37.218" ,
+    "PU-S9": "172.28.37.219" , "PU-T0": "172.28.37.220" , "PU-T1": "172.28.37.221" , "PU-T2": "172.28.37.222" ,
+    "PU-T3": "172.28.37.223" , "PU-T4": "172.28.37.224" , "PU-T5": "172.28.37.225" , "PU-T6": "172.28.37.226" ,
+    "PU-T7": "172.28.37.227" , "PU-T8": "172.28.37.228" , "PU-T9": "172.28.37.229" , "PU-U0": "172.28.37.230" ,
+    "PU-U1": "172.28.37.231" , "PU-U2": "172.28.37.232" , "PU-U3": "172.28.37.233" , "PU-U4": "172.28.37.234" ,
+    "PU-U5": "172.28.37.235" , "PU-U6": "172.28.37.236" , "PU-U7": "172.28.37.237" , "PU-U8": "172.28.37.238" ,
+    "PU-U9": "172.28.37.239" , "PU-V0": "172.28.37.240" , "PU-V1": "172.28.37.241" , "PU-V2": "172.28.37.242" ,
+    "PU-V3": "172.28.37.243" , "PU-V4": "172.28.37.244" , "PU-V5": "172.28.37.245" , "PU-V6": "172.28.37.246" ,
+    "PU-V7": "172.28.37.247" , "PU-V8": "172.28.37.248" , "PU-V9": "172.28.37.249" , "PU-W0": "172.28.37.250" ,
+    "PU-W1": "172.28.37.251" , "PU-W2": "172.28.37.252"
+}
 
-# 분류/ 판정 허용 공정
-ALLOWED_PULLER_MODES = {"BEFOFEED"}
+server_ip = equipment_ip_map.get(lookup_username, None)
 
-# ViT 분류 파라미터
-MODEL_NAME = "vit_small_patch16_224"
-CLASS_NAMES = ["Melted", "Icing", "Iced"]
+password = 'smin'                  # 계정 비밀번호
+client_name = host_name            # 카메라PC 네트워크(호스트) 이름
+server_name = username             # 장비PC 네트워크(호스트) 이름
+domain = ''                        # 도메인이 없으면 빈 문자열
+share_name = 'data'                # 설정 IP의 하위 폴더명
+# ===============================================================================
 
-def resource_path(rel_path: str) -> Path:
-    """PyInstaller(onefile) 포함 리소스 경로 헬퍼"""
-    base_dir = getattr(sys, "_MEIPASS", None)
-    if base_dir:
-        return Path(base_dir) / rel_path
-    return Path(__file__).resolve().parent / rel_path
-
-CHECKPOINT_PATH = resource_path("vit_melted_icing_iced_best_ema.pth")
-IMG_SIZE = 224
-
-# ROI 기본값
-DEFAULT_ROI_RECT = (40, 0, 200, 555)
-
-# 그래프 패널 크기
-PANEL_W_PX, PANEL_H_PX = 405, 270
-
-def clamp_roi_to_shape(roi: tuple[int, int, int, int] | None, width: int, height: int):
-    """이미지 크기에 맞춰 ROI를 보정"""
-    if roi is None:
-        return None
-    if width <= 0 or height <= 0:
-        return None
-    x, y, w, h = map(int, roi)
-    x = max(0, min(x, width - 1))
-    y = max(0, min(y, height - 1))
-    w = max(1, min(w, width - x))
-    h = max(1, min(h, height - y))
-    return x, y, w, h
-
-def safe_image_load(image_path, as_gray=False, max_retries=5, delay=0.2):
-    """안전 이미지 로딩 (재시도 최대 5회)"""
-    flag = cv2.IMREAD_GRAYSCALE if as_gray else cv2.IMREAD_UNCHANGED
-    for _ in range(max_retries):
+def maintain_max_files(output_folder, max_files):
+    """저장 폴더 내 파일이 설정 값(장) 초과 시 오래된 파일 삭제"""
+    files = list(output_folder.glob('*.*'))
+    if len(files) <= max_files:
+        return
+    files.sort(key=lambda f: f.stat().st_mtime)
+    to_delete = len(files) - max_files
+    for f in files[:to_delete]:
         try:
-            img_array = np.fromfile(str(image_path), dtype=np.uint8)
-            img = cv2.imdecode(img_array, flag)
+            f.unlink()
+        except Exception as e:
+            print(f'파일 삭제 실패: {f} - {e}')
+
+def parse_datetime(date_str, time_str):
+    """CSV의 'Date'와 'Time' 칼럼 값을 활용하여 datetime 객체로 변환"""
+    try:
+        dt = datetime.strptime(date_str.strip(), '%Y-%m-%d')
+        date_part = dt.strftime('%Y%m%d')
+    except Exception:
+        date_part = date_str.replace('-', '')
+
+    try:
+        t = time_str.strip()
+        tl = t.lower()
+        is_pm = ('오후' in tl) or ('pm' in tl)
+        is_am = ('오전' in tl) or ('am' in tl)
+
+        time_clean = (t.replace('오전','').replace('오후','').replace('AM','').replace('PM','').replace('am','').replace('pm','').strip())
+
+        try:
+            # 12시간제 우선
+            dt_time = datetime.strptime(time_clean, '%I:%M:%S')
+            hour = dt_time.hour
+            if is_pm and hour < 12:
+                hour += 12
+            if is_am and hour == 12:
+                hour = 0
+        except ValueError:
+            # 24시간제 폴백
+            dt_time = datetime.strptime(time_clean, '%H:%M:%S')
+            hour = dt_time.hour
+
+        dt_full = datetime.strptime(date_part, '%Y%m%d').replace(
+            hour=hour, minute=dt_time.minute, second=dt_time.second)
+        return dt_full
+    except Exception:
+        return None
+
+def extract_row_info(row):
+    """CSV에서 장비명, Lot#, Status, 날짜/시간 등의 정보 추출 후 딕셔너리로 반환"""
+    if row is None:
+        return {
+            "date_time": "",
+            "equipment": "",
+            "lot_number": "",
+            "status_display": "",
+            "status_text": "",
+            "puller_status": None
+        }
+
+    date_str = row.get('Date', '')
+    time_str = row.get('Time', '')
+    run_number = row.get('Run Number', '')
+    puller_status_raw = row.get('Puller Mode Status', '')
+    neck_attempt_raw = row.get('Neck Attempts', '')
+    max_light_raw = row.get('Camera 1 Max Light', '')
+    bottom_heater_raw = row.get('Bottom Heater Set Point', '')
+    seed_lift_raw = row.get('Seed Lift Set Point', '')
+
+    dt_full = parse_datetime(date_str, time_str)
+    if dt_full:
+        date_time = dt_full.strftime('%Y%m%d_%H%M%S')
+    else:
+        date_time = ''
+
+    equipment = host_name[3:5]
+    lot_number = run_number
+
+    puller_status_str = puller_status_raw.strip() if isinstance(puller_status_raw, str) else str(puller_status_raw)
+    try:
+        puller_status = int(float(puller_status_str))
+    except (ValueError, TypeError):
+        puller_status = None
+    try:
+        neck_attempt = int(float(neck_attempt_raw))
+    except (ValueError, TypeError):
+        neck_attempt = 0
+    try:
+        max_light = float(max_light_raw)
+    except (ValueError, TypeError):
+        max_light = 0.0
+    try:
+        bottom_heater = float(bottom_heater_raw)
+    except (ValueError, TypeError):
+        bottom_heater = 0.0
+    try:
+        seed_lift = float(seed_lift_raw)
+    except (ValueError, TypeError):
+        seed_lift = 0.0
+
+    status_map = {0: "IDLE", 4: "TAKEOVER", 5: "PUMPDOWN"}
+
+    if puller_status is not None:
+        if puller_status in status_map:
+            status_text = status_map[puller_status]
+        elif 10 <= puller_status <= 19:
+            status_text = "MELTDOWN"
+        elif 20 <= puller_status <= 29:
+            status_text = "STABILIZATION"
+        elif 30 <= puller_status <= 39:
+            # [mode 30~39 조건 下] ① Max Light==0 & BH Power≥5 → "BEFOFEED" / ② BH Power≥10 → "REMELT" / ③ Neck Att≥1 & Seed Lift≥0.1 → "NECK" / ④ 아니면 "NECK(STAB)"
+            if max_light == 0 and bottom_heater >= 5:
+                status_text = "BEFOFEED"
+            elif bottom_heater >= 10:
+                status_text = "REMELT"
+            else:
+                status_text = "NECK" if (neck_attempt >= 1 and seed_lift >= 0.1) else "NECK(STAB)"
+        elif 40 <= puller_status <= 49:
+            status_text = "CROWN"
+        elif 50 <= puller_status <= 59:
+            status_text = "SHOULDER"
+        elif 60 <= puller_status <= 69:
+            status_text = "BODY"
+        elif 70 <= puller_status <= 79:
+            status_text = "TAIL"
+        elif 80 <= puller_status <= 89:
+            status_text = "SHUTDOWN"
+        elif 90 <= puller_status <= 99:
+            # [mode 90~99 조건 下] ① Max Light==0 & BH Power≥5 → "BEFOFEED" / ② 아니면 "PULLOUT"
+            if max_light == 0 and bottom_heater >= 5:
+                status_text = "BEFOFEED"
+            else:
+                status_text = "PULLOUT"
+        else:
+            status_text = f"알 수 없는 상태({puller_status})"
+
+        status_display = f"{puller_status} / {status_text}"
+    else:
+        status_text = ""
+        status_display = f"{puller_status_str} / 상태 정보 없음"
+
+    return {
+        "date_time": date_time,
+        "dt": dt_full,
+        "equipment": equipment,
+        "lot_number": lot_number,
+        "status_display": status_display,
+        "status_text": status_text,
+        "puller_status": puller_status,
+        "max_light": max_light
+    }
+
+# Attempt_NEW 계산 (온라인/스트리밍)
+INTEREST_STATUSES = ("NECK", "CROWN", "SHOULDER", "BODY", "BEFOFEED")
+
+def find_closest_row_and_attempt(csv_text, target_dt):
+    """Attempt_NEW를 온라인 방식으로 계산 (현재시각 이하 중 가장 늦은 행 선택)"""
+    f = io.StringIO(csv_text)
+    reader = csv.DictReader(f)
+
+    counters = {s: 0 for s in INTEREST_STATUSES}
+    last_exit = {s: None for s in INTEREST_STATUSES}
+    prev_status = None
+    prev_lot = None
+    prev_dt = None
+
+    selected_row = None
+    selected_attempt = 0
+    selected_info = None
+    selected_dt = None
+
+    first_row = first_info = None
+    first_attempt = None
+
+    last_row = last_info = None
+    last_attempt = None
+    last_dt = None
+
+    for row in reader:
+        info = extract_row_info(row)
+        lot = info.get("lot_number", "")
+        status_text = info.get("status_text", "")
+        row_dt = info.get("dt")
+
+        # 동일 csv 내에서 Lot# 변경 시 카운터 리셋
+        if lot and lot != prev_lot:
+            counters = {s: 0 for s in INTEREST_STATUSES}
+            last_exit = {s: None for s in INTEREST_STATUSES}
+            prev_status = None
+            prev_dt = None
+            prev_lot = lot
+
+        old_status = prev_status
+        old_dt = prev_dt
+
+        # Attempt_NEW 계산 (설정된 Status 진입 시 이전 row와 다르면 해당 상태 카운터 +1)
+        if status_text in counters and old_status != status_text:
+            gap_too_short = False
+            last_exit_dt = last_exit.get(status_text)
+            if row_dt and last_exit_dt:
+                gap_too_short = (row_dt - last_exit_dt) < timedelta(minutes=5)  # 관심 공정 밖 공백이 5분 미만이면 카운팅 하지 않음
+
+            if not gap_too_short:
+                counters[status_text] += 1
+        attempt_now = counters.get(status_text, 0)
+
+        if row_dt:
+            # 첫 유효 행
+            if first_row is None:
+                first_row = row
+                first_info = info
+                first_attempt = attempt_now
+            # 전체 최신 행
+            if (last_dt is None) or (row_dt >= last_dt):
+                last_dt = row_dt
+                last_row = row
+                last_info = info
+                last_attempt = attempt_now
+            # target_dt 이하 중 가장 늦은 행 선택
+            if row_dt <= target_dt:
+                if (selected_dt is None) or (row_dt >= selected_dt):
+                    selected_dt = row_dt
+                    selected_row = row
+                    selected_attempt = attempt_now
+                    selected_info = info
+
+        if old_status in counters and status_text != old_status:
+            last_exit[old_status] = row_dt if row_dt else old_dt
+
+        prev_status = status_text
+        prev_dt = row_dt
+
+    # 폴백: target_dt 이하 행이 하나도 없으면 '최신 행'으로(권장), 없으면 '첫 행'
+    if selected_info is None:
+        if last_info is not None:
+            selected_row = last_row
+            selected_info = last_info
+            selected_attempt = last_attempt
+        elif first_info is not None:
+            selected_row = first_row
+            selected_info = first_info
+            selected_attempt = first_attempt
+        else:
+            # CSV 구조가 비정상/빈 경우 안전한 기본값 반환
+            selected_row = None
+            selected_attempt = 0
+            selected_info = {
+                "date_time": "",
+                "equipment": "",
+                "lot_number": "",
+                "status_display": "",
+                "status_text": "",
+                "puller_status": None
+            }
+
+    return selected_row, selected_attempt, selected_info
+
+
+def safe_read_gray(path, retries=5, delay=0.2):
+    """이미지 안전 읽기(비잠금) 함수"""
+    for _ in range(retries):
+        try:
+            arr = np.fromfile(str(path), dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
             if img is not None:
                 return img
         except Exception:
@@ -115,826 +343,617 @@ def safe_image_load(image_path, as_gray=False, max_retries=5, delay=0.2):
         time.sleep(delay)
     return None
 
-def _numpy_to_qimage(npimg) -> QImage:
-    """NumPy 이미지를 QImage로 변환 (채널 수에 따라 자동 변환)"""
-    if npimg is None:
-        return QImage()
+class CsvTracker:
+    """CSV 접근 최적화용 트래커 (루프당 1회 디렉터리 스캔)"""
 
-    if npimg.ndim == 2:
-        h, w = npimg.shape
-        return QImage(npimg.data, w, h, w, QImage.Format_Grayscale8).copy()
-
-    if npimg.shape[2] == 3:
-        rgb = cv2.cvtColor(npimg, cv2.COLOR_BGR2RGB)
-        h, w, _ = rgb.shape
-        return QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
-
-    if npimg.shape[2] == 4:
-        rgba = cv2.cvtColor(npimg, cv2.COLOR_BGRA2RGBA)
-        h, w, _ = rgba.shape
-        return QImage(rgba.data, w, h, 4 * w, QImage.Format_RGBA8888).copy()
-
-    gray = cv2.cvtColor(npimg, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
-    return QImage(gray.data, w, h, w, QImage.Format_Grayscale8).copy()
-
-def pixmap_from_numpy(npimg, target_size: tuple[int, int] | None = None) -> QPixmap:
-    """NumPy 이미지를 QPixmap으로 변환 후 필요 시 스케일링"""
-    qimg = _numpy_to_qimage(npimg)
-    if qimg.isNull():
-        return QPixmap()
-    pm = QPixmap.fromImage(qimg)
-    if target_size:
-        pm = pm.scaled(*target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-    return pm
-
-def parse_filename(fname: str):
-    """파일명 파서 (형식: EQUIP_Lot#_Process_Attempt_YYYYMMDD_HHMM(SS).ext)"""
-    stem = Path(fname).stem
-    parts = stem.split('_')
-    try:
-        equip = parts[0]
-        lot = parts[1]
-        process = parts[2]
-        attempt = int(parts[3])
-        date_str = parts[4]
-        time_str = parts[5]
-    except Exception:
-        equip = lot = process = date_str = time_str = ''
-        attempt = 0
-    return {
-        'equip': equip,
-        'lot': lot,
-        'process': process,
-        'attempt': attempt,
-        'date': date_str,
-        'time': time_str,
-        'stem': stem,
-        'name': Path(fname).name,
-    }
-
-def extract_image_datetime(path: Path) -> QDateTime:
-    """파일명으로부터 QDateTime 추출 (YYMMDD_HHMMSS 형식 지원, 실패 시 mtime 사용)"""
-    stem = path.stem
-
-    info = parse_filename(path.name)
-    date_str = info.get('date') or ''
-    time_str = info.get('time') or ''
-
-    try:
-        if len(date_str) == 6 and len(time_str) >= 4:
-            yy = int(date_str[0:2])
-            mm = int(date_str[2:4])
-            dd = int(date_str[4:6])
-            yyyy = 2000 + yy
-
-            hh = int(time_str[0:2])
-            mi = int(time_str[2:4])
-            ss = int(time_str[4:6]) if len(time_str) >= 6 else 0
-
-            qdt = QDateTime(yyyy, mm, dd, hh, mi, ss)
-            if qdt.isValid():
-                return qdt
-    except Exception:
-        pass
-
-    m = re.search(r'(\d{6})[_-]?(\d{4,6})', stem)
-    if m:
-        try:
-            date_part = m.group(1)
-            time_part = m.group(2)
-
-            yy = int(date_part[0:2])
-            mm = int(date_part[2:4])
-            dd = int(date_part[4:6])
-            yyyy = 2000 + yy
-
-            hh = int(time_part[0:2])
-            mi = int(time_part[2:4])
-            ss = int(time_part[4:6]) if len(time_part) >= 6 else 0
-
-            qdt = QDateTime(yyyy, mm, dd, hh, mi, ss)
-            if qdt.isValid():
-                return qdt
-        except Exception:
-            pass
-
-    try:
-        ts = path.stat().st_mtime
-        return QDateTime.fromSecsSinceEpoch(int(ts))
-    except Exception:
-        return QDateTime()
-
-def _qdatetime_to_datetime(qdt: QDateTime | None):
-    """QDateTime → datetime 변환"""
-    if qdt is None or not isinstance(qdt, QDateTime) or not qdt.isValid():
-        return None
-    if hasattr(qdt, "toPython"):
-        try:
-            return qdt.toPython()
-        except Exception:
-            pass
-    try:
-        return datetime.fromtimestamp(qdt.toSecsSinceEpoch())
-    except Exception:
-        return None
-
-def format_mmdd_hhmm(qdt: QDateTime | None) -> str:
-    """MM/DD HH:mm 포맷 문자열"""
-    if qdt is None or not isinstance(qdt, QDateTime) or not qdt.isValid():
-        return ""
-    return qdt.toString("MM/dd HH:mm")
-
-def compute_lead_minutes(start_a: QDateTime | None, start_b: QDateTime | None) -> str:
-    """두 시각 차이를 분 단위로 계산"""
-    dt_a = _qdatetime_to_datetime(start_a)
-    dt_b = _qdatetime_to_datetime(start_b)
-    if dt_a is None or dt_b is None or dt_b < dt_a:
-        return ""
-    minutes = (dt_b - dt_a).total_seconds() / 60.0
-    return f"{minutes:.1f}"
-
-def compute_current_lead_minutes(start_dt: QDateTime | None, cur_dt: QDateTime | None) -> str:
-    """특정 시작 시각 대비 현재 시각 리드 타임(분)"""
-    base = _qdatetime_to_datetime(start_dt)
-    cur = _qdatetime_to_datetime(cur_dt)
-    if base is None or cur is None or cur < base:
-        return ""
-    minutes = (cur - base).total_seconds() / 60.0
-    return f"{minutes:.1f}"
-
-class ViTClassifier:
-    """학습된 ViT 모델을 사용한 3 클래스 분류기"""
-
-    def __init__(self, model_name: str, checkpoint: Path, class_names: list[str], img_size: int = 224):
-        self.model_name = model_name
-        self.class_names = list(class_names)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = timm.create_model(model_name, pretrained=False, num_classes=len(self.class_names))
-
-        if checkpoint.exists():
-            try:
-                state = torch.load(checkpoint, map_location="cpu")
-                if isinstance(state, dict) and "state_dict" in state:
-                    state = state["state_dict"]
-                cleaned = {k.replace("model.", "").replace("module.", ""): v for k, v in state.items()}
-                self.model.load_state_dict(cleaned, strict=False)
-            except Exception as e:
-                print(f"❌ 모델 가중치 로드 실패: {e}")
-        else:
-            print(f"⚠️ 체크포인트가 존재하지 않습니다: {checkpoint}")
-
-        self.model.to(self.device)
-        self.model.eval()
-
-        self.transform_gray = T.Compose([
-            T.Resize((img_size, img_size)),
-            T.ToTensor(),
-            T.Lambda(lambda t: t.expand(3, -1, -1)),
-            T.Normalize(mean=[0.485, 0.456, 0.406],
-                        std=[0.229, 0.224, 0.225]),
-        ])
-
-    @staticmethod
-    def _crop_with_roi(img_np: np.ndarray, roi: tuple[int, int, int, int] | None):
-        if img_np is None or roi is None:
-            return img_np
-        h, w = img_np.shape[:2]
-        clamped = clamp_roi_to_shape(roi, w, h)
-        if clamped is None:
-            return img_np
-        x, y, rw, rh = clamped
-        return img_np[y:y+rh, x:x+rw]
-
-    def predict(self, image_path: Path, roi: tuple[int, int, int, int] | None = None, return_gray_for_preview: bool = False):
-        """이미지 경로를 입력받아 (라벨, 확률) or (라벨, 확률, 그레이원본) 반환"""
-        try:
-            img_gray = safe_image_load(str(image_path), as_gray=True, max_retries=5, delay=0.2)
-            if img_gray is None:
-                raise OSError(f"이미지 로드 실패: {image_path}")
-
-            img_crop = self._crop_with_roi(img_gray, roi)
-            pil_img = Image.fromarray(img_crop)
-            if pil_img.mode != "L":
-                pil_img = pil_img.convert("L")
-
-            tensor = self.transform_gray(pil_img).unsqueeze(0).to(self.device)
-
-            with torch.no_grad():
-                logits = self.model(tensor)
-                raw_probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
-
-            if raw_probs.shape[0] == 3:
-                probs = np.array([raw_probs[2], raw_probs[1], raw_probs[0]], dtype=np.float32)
-            else:
-                probs = raw_probs.astype(np.float32)
-
-            idx = int(np.argmax(probs))
-            label = self.class_names[idx]
-
-            if return_gray_for_preview:
-                return label, probs, img_gray
-            return label, probs
-
-        except Exception as e:
-            print(f"❌ 분류 실패: {e}")
-            if return_gray_for_preview:
-                return None, None, None
-            return None, None
-
-class _ImageFileEventHandler(FileSystemEventHandler):
-    """watchdog 이벤트 핸들러 (신규 이미지 감지)"""
-
-    def __init__(self, callback, allow_ext):
-        super().__init__()
-        self._callback = callback
-        self._allow_ext = tuple(allow_ext)
-
-    def _handle_path(self, src_path):
-        if not src_path:
-            return
-        path = Path(src_path)
-        if path.is_dir():
-            return
-        if path.suffix.lower() not in self._allow_ext:
-            return
-        self._callback(path)
-
-    def on_created(self, event):
-        self._handle_path(getattr(event, 'src_path', None))
-
-    def on_moved(self, event):
-        self._handle_path(getattr(event, 'dest_path', None))
-
-class ImageDirectoryWatcher(QObject):
-    """watchdog 기반 이미지 디렉토리 감시기"""
-
-    file_created = Signal(object)
-
-    def __init__(self, directory: Path, allow_ext=None, parent=None):
-        super().__init__(parent)
-        self._directory = Path(directory)
-        self._observer: Observer | None = None  # pyright: ignore[reportInvalidTypeForm]
-        self._handler: _ImageFileEventHandler | None = None
-        if allow_ext is None:
-            allow_ext = ALLOWED_IMAGE_EXTS
-        self._allow_ext = {ext.lower() for ext in allow_ext}
-
-    def start(self):
-        if self._observer is not None:
-            return
-        if not self._directory.exists():
-            self._directory.mkdir(parents=True, exist_ok=True)
-        self._handler = _ImageFileEventHandler(self.file_created.emit, self._allow_ext)
-        observer = Observer()
-        observer.schedule(self._handler, str(self._directory), recursive=False)
-        observer.start()
-        self._observer = observer
-
-    def stop(self):
-        if self._observer is None:
-            return
-        observer = self._observer
-        self._observer = None
-        self._handler = None
-        try:
-            observer.stop()
-            observer.join(timeout=2.0)
-        except Exception:
-            pass
-
-    def is_running(self) -> bool:
-        return self._observer is not None
-
-class ImagePreviewLabel(QLabel):
-    """이미지 미리보기 (원본 + ROI 박스)"""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.pixmap = None
-        self.src_shape = None
-        self.roi_rect: tuple[int, int, int, int] | None = None
-        self.setAlignment(Qt.AlignCenter)
-        self.setFixedSize(170, 360)
-        self.filename = ''
-        self.placeholder_text = ""
-
-    def show_placeholder(self, text: str):
-        self.pixmap = None
-        self.src_shape = None
-        self.roi_rect = None
-        self.placeholder_text = text or ""
-        self.filename = ''
-        self.update()
-
-    def show_image(self, npimg, filename: str = '', roi: tuple[int, int, int, int] | None = None):
-        self.placeholder_text = ""
-        self.src_shape = npimg.shape if npimg is not None else None
-        self.pixmap = pixmap_from_numpy(npimg, target_size=(self.width(), self.height()))
-        self.filename = filename
-        if self.src_shape is not None:
-            self.roi_rect = clamp_roi_to_shape(roi, self.src_shape[1], self.src_shape[0])
-        else:
-            self.roi_rect = None
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor('black'))
-        if self.pixmap is not None and not self.pixmap.isNull():
-            pm = self.pixmap
-            x = (self.width() - pm.width()) // 2
-            y = (self.height() - pm.height()) // 2
-            painter.drawPixmap(x, y, pm)
-            if self.roi_rect and self.src_shape:
-                src_h, src_w = self.src_shape[0], self.src_shape[1]
-                if src_w > 0 and src_h > 0:
-                    scale_x = pm.width() / src_w
-                    scale_y = pm.height() / src_h
-                    r_x, r_y, r_w, r_h = self.roi_rect
-                    draw_x = x + int(r_x * scale_x)
-                    draw_y = y + int(r_y * scale_y)
-                    draw_w = int(r_w * scale_x)
-                    draw_h = int(r_h * scale_y)
-                    painter.setPen(QPen(QColor('lime'), 1))
-                    painter.drawRect(draw_x, draw_y, draw_w, draw_h)
-        else:
-            painter.setPen(QPen(Qt.white))
-            painter.drawText(self.rect(), Qt.AlignCenter, self.placeholder_text)
-        painter.end()
-
-class ClassificationPanel(QWidget):
-    """3박스 판정 확률 + 리드타임/파일명 텍스트 패널"""
-
-    # ---- 레이아웃/스타일 상수 ----
-    OUTER_MARGIN = 15             # 패널 좌우/하단 여백
-    HEADER_EXTRA_TOP = 12         # 상단 여백 보정 (파일명 영역 위쪽)
-    HEADER_LINE_HEIGHT = 20       # 파일명/리드타임 텍스트 줄 간격
-
-    BOX_GAP = 10                  # 박스 사이 가로 간격
-    BOX_TITLE_GAP = 23            # 박스 위 타이틀과 박스 사이 간격
-    BOX_TOP_EXTRA = 20            # 헤더 영역 아래에서 박스 시작까지 여분
-    BOX_MIN_SIDE = 20             # 박스 한 변의 최소 픽셀
-
-    PANEL_BOTTOM_MARGIN = 2       # 패널 하단 여유(박스 영역 기준)
-    # ---------------------------
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedSize(PANEL_W_PX, PANEL_H_PX)
-        self.setMinimumSize(PANEL_W_PX, PANEL_H_PX)
-        self.header_text = ""
-        self.probs = [0.0 for _ in CLASS_NAMES]
-        self.pred_label = ""
-        self.earliest: dict[str, QDateTime | None] = {name: None for name in CLASS_NAMES}
-        self.current_dt: QDateTime | None = None
-        self._show_completion_badge = False
-        self.setAutoFillBackground(False)
-
-    def set_completion_badge(self, visible: bool):
-        """완료 배지 표시 설정"""
-        self._show_completion_badge = bool(visible)
-        self.update()
-
-    def update_panel(self, header_text: str, probs, pred_label: str, earliest: dict, current_dt: QDateTime | None):
-        """패널 내용(파일명, 판정 확률, 각 단계 시작 시각, 현재시각)을 갱신"""
-        try:
-            self.header_text = header_text or ""
-            self.pred_label = pred_label or ""
-
-            if probs is None:
-                self.probs = [0.0 for _ in CLASS_NAMES]
-            else:
-                arr = list(probs)
-                if len(arr) < len(CLASS_NAMES):
-                    arr.extend([0.0] * (len(CLASS_NAMES) - len(arr)))
-                self.probs = arr[: len(CLASS_NAMES)]
-
-            if isinstance(earliest, dict):
-                self.earliest = {name: earliest.get(name) for name in CLASS_NAMES}
-            else:
-                self.earliest = {name: None for name in CLASS_NAMES}
-
-            self.current_dt = (
-                current_dt if isinstance(current_dt, QDateTime) and current_dt.isValid()
-                else None
-            )
-        except Exception:
-            pass
-
-        self.update()
-
-    def paintEvent(self, event):
-        """패널 배경, 상단 정보 텍스트, Lead Time, 클래스 박스 """
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        panel_rect = self.rect()
-        painter.fillRect(panel_rect, QColor("white"))
-
-        # 표시할 내용이 없으면 "결과 없음"
-        has_header = bool(self.header_text)
-        has_probs = any(self.probs)
-        if not has_header and not has_probs:
-            painter.setPen(QPen(Qt.gray))
-            painter.drawText(panel_rect, Qt.AlignCenter, "결과 없음")
-            painter.end()
-            return
-
-        # 상단 기본 정보 + 리드타임 텍스트 영역
-        outer = self.OUTER_MARGIN
-        line_h = self.HEADER_LINE_HEIGHT
-
-        header_x = outer
-        header_y = outer + self.HEADER_EXTRA_TOP
-
-        title_font = QFont(self.font())
-        title_font.setPointSize(11)
-        title_font.setBold(True)
-        painter.setFont(title_font)
-        painter.setPen(QPen(Qt.black))
-        painter.drawText(int(header_x), int(header_y + line_h * 0), self.header_text)
-
-        # 리드타임 계산
-        lead_font = QFont(self.font())
-        lead_font.setPointSize(10)
-        painter.setFont(lead_font)
-
-        icing_lead = compute_lead_minutes(self.earliest.get("Melted"), self.earliest.get("Icing"))
-        iced_lead = compute_lead_minutes(self.earliest.get("Icing"), self.earliest.get("Iced"))
-        current_lead = compute_current_lead_minutes(self.earliest.get("Iced"), self.current_dt)
-
-        painter.drawText(int(header_x), int(header_y + line_h * 1.2), f"- Melted~Icing Time: {icing_lead} min" if icing_lead else "- Melted~Icing Time: ")
-        painter.drawText(int(header_x), int(header_y + line_h * 2.2), f"- Icing~Iced Time: {iced_lead} min" if iced_lead else "- Icing~Iced Time: ")
-        painter.drawText(int(header_x), int(header_y + line_h * 3.2), f"- Iced~Last Image Time: {current_lead} min" if current_lead else "- Iced~Last Image Time: ")
-
-        # 3개 클래스 박스 레이아웃 계산
-        boxes_top_y = header_y + line_h * 4 + self.BOX_TOP_EXTRA
-        side_max_w = PANEL_W_PX - 2 * outer - 2 * self.BOX_GAP
-        side_max_h = PANEL_H_PX - boxes_top_y - outer + self.PANEL_BOTTOM_MARGIN
-
-        side = int(min(side_max_w / 3, side_max_h))
-        side = max(side, self.BOX_MIN_SIDE)
-
-        x0 = outer
-        x1 = x0 + side + self.BOX_GAP
-        x2 = x1 + side + self.BOX_GAP
-        box_x_positions = [x0, x1, x2]
-
-        # 박스 내부 스타일 설정
-        title_font_box = QFont(self.font())
-        title_font_box.setPointSize(12)
-        title_font_box.setBold(True)
-
-        prob_font = QFont(self.font())
-        prob_font.setPointSize(12)
-        prob_font.setBold(True)
-
-        start_font = QFont(self.font())
-        start_font.setPointSize(9)
-
-        active_fill = {"Melted": QColor("#ffadad"), "Icing": QColor("#81CBF8"), "Iced": QColor("#5a63e2")}
-        inactive_fill = QColor("white")
-        stroke_color = QColor("black")
-
-        # 각 클래스(Melted, Icing, Iced) 박스 그리기
-        for idx, (name, x_left) in enumerate(zip(CLASS_NAMES, box_x_positions)):
-            painter.setFont(title_font_box)
-            painter.setPen(stroke_color)
-            painter.drawText(int(x_left), int(boxes_top_y - self.BOX_TITLE_GAP), side, line_h, Qt.AlignCenter, name)
-
-            is_active = (name == self.pred_label)
-            rect_color = active_fill.get(name, inactive_fill) if is_active else inactive_fill
-            painter.fillRect(int(x_left), int(boxes_top_y), side, side, rect_color)
-            painter.setPen(QPen(stroke_color))
-            painter.drawRect(int(x_left), int(boxes_top_y), side, side)
-
-            # 박스 내 확률 값 텍스트
-            try:
-                p_val = float(self.probs[idx]) if idx < len(self.probs) else 0.0
-            except Exception:
-                p_val = 0.0
-
-            painter.setFont(prob_font)
-
-            prob_rect_top = int(boxes_top_y + side * 0.23)
-            prob_rect_h = int(side * 0.40)
-            painter.drawText(int(x_left), prob_rect_top, side, prob_rect_h, Qt.AlignHCenter | Qt.AlignVCenter, f"{p_val * 100:.1f}%")
-
-            # 박스 내 시작 시각 텍스트
-            painter.setFont(start_font)
-            start_str = format_mmdd_hhmm(self.earliest.get(name))
-            start_rect_top = int(boxes_top_y + side * 0.55)
-            start_rect_h = int(side * 0.20)
-            painter.drawText(int(x_left), start_rect_top, side, start_rect_h, Qt.AlignHCenter | Qt.AlignVCenter, start_str)
-
-        if self._show_completion_badge:
-            badge_w, badge_h = 54, 24
-            margin = 12
-            badge_x = panel_rect.right() - badge_w - margin
-            badge_y = panel_rect.top() + margin
-            badge_rect = QRect(int(badge_x), int(badge_y), int(badge_w), int(badge_h))
-
-            painter.setPen(Qt.NoPen)
-            painter.fillRect(badge_rect, QColor("#1e6bd6"))
-
-            badge_font = QFont(self.font())
-            badge_font.setPointSize(10)
-            badge_font.setBold(True)
-            painter.setFont(badge_font)
-            painter.setPen(QPen(Qt.white))
-            painter.drawText(badge_rect, Qt.AlignCenter, "완료")
-
-        painter.end()
-
-
-class BacklogFeeder(QObject):
-    """이미지 백로그를 천천히 하나씩 흘려 보내는 전용 worker"""
-    finished = Signal()
-    next_image = Signal(object)
-
-    def __init__(self, backlog):
-        super().__init__()
-        self.backlog = list(backlog)
-        self._stop = False
-
-    def stop(self):
-        self._stop = True
-
-    def run(self):
-        for p in self.backlog:
-            if self._stop:
-                break
-            self.next_image.emit(p)
-            time.sleep(0.05)
-        self.finished.emit()
-
-class IcingClassificationGUI(QWidget):
-    """메인 GUI 위젯 클래스 (ViT 분류 기반)"""
+    DIR_SCAN_INTERVAL_SEC = 600  # 새 Lot 탐지용 전체 디렉터리 스캔 주기 (10분)
 
     def __init__(self):
+        """CSV 및 SMB 연결 상태, 캐시 정보를 초기화"""
+        self.name = None
+        self.mtime = None
+        self.size = None
+        self.text = None
+
+        self.cached_attempt = 0
+        self.cached_info = {"status_text": "", "lot_number": "", "status_display": "", "puller_status": None}
+
+        self.conn = None
+        self.last_dir_scan_ts = 0
+        self.net_connected = False
+
+    def _reset_connection(self):
+        """SMB 연결을 종료하고, CSV/캐시 관련 상태를 초기화"""
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+        self.conn = None
+        self.net_connected = False
+        self.name = None
+        self.mtime = None
+        self.size = None
+        self.text = None
+        self.cached_attempt = 0
+        self.cached_info = {"status_text": "", "lot_number": "", "status_display": "", "puller_status": None}
+
+    def _connect(self):
+        """SMB 서버에 연결을 시도하고, 성공 시 연결 객체를 보관"""
+        if self.conn:
+            return True
+
+        for port_try in [139, 445]:
+            try:
+                is_direct_tcp = (port_try == 445)
+                conn = SMBConnection(username, password, client_name, server_name, domain=domain, use_ntlm_v2=True, is_direct_tcp=is_direct_tcp)
+                if conn.connect(server_ip, port_try):
+                    self.conn = conn
+                    self.net_connected = True
+                    return True
+            except Exception:
+                pass
+
+        self._reset_connection()
+        self.net_connected = False
+        return False
+
+    def _get_file_attributes(self, filename):
+        """SMB를 통해 주어진 파일의 속성(mtime, size 등)을 조회"""
+        if not self._connect():
+            return None
+
+        for path in (filename, f"/{filename}"):
+            try:
+                return self.conn.getAttributes(share_name, path)
+            except Exception:
+                continue
+
+        self._reset_connection()
+        return None
+
+    def _scan_latest_csv(self):
+        """SMB 공유 폴더에서 가장 최신 CSV 파일을 찾아 메타 정보를 반환"""
+        if not self._connect():
+            return None
+
+        try:
+            files = self.conn.listPath(share_name, '/')
+            csv_files = [f for f in files if f.filename.lower().endswith('.csv')]
+            if not csv_files:
+                return None
+
+            latest = max(csv_files, key=lambda f: f.last_write_time)
+            return {"name": latest.filename, "mtime": latest.last_write_time, "size": getattr(latest, "file_size", None)}
+        except Exception:
+            self._reset_connection()
+            return None
+
+    def _retrieve_csv_text(self, filename):
+        """SMB에서 CSV 파일을 다운로드하여 cp949 문자열로 읽기"""
+        if not self._connect():
+            return None
+
+        try:
+            file_obj = io.BytesIO()
+            self.conn.retrieveFile(share_name, filename, file_obj)
+            file_obj.seek(0)
+            return file_obj.read().decode('cp949')
+        except Exception:
+            self._reset_connection()
+            return None
+
+    def get_info(self, now_dt):
+        """현재 시각 기준으로 최신 CSV에서 Attempt와 공정 정보를 계산해 반환"""
+        if not self._connect():
+            return None, None
+
+        now_ts = time.time()
+        latest_meta = None
+
+        # 현재 선택된 최신 Lot CSV의 메타데이터만 조회
+        if self.name:
+            attr = self._get_file_attributes(self.name)
+            if attr:
+                latest_meta = {"name": self.name, "mtime": attr.last_write_time, "size": getattr(attr, "file_size", None)}
+
+        # 새 Lot 탐지는 느린 주기로 전체 디렉터리 스캔
+        need_dir_scan = (not self.name or (now_ts - self.last_dir_scan_ts >= self.DIR_SCAN_INTERVAL_SEC) or latest_meta is None)
+
+        if need_dir_scan:
+            scanned = self._scan_latest_csv()
+            if scanned:
+                latest_meta = scanned
+                self.last_dir_scan_ts = now_ts
+
+        if latest_meta is None:
+            if self.text is None:
+                self.cached_attempt = 0
+                self.cached_info = {"status_text": "", "lot_number": "", "status_display": "", "puller_status": None}
+            return self.cached_attempt, self.cached_info
+
+        need_reload = False
+
+        # 파일명이 바뀐 경우(새 Lot 시작) → 본문 읽기 시도
+        if self.name != latest_meta["name"]:
+            need_reload = True
+
+        # 파일명은 같지만 메타데이터가 변한 경우 → 본문 읽기 시도
+        elif (latest_meta.get("mtime") != self.mtime) or (latest_meta.get("size") != self.size):
+            need_reload = True
+
+        # 본문 읽기/파싱
+        if need_reload:
+            new_text = self._retrieve_csv_text(latest_meta["name"])
+            if new_text:
+                self.text = new_text
+                self.name = latest_meta["name"]
+                self.mtime = latest_meta["mtime"]
+                self.size = latest_meta["size"]
+
+                _, attempt_new, info = find_closest_row_and_attempt(self.text, now_dt)
+                self.cached_attempt = attempt_new
+                self.cached_info = info
+
+        return self.cached_attempt, self.cached_info
+
+class ImageSaverThread(QThread):
+    """이미지 저장 및 CSV 정보를 활용, 주기적으로 이미지 파일을 저장하는 쓰레드"""
+    update_status = Signal(str)
+    update_preview = Signal()
+    update_device_name = Signal(str)
+    allowed_state_changed = Signal(bool)
+
+    def __init__(self, source_file, output_folder, crop_rect, get_format, get_quality, get_interval, get_max_files, get_allowed_process_rule):
+        """이미지 저장에 필요한 파라미터(파일 경로, 형식, 크롭 영역 등)를 받으며 쓰레드 객체 초기화"""
         super().__init__()
-        self.setWindowTitle('Icing Classification GUI')
-        self.resize(500, 400)
-        self.settings = QSettings(str(INI_SETTINGS_PATH), QSettings.IniFormat)
+        self.source_file = Path(source_file)
+        self.output_folder = Path(output_folder)
+        self.crop_rect = crop_rect
+        self.get_format = get_format
+        self.get_quality = get_quality
+        self.get_interval = get_interval
+        self.get_max_files = get_max_files
+        self.get_allowed_process_rule = get_allowed_process_rule
+        self.running = False
+        self._last_mtime = None
+        self.csv_tracker = CsvTracker()
+        self._last_allowed_state = None
+        self.setPriority(QThread.LowestPriority)
+
+    def run(self):
+        """이미지 저장 루프"""
+        self.running = True
+        while self.running:
+            if not self.output_folder.exists():
+                try:
+                    self.output_folder.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    self.update_status.emit(f'폴더 생성 실패: {e}')
+                    return
+
+            # 소스 파일 변경 감지 (변경 시에만 처리, 안정화 대기 200ms)
+            if not self.source_file.exists():
+                self.update_status.emit('소스 파일이 존재하지 않음!')
+                self.msleep(200)
+                continue
+
+            try:
+                st = self.source_file.stat()
+                mtime = st.st_mtime
+            except Exception:
+                self.update_status.emit('소스 파일 상태 확인 실패')
+                self.msleep(200)
+                continue
+
+            if self._last_mtime is not None and mtime == self._last_mtime:
+                self.msleep(100)
+                continue
+
+            self.msleep(200)
+            self._last_mtime = mtime
+
+            # 실제 처리 시작
+            try:
+                now = datetime.now()
+                dt_str = now.strftime("%Y%m%d_%H%M%S")
+
+                # 최신 attempt/info 조회
+                attempt_new, csv_row_info = self.csv_tracker.get_info(now)
+
+                if attempt_new is None or csv_row_info is None:
+                    self.update_status.emit('NET_DISCONNECTED')
+                    if not self._wait_until_next_change(poll_ms=500):
+                        return
+                    continue
+
+                # 장비명/CSV 파일명 GUI 갱신
+                latest_csv_fname = self.csv_tracker.name
+                device_name_full = f"{host_name} / {latest_csv_fname.rsplit('.', 1)[0] if latest_csv_fname else 'N/A'}"
+                self.update_device_name.emit(device_name_full)
+
+                status_text = csv_row_info.get("status_text", "") or "UNKNOWN"
+
+                is_allowed = self._is_allowed_process(status_text)
+
+                if is_allowed != self._last_allowed_state:
+                    self.allowed_state_changed.emit(is_allowed)
+                    self._last_allowed_state = is_allowed
+
+                if not is_allowed:
+                    allowed_desc = self._describe_allowed_processes()
+                    self.update_status.emit(f'저장 허용 공정이 아님 (현재: {status_text}, 허용: {allowed_desc})')
+                    if not self._wait_until_next_change(poll_ms=200):
+                        return
+                    continue
+
+                formats = self.get_format()
+
+                # 안전한 비잠금 읽기
+                img_gray = safe_read_gray(self.source_file)
+                if img_gray is None:
+                    self.update_status.emit('이미지 읽기 실패(쓰기중/락)')
+                    self.msleep(50)
+                    continue
+
+                cx, cy, cw, ch = self.crop_rect()
+                h, w = img_gray.shape[:2]
+                if (cx + cw > w) or (cy + ch > h):
+                    self.update_status.emit(f'Crop 영역({cx},{cy},{cw},{ch})이 원본 이미지({w},{h})보다 큼')
+                    self.msleep(50)
+                    continue
+
+                cropped_np = img_gray[cy:cy+ch, cx:cx+cw]
+                cropped_pil = Image.fromarray(cropped_np)
+
+                # 파일명 구성
+                device_name_for_fname = host_name[3:5]
+                lot_for_fname = csv_row_info.get("lot_number", "") or "LotUnknown"
+                status_for_fname = (csv_row_info.get("status_text", "") or "StatusUnknown").replace(" ", "_").replace("/", "-")
+                attempt_tag_for_fname = f"{attempt_new}"
+                base_fname = f"{device_name_for_fname}_{lot_for_fname}_{status_for_fname}_{attempt_tag_for_fname}_{dt_str}"
+
+                # 저장
+                if "BMP" in formats:
+                    fname = f"{base_fname}.bmp"
+                    save_path = self.output_folder / fname
+                    cropped_pil.save(save_path, format="BMP")
+                    self.update_status.emit(f'저장: {fname}')
+                if "JPEG" in formats:
+                    fname = f"{base_fname}.jpg"
+                    save_path = self.output_folder / fname
+                    cropped_pil.save(save_path, format="JPEG", quality=self.get_quality())
+                    self.update_status.emit(f'저장: {fname}')
+
+                # 유지 개수 기준 (저장 직후에만 호출)
+                try:
+                    maintain_max_files(self.output_folder, self.get_max_files())
+                except Exception as e:
+                    self.update_status.emit(f'정리 실패: {e}')
+
+                # 프리뷰 갱신
+                self.update_preview.emit()
+
+            except Exception as e:
+                self.update_status.emit(f'저장 실패: {e}')
+
+            # 안전장치: 파일 변경이 잦을 때 저장 빈도를 제한
+            target = float(self.get_interval())
+            ticks = int(target / 0.1)
+            for _ in range(max(1, ticks)):
+                if not self.running:
+                    return
+                self.msleep(100)
+
+    def stop(self):
+        """이미지 저장 루프 종료"""
+        self.running = False
+
+    def _is_allowed_process(self, status_text):
+        """이미지 저장 허용 공정 판정 (ALL이면 모두 허용)"""
+        allow_all, allowed_set = self.get_allowed_process_rule()
+        if allow_all:
+            return True
+
+        normalized = (status_text or "").upper().strip()
+        effective_allowed = allowed_set or {"NECK"}
+
+        return normalized in effective_allowed
+    
+
+    def _describe_allowed_processes(self):
+        allow_all, allowed_set = self.get_allowed_process_rule()
+        if allow_all:
+            return "ALL"
+        if not allowed_set:
+            return "NECK"
+
+        return ", ".join(sorted(allowed_set))
+
+    def _wait_until_next_change(self, poll_ms=200):
+        """composite.bmp의 '다음 변경'이 발생할 때까지 블로킹 대기 헬퍼"""
+        prev_mtime = self._last_mtime
+        while self.running:
+            try:
+                cur_mtime = self.source_file.stat().st_mtime
+                if prev_mtime is None or cur_mtime != prev_mtime:
+                    return True
+            except Exception:
+                pass
+            self.msleep(int(poll_ms))
+        return False
+
+class PreviewLabel(QLabel):
+    """QLabel: 이미지 미리보기(크롭 영역 표시) 클래스"""
+
+    def __init__(self, *args, **kwargs):
+        """QLabel 기본설정 및 crop 정보 준비"""
+        super().__init__(*args, **kwargs)
+        self.setAlignment(Qt.AlignCenter)
+        self.crop_rect = (0, 0, 100, 100)
+        self.img = None
+        self.show_crop = True
+
+    def set_image(self, pil_img, crop_rect=None):
+        """PIL 이미지를 QLabel에 세팅 및 crop 정보 갱신"""
+        self.img = pil_img.convert('L')
+
+        if crop_rect is not None:
+            self.crop_rect = crop_rect
+            self.show_crop = True
+        else:
+            self.show_crop = False
+
+        self.update()
+
+    def paintEvent(self, event):
+        """QLabel에 이미지와 crop 영역 사각형 그림"""
+        super().paintEvent(event)
+        if self.img:
+            qimg = ImageQt.ImageQt(self.img)
+            pixmap = QPixmap.fromImage(qimg)
+            w = self.width()
+            h = self.height()
+            scaled = pixmap.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            img_w, img_h = self.img.size
+            scale = min(w / img_w, h / img_h)
+            offset_x = (w - img_w * scale) / 2
+            offset_y = (h - img_h * scale) / 2
+            painter = QPainter(self)
+            painter.drawPixmap(int(offset_x), int(offset_y), scaled)
+
+            if self.show_crop:
+                cx, cy, cw, ch = self.crop_rect
+                pen = QPen(QColor(255, 0, 0), 2)
+                painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(int(offset_x + cx * scale), int(offset_y + cy * scale), int(cw * scale), int(ch * scale))
+            painter.end()
+
+class MainWindow(QWidget):
+    """메인 GUI 윈도우 클래스 (설정 로드/저장, 사용자 입력 위젯, 이미지 저장 스레드 관리 등 주요 UI 관리)"""
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('Composite Image Saver')
+        self.setFixedSize(600, 290)
+
+        USE_TEST_MODE = False   # 이미지(composite) 로드 경로 (True: Test용 / False: 실제 장비 적용)
+        INI_TEST_MODE = False   # 설정 파일(ini) 저장 경로 (True: Test용 / False: 실제 장비 적용)
+
+        if USE_TEST_MODE:
+            self.source_file = Path('composite.bmp')
+        else:
+            self.source_file = Path(r'Z:/composite.bmp')
+
+        if INI_TEST_MODE:
+            try:
+                ini_base_dir = os.path.dirname(os.path.abspath(__file__))
+            except NameError:
+                ini_base_dir = os.getcwd()
+            settings_path = os.path.join(ini_base_dir, "CompositeImageApp.ini")
+        else:
+            settings_path = r"D:\AI Vision\CompositeImageApp.ini"
+
+        self.settings = QSettings(settings_path, QSettings.IniFormat)
         self._window_position_restored = False
 
-        # 상태 메시지 관리
-        self._status_text: str = ""
-        self._status_hold_until: float = 0.0
-        self._no_image_grace_until: float = 0.0
-        self.last_image_seen_at: float = 0.0
-        self.last_allowed_seen_at: float = 0.0
+        self.output_folder = Path('Images')
+        self.output_folder.mkdir(exist_ok=True)
 
-        # 텍스트 박스 ('장비명_Lot#_Process')
-        self.device_info_box = QLineEdit()
-        self.device_info_box.setReadOnly(True)
-        self.device_info_box.setFixedWidth(180)
-        self.device_info_box.setAlignment(Qt.AlignCenter)
+        self._allowed_process_raw = "ALL"
+        self._allowed_process_allow_all = False
+        self._allowed_process_set = set()
 
-        # 현재 Lot/Attempt 및 CSV 경로/장비 정보
-        self.current_lot: str | None = None
-        self.current_attempt: int | None = None
-        self.lot_csv_path: Path | None = None
-        self.current_equip: str | None = None
-        self.equip_csv_path: Path | None = None
-        self.last_processed_dt: QDateTime | None = None
-
-        # Lot 상세 CSV 헤더
-        self.csv_header = ['이미지 파일명', 'Attempt', '예측 라벨', 'Melted', 'Icing', 'Iced']
-
-        self.processed_images: set[str] = set()
-        self.pending_images: deque[Path] = deque()
-        self._is_processing_queue = False
-
-        # 허용 모드/리드타임/피딩 타임 관리
-        self.ALLOWED_PULLER_MODES = set(ALLOWED_PULLER_MODES)
-        self.no_new_image_grace_s = 9.0
-        self.last_allowed_image_info: dict[str, object] = {"equip": None, "lot": None, "attempt": None, "name": None, "dt": None}
-    
-        # FeedingTime 기록 트리거 1회용 플래그
-        self._feeding_trigger_a_fired: bool = False
-        self._feeding_trigger_b_fired: bool = False
-
-        # 비허용 공정 진입 감지용 래치/타이머
-        self.disallowed_mode_latched: bool = False
-        self.disallowed_entered_at: float = 0.0
-
-        # 연속 판정(5회) 기반 시작 시각 확정용 상태
-        self._streak_label: str | None = None
-        self._streak_count: int = 0
-        self._streak_start_dt: QDateTime | None = None
-        
-        self.classifier = ViTClassifier(MODEL_NAME, CHECKPOINT_PATH, CLASS_NAMES, img_size=IMG_SIZE)
-
-        # 채택 영역 설정의 기본값 지정
-        self.crop1_x = QSpinBox(maximum=9999)
-        self.crop1_y = QSpinBox(maximum=9999)
-        self.crop1_w = QSpinBox(maximum=9999)
-        self.crop1_h = QSpinBox(maximum=9999)
-        default_roi = DEFAULT_ROI_RECT
-
-        # 채택 영역 좌표 설정 (새 키 우선, 없으면 레거시 키 또는 기본값)
-        stored_vals = [
-            self._load_int_setting('crop1_x', default_roi[0], legacy_keys=['crop_x']),
-            self._load_int_setting('crop1_y', default_roi[1], legacy_keys=['crop_y']),
-            self._load_int_setting('crop1_w', default_roi[2], legacy_keys=['crop_w']),
-            self._load_int_setting('crop1_h', default_roi[3], legacy_keys=['crop_h']),
-        ]
-        for s, v in zip([self.crop1_x, self.crop1_y, self.crop1_w, self.crop1_h], stored_vals):
-            s.setValue(v)
-            s.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-            s.setFixedWidth(66)   # 채택 영역(ROI) 스핀박스 폭
-
-        self.crop1_enabled_cb = QCheckBox()
-        enabled_val = self._load_bool_setting('crop1_enabled', True)
-        self.crop1_enabled_cb.setChecked(bool(enabled_val))
-        # 체크 상태에 따라 스핀박스 활성/비활성
-        for s in (self.crop1_x, self.crop1_y, self.crop1_w, self.crop1_h):
-            s.setEnabled(bool(enabled_val))
-
-        self.disallowed_preview_cb = QCheckBox('')
-        self.disallowed_preview_cb.setChecked(self._load_bool_setting('show_disallowed_preview', False))
-
-        # 위젯 초기화
+        self.status_label = QLabel('대기 중.')
         self.start_button = QPushButton('시작')
         self.stop_button = QPushButton('종료')
         self.stop_button.setEnabled(False)
         self.save_opt_button = QPushButton('설정 저장')
-        for btn in (self.start_button, self.stop_button, self.save_opt_button):
-            btn.setFixedWidth(70)    # 시작/종료/설정 저장 버튼 너비
-        self.status_label = QLabel('- 대기 중 -')
-        self.preview_label = ImagePreviewLabel()
-        self.panel_canvas = ClassificationPanel()
-        self.auto_start_on_launch = AUTO_START_ON_LAUNCH
 
-        # Lot/Attempt 단위 earliest 시각 관리
-        self.earliest_by_lot_attempt: dict[tuple[str, int], dict[str, QDateTime | None]] = {}
+        # 허용 공정 여부 관련 상태 (비허용 10초 경과 시 프리뷰 대체용)
+        self.disallowed_since = None
+        self.placeholder_active = False
+        self.last_preview_size = None
+        self.disallowed_timer = QTimer(self)
+        self.disallowed_timer.setInterval(1000)
+        self.disallowed_timer.timeout.connect(self._on_disallowed_timer)
+        self.disallowed_timer.start()
 
-        # 레이아웃 구성
-        main_hbox = QHBoxLayout(self)
-        main_hbox.setContentsMargins(10, 15, 10, 10)
-        main_hbox.setSizeConstraint(QLayout.SetMinimumSize)
+        # 윈도우 상부 텍스트 박스(장비/시작/종료/설정) 설정
+        self.device_edit = QLineEdit()
+        self.device_edit.setReadOnly(True)
+        self.device_edit.setAlignment(Qt.AlignCenter)
+        self.device_edit.setMinimumWidth(120)
+        self.device_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.start_button.setMinimumWidth(45)
+        self.start_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.stop_button.setMinimumWidth(45)
+        self.stop_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.save_opt_button.setMinimumWidth(75)
+        self.save_opt_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        left_panel = QVBoxLayout()
-        left_panel.addWidget(self.status_label)
+        # "장비(호스트)/Lot#" 텍스트 박스와 시작/종료/설정 버튼을 같은 행에 배치
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.device_edit)
+        button_layout.addWidget(self.start_button)
+        button_layout.addWidget(self.stop_button)
+        button_layout.addWidget(self.save_opt_button)
 
-        btns = QHBoxLayout()
-        btns.addWidget(self.device_info_box)
-        btns.addWidget(self.start_button)
-        btns.addWidget(self.stop_button)
-        btns.addWidget(self.save_opt_button)
-        left_panel.addLayout(btns)
+        # Spin 박스(저장 Interval) 생성 및 설정
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setMinimum(1)
+        self.interval_spin.setMaximum(60)
+        self.interval_spin.setValue(4)
+        self.interval_spin.setFixedWidth(85)
+        self.interval_label = QLabel('저장(초):')
 
-        crop_box = QGroupBox(' 채택 영역 설정 ')
-        crop_vbox = QVBoxLayout()
+        # Spin 박스(최대 보존 파일 개수) 생성 및 설정
+        self.max_files_spin = QSpinBox()
+        self.max_files_spin.setMinimum(1)
+        self.max_files_spin.setMaximum(1000)
+        self.max_files_spin.setValue(1000)
+        self.max_files_spin.setFixedWidth(85)
+        self.max_files_label = QLabel('보존(장):')
 
-        crop_hbox1 = QHBoxLayout()
-        crop_hbox1.addWidget(self.crop1_enabled_cb)
-        crop_hbox1.addWidget(QLabel("X:")); crop_hbox1.addWidget(self.crop1_x)
-        crop_hbox1.addWidget(QLabel("Y:")); crop_hbox1.addWidget(self.crop1_y)
-        crop_hbox1.addWidget(QLabel("W:")); crop_hbox1.addWidget(self.crop1_w)
-        crop_hbox1.addWidget(QLabel("H:")); crop_hbox1.addWidget(self.crop1_h)
-        crop_vbox.addLayout(crop_hbox1)
+        # 그룹 박스(Interval Parameter) 생성 및 설정
+        interval_group = QGroupBox('Interval Parameter')
+        interval_layout = QGridLayout()
+        interval_layout.addWidget(self.interval_label, 0, 0)
+        interval_layout.addWidget(self.interval_spin, 0, 1)
+        interval_layout.addWidget(self.max_files_label, 0, 2)
+        interval_layout.addWidget(self.max_files_spin, 0, 3)
+        interval_group.setLayout(interval_layout)
 
-        crop_box.setLayout(crop_vbox)
+        # 체크 박스(BMP, JPEG) 생성
+        self.bmp_check = QCheckBox('BMP(원본)')
+        self.jpg_check = QCheckBox('JPEG')
+        self.bmp_check.setChecked(False)
+        self.jpg_check.setChecked(True)
+        format_layout = QHBoxLayout()
+        format_layout.addWidget(self.bmp_check)
+        format_layout.addWidget(self.jpg_check)
 
-        left_panel.addWidget(crop_box)
-        left_panel.addWidget(self.panel_canvas)
-        left_panel.addStretch()
+        # Spin 박스(Crop 영역 지정) 생성 및 설정
+        self.crop_x_label = QLabel("X:")
+        self.crop_x = QSpinBox()
+        self.crop_x.setMaximum(9999)
+        self.crop_x.setFixedWidth(120)
+        self.crop_y_label = QLabel("Y:")
+        self.crop_y = QSpinBox()
+        self.crop_y.setMaximum(9999)
+        self.crop_y.setFixedWidth(120)
+        self.crop_w_label = QLabel("W:")
+        self.crop_w = QSpinBox()
+        self.crop_w.setMaximum(9999)
+        self.crop_w.setFixedWidth(120)
+        self.crop_h_label = QLabel("H:")
+        self.crop_h = QSpinBox()
+        self.crop_h.setMaximum(9999)
+        self.crop_h.setFixedWidth(120)
 
-        right_panel = QVBoxLayout()
-        preview_header = QHBoxLayout()
-        preview_header.addWidget(self.disallowed_preview_cb)
-        preview_header.addStretch()
-        right_panel.addLayout(preview_header)
-        right_panel.addWidget(self.preview_label, alignment=Qt.AlignTop)
+        # 그룹 박스(Crop Parameters) 생성 및 설정
+        crop_group = QGroupBox('Crop Parameters')
+        crop_layout = QGridLayout()
+        crop_layout.addWidget(self.crop_x_label, 0, 0)
+        crop_layout.addWidget(self.crop_x, 0, 1)
+        crop_layout.addWidget(self.crop_y_label, 0, 2)
+        crop_layout.addWidget(self.crop_y, 0, 3)
+        crop_layout.addWidget(self.crop_w_label, 1, 0)
+        crop_layout.addWidget(self.crop_w, 1, 1)
+        crop_layout.addWidget(self.crop_h_label, 1, 2)
+        crop_layout.addWidget(self.crop_h, 1, 3)
+        crop_group.setLayout(crop_layout)
 
-        main_hbox.addLayout(left_panel)
-        main_hbox.addLayout(right_panel)
+        # 슬라이더(JPEG 품질) 생성 및 설정
+        qual_layout = QHBoxLayout()
+        self.quality_label = QLabel('JPEG 품질: 90')
+        self.quality_slider = QSlider(Qt.Horizontal)
+        self.quality_slider.setRange(50, 100)
+        self.quality_slider.setValue(90)
+        qual_layout.addWidget(self.quality_label)
+        qual_layout.addWidget(self.quality_slider)
 
-        # 타이머/워처
-        self.tail_timer = QTimer(self)
-        self.tail_timer.setInterval(500)
-        self.tail_timer.timeout.connect(self._main_tick)
+        # 레이아웃(컨트롤 관련 위젯 수직 배치) 생성 및 설정
+        control_layout = QVBoxLayout()
+        control_layout.addWidget(self.status_label)
+        control_layout.addLayout(button_layout)
+        control_layout.addWidget(interval_group)
+        control_layout.addWidget(crop_group)
+        control_layout.addLayout(format_layout)
+        control_layout.addLayout(qual_layout)
+        control_layout.addStretch()
 
-        self.directory_watcher = ImageDirectoryWatcher(IMG_INPUT_DIR)
-        self.directory_watcher.file_created.connect(self._enqueue_new_image)
+        # 레이아웃(이미지 미리보기) 생성 및 설정
+        preview_panel = QVBoxLayout()
+        self.preview_label = PreviewLabel()
+        self.preview_label.setFixedSize(250, 250)
+        preview_panel.addWidget(self.preview_label, alignment=Qt.AlignTop)
+        preview_panel.addStretch()
 
-        self._backlog_thread: QThread | None = None
-        self._backlog_feeder: BacklogFeeder | None = None
+        # 레이아웃(메인 윈도우) 생성 및 설정
+        main_layout = QHBoxLayout()
+        main_layout.addLayout(control_layout)
+        main_layout.addSpacing(10)
+        main_layout.addLayout(preview_panel)
+        self.setLayout(main_layout)
 
-        # 신호 연결
-        self.start_button.clicked.connect(self.start_realtime)
-        self.stop_button.clicked.connect(self.stop_realtime)
+        # 위젯들(버튼 및 체크박스 등)의 시그널과 함수 연결
+        self.image_thread = None
+        self.start_button.clicked.connect(self.start_saving)
+        self.stop_button.clicked.connect(self.stop_saving)
         self.save_opt_button.clicked.connect(self.save_options)
-        self.crop1_enabled_cb.toggled.connect(self._on_crop1_toggled)
-        self.disallowed_preview_cb.toggled.connect(self.update_preview)
+        self.bmp_check.stateChanged.connect(self.on_format_check)
+        self.jpg_check.stateChanged.connect(self.on_format_check)
 
-        # 마지막 이미지 기준으로 장비/lot/공정/attempt 및 장비 요약 CSV 로드
-        self._init_device_info_from_last_image()
-        self._restore_window_position()
+        # 크롭 영역 및 슬라이더 변경 시 동작 연결
+        for spin in (self.crop_x, self.crop_y, self.crop_w, self.crop_h):
+            spin.valueChanged.connect(self.update_preview)
+        self.quality_slider.valueChanged.connect(self.set_quality)
+        self.quality_slider.valueChanged.connect(self.update_preview)
+
+        # 초기 설정 파일을 읽어 GUI에 반영
+        self.load_options()
+        self.set_quality(self.quality_slider.value())
+        self.on_format_check()
         self.update_preview()
 
-    def _load_int_setting(self, key: str, default: int, legacy_keys=None) -> int:
-        """QSettings에서 int를 읽되, 없으면 legacy_keys 순서대로 fallback 후 default 사용"""
-        if legacy_keys is None:
-            legacy_keys = []
-        val = self.settings.value(key, None)
-        if val is None:
-            for lk in legacy_keys:
-                val = self.settings.value(lk, None)
-                if val is not None:
-                    break
-        if val is None:
-            return int(default)
-        try:
-            return int(val)
-        except Exception:
-            return int(default)
+        # 실행파일 실행 시, "자동 시작 동작 수행" 여부 플래그 : 자동 시작(True) / 수동 시작(False)
+        self.auto_start_enabled = True
+        self.auto_start_triggered = False
 
-    def _load_bool_setting(self, key: str, default: bool) -> bool:
-        """QSettings에서 bool 값을 다양한 문자열 표현까지 포함해 안전하게 로드"""
-        val = self.settings.value(key, None)
-        if val is None:
-            return default
-        if isinstance(val, bool):
-            return val
-        if isinstance(val, (int, float)):
-            return bool(val)
-        if isinstance(val, str):
-            s = val.strip().lower()
-            if s in ("1", "true", "yes", "y", "on"):
-                return True
-            if s in ("0", "false", "no", "n", "off"):
-                return False
-        return default
+        if self.auto_start_enabled:
+            QTimer.singleShot(0, self.handle_auto_start)
 
-    def _set_status(self, text: str, hold_s: float = 3.0):
-        """상태 라벨 업데이트 헬퍼 (깜빡임 방지)"""
-        now = time.monotonic()
-        if text == self._status_text:
-            return
-        self._status_text = text
-        self.status_label.setText(text)
-        if hold_s and hold_s > 0:
-            self._status_hold_until = now + hold_s
-        else:
-            self._status_hold_until = 0.0
-
-    @staticmethod
-    def _qdatetime_to_str(qdt: QDateTime | None) -> str:
-        """QDateTime -> CSV 저장용 문자열 ('yyyy-MM-dd HH:mm:ss')"""
-        if qdt is None or not isinstance(qdt, QDateTime) or not qdt.isValid():
-            return ""
-        return qdt.toString("yyyy-MM-dd HH:mm:ss")
-
-    @staticmethod
-    def _str_to_qdatetime(s: str) -> QDateTime | None:
-        """CSV 문자열 -> QDateTime (24시간제 & AM/PM 12시간제)"""
-        if not s:
-            return None
-
-        s = s.strip()
-        if not s:
-            return None
-        s_norm = re.sub(r'\s+', ' ', s)
-
-        # 24시간제
-        for fmt in ("yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm"):
-            qdt = QDateTime.fromString(s_norm, fmt)
-            if qdt.isValid():
-                return qdt
-
-        # AM/PM 12시간제
-        for fmt in ("yyyy-MM-dd h:mm:ss AP", "yyyy-MM-dd h:mm AP"):
-            qdt = QDateTime.fromString(s_norm, fmt)
-            if qdt.isValid():
-                return qdt
-
-        return None
+    def showEvent(self, event):
+        """메인 창 최초 표시 시 INI 저장 좌표 복원 또는 좌하단 오프셋 기본 위치 적용"""
+        super().showEvent(event)
+        if not self._window_position_restored:
+            self._window_position_restored = True
+            self._restore_window_position()
 
     def _restore_window_position(self):
-        """이전에 저장된 창 위치(INI)를 복원"""
-        if self._window_position_restored:
-            return
+        """INI(QSettings)에 저장된 메인 창 좌표를 복원"""
+        saved_x = self.settings.value('main_window_pos_x', None)
+        saved_y = self.settings.value('main_window_pos_y', None)
         try:
-            x_val = int(self.settings.value('main_window_pos_x', 0))
-            y_val = int(self.settings.value('main_window_pos_y', 0))
-        except Exception:
-            x_val = y_val = 0
-        self._window_position_restored = True
+            x_val = None if saved_x is None else int(float(saved_x))
+            y_val = None if saved_y is None else int(float(saved_y))
+        except (TypeError, ValueError):
+            x_val = y_val = None
 
-        if x_val or y_val:
+        if x_val is not None and y_val is not None:
             x_val, y_val = self._adjust_position_to_screen(x_val, y_val)
             self.move(x_val, y_val)
             return
+
         self._move_to_default_position()
 
     def _move_to_default_position(self):
-        """OFFSET 값 기반으로 기본 창 위치를 계산해 이동"""
+        """저장 값이 없을 때, 기본 위치로 메인 창을 이동"""
         screen = self.screen() or QGuiApplication.primaryScreen()
         if screen is None:
             return
+
         available = screen.availableGeometry()
         frame_geo = self.frameGeometry()
         window_width = frame_geo.width()
@@ -945,10 +964,11 @@ class IcingClassificationGUI(QWidget):
         self.move(target_x, target_y)
 
     def _adjust_position_to_screen(self, x, y, window_width=None, window_height=None):
-        """창이 화면 영역을 벗어나지 않도록 x, y 좌표를 보정해 반환"""
+        """메인 창의 좌표가 현재 모니터의 표시 가능한 영역을 벗어나지 않도록 보정"""
         screen = self.screen() or QGuiApplication.primaryScreen()
         if screen is None:
             return int(round(x)), int(round(y))
+
         available = screen.availableGeometry()
         if window_width is None or window_height is None:
             frame_geo = self.frameGeometry()
@@ -956,768 +976,286 @@ class IcingClassificationGUI(QWidget):
                 window_width = frame_geo.width()
             if window_height is None:
                 window_height = frame_geo.height()
+
         min_x = available.x()
         min_y = available.y()
         max_x = max(min_x, available.x() + available.width() - window_width)
         max_y = max(min_y, available.y() + available.height() - window_height)
+
         clamped_x = max(min_x, min(int(round(x)), max_x))
         clamped_y = max(min_y, min(int(round(y)), max_y))
         return clamped_x, clamped_y
 
-    def save_options(self):
-        """현재 ROI 값과 창 위치를 QSettings(INI)에 저장하고 상태를 표시"""
-        self.settings.setValue('crop1_x', self.crop1_x.value())
-        self.settings.setValue('crop1_y', self.crop1_y.value())
-        self.settings.setValue('crop1_w', self.crop1_w.value())
-        self.settings.setValue('crop1_h', self.crop1_h.value())
-        self.settings.setValue('crop1_enabled', bool(self.crop1_enabled_cb.isChecked()))
-        self.settings.setValue('show_disallowed_preview', bool(self.disallowed_preview_cb.isChecked()))
-        top_left = self.frameGeometry().topLeft()
-        self.settings.setValue('main_window_pos_x', int(top_left.x()))
-        self.settings.setValue('main_window_pos_y', int(top_left.y()))
-        self.settings.sync()
-        self._set_status("설정 저장됨.")
-
-    def _get_current_roi(self) -> tuple[int, int, int, int] | None:
-        """ROI 체크박스와 스핀박스 값으로 현재 사용 중인 ROI(또는 None)를 반환"""
-        if not self.crop1_enabled_cb.isChecked():
-            return None
-        return (int(self.crop1_x.value()), int(self.crop1_y.value()), int(self.crop1_w.value()), int(self.crop1_h.value()))
-
-    def _get_earliest_for(self, lot_number: str, attempt_value: int) -> dict[str, QDateTime | None]:
-        """(Lot, Attempt) 조합별 earliest dict 반환"""
-        key = (lot_number, int(attempt_value))
-        return self.earliest_by_lot_attempt.setdefault(key, {name: None for name in CLASS_NAMES})
-
-    def _reset_label_streak(self):
-        """연속 판정 카운터 초기화"""
-        self._streak_label = None
-        self._streak_count = 0
-        self._streak_start_dt = None
-
-    def _reset_feeding_state(self):
-        """피딩 타임 기록 상태 초기화"""
-        self.last_allowed_image_info = {"equip": None, "lot": None, "attempt": None, "name": None, "dt": None}
-        self.last_allowed_seen_at = 0.0
-        self.panel_canvas.set_completion_badge(False)
-        self.disallowed_mode_latched = False
-        self.disallowed_entered_at = 0.0
-        self._feeding_trigger_a_fired = False
-        self._feeding_trigger_b_fired = False
-
-    def _update_label_streak(self, label: str, cur_dt: QDateTime | None) -> QDateTime | None:
-        """동일 판정 5회 연속 시 최초 시각 반환"""
-        if label != self._streak_label:
-            self._streak_label = label
-            self._streak_count = 1
-            self._streak_start_dt = cur_dt if isinstance(cur_dt, QDateTime) and cur_dt.isValid() else None
-        else:
-            self._streak_count += 1
-            if self._streak_start_dt is None and isinstance(cur_dt, QDateTime) and cur_dt.isValid():
-                self._streak_start_dt = cur_dt
-
-        if self._streak_count >= 5 and isinstance(self._streak_start_dt, QDateTime) and self._streak_start_dt.isValid():
-            return self._streak_start_dt
-        return None
-
-    def _reset_panel(self):
-        """Lot / Attempt 전환 시 패널(리드타임/파일명 등) 초기화"""
-        empty_earliest = {name: None for name in CLASS_NAMES}
-        self.panel_canvas.update_panel("", None, "", empty_earliest, None)
-        self.panel_canvas.set_completion_badge(False)
-
-    def _load_equip_summary_from_csv(self):
-        """<Lot#.csv>를 리플레이해서 <장비#.csv> 정보를 재구성"""
-        if not self.current_equip:
-            return
-
-        # 재부팅 시점에 Lot 기반 정보를 다시 채우기 위해 상태를 초기화
-        self.equip_csv_path = CSV_OUTPUT_DIR / f"{self.current_equip}.csv"
-        self.earliest_by_lot_attempt.clear()
-        self.processed_images.clear()
-        self._reset_label_streak()
-
-        # Lot/Attempt 단위로 리플레이한 결과를 모아 장비 요약을 재작성
-        summary: dict[tuple[str, int], dict] = {}
-        latest_ctx: tuple[str, int, dict[str, QDateTime | None], str, QDateTime] | None = None
-        latest_py_dt = None
-        current_key: tuple[str, int] | None = None
-
-        def _load_last_image_from_lot(lot: str, attempt_val: int):
-            """Lot 상세 CSV를 이용해 마지막 처리 이미지 정보 획득"""
-            lot_path = LOT_DETAILS_DIR / f"{lot}.csv"
-            last_name = None
-            processed: set[str] = set()
-            last_dt: QDateTime | None = None
-            if not lot_path.exists():
-                return last_name, last_dt, processed
-
-            try:
-                with open(lot_path, "r", encoding="utf-8-sig", newline="") as lf:
-                    reader = csv.reader(lf)
-                    header = next(reader, None) or []
-                    idx_map = {name: i for i, name in enumerate(header)}
-
-                    for row in reader:
-                        if not row:
-                            continue
-                        try:
-                            att = int(row[idx_map.get("Attempt", 1)]) if "Attempt" in idx_map else int(row[1])
-                        except Exception:
-                            att = 0
-                        if att != attempt_val:
-                            continue
-
-                        name_idx = idx_map.get("이미지 파일명", 0)
-                        if name_idx < len(row):
-                            processed.add(row[name_idx])
-                            last_name = row[name_idx]
-
-                    if last_name:
-                        img_path = IMG_INPUT_DIR / last_name
-                        lot_dt = extract_image_datetime(img_path)
-                        if isinstance(lot_dt, QDateTime) and lot_dt.isValid():
-                            last_dt = lot_dt
-            except Exception:
-                pass
-
-            return last_name, last_dt, processed
-
-        for lot_csv in sorted(LOT_DETAILS_DIR.glob("*.csv")):
-            lot_id = lot_csv.stem
-            try:
-                with open(lot_csv, "r", encoding="utf-8-sig", newline="") as f:
-                    reader = csv.reader(f)
-                    header = next(reader, None) or []
-                    idx_map = {name: i for i, name in enumerate(header)}
-                    for row in reader:
-                        if not row:
-                            continue
-
-                        name_idx = idx_map.get("이미지 파일명", 0)
-                        attempt_idx = idx_map.get("Attempt", 1)
-                        label_idx = idx_map.get("예측 라벨", 2)
-
-                        if name_idx >= len(row) or label_idx >= len(row):
-                            continue
-
-                        img_name = row[name_idx]
-                        label = row[label_idx]
-                        try:
-                            attempt_val = int(row[attempt_idx]) if attempt_idx < len(row) else 0
-                        except Exception:
-                            attempt_val = 0
-
-                        info = parse_filename(img_name)
-                        if info['equip'] and info['equip'] != self.current_equip:
-                            continue
-                        lot_num = info['lot'] or lot_id
-                        attempt_val = info['attempt'] if info['attempt'] is not None else attempt_val
-
-                        if current_key != (lot_num, attempt_val):
-                            self._reset_label_streak()
-                            current_key = (lot_num, attempt_val)
-
-                        img_dt = extract_image_datetime(IMG_INPUT_DIR / img_name)
-                        streak_dt = self._update_label_streak(label, img_dt)
-                        starts = self._get_earliest_for(lot_num, attempt_val)
-                        if streak_dt and (starts.get(label) is None or streak_dt < starts[label]):
-                            starts[label] = streak_dt
-
-                        entry = summary.setdefault((lot_num, attempt_val), {
-                            "starts": {name: starts.get(name) for name in CLASS_NAMES},
-                            "last_img": "",
-                            "last_dt": None,
-                        })
-
-                        for name in CLASS_NAMES:
-                            cur_start = starts.get(name)
-                            prev_start = entry["starts"].get(name)
-                            if cur_start and (prev_start is None or cur_start < prev_start):
-                                entry["starts"][name] = cur_start
-
-                        if img_dt and isinstance(img_dt, QDateTime) and img_dt.isValid():
-                            if entry["last_dt"] is None or img_dt > entry["last_dt"]:
-                                entry["last_dt"] = img_dt
-                                entry["last_img"] = img_name
-                            py_dt = _qdatetime_to_datetime(img_dt)
-                            if py_dt and (latest_py_dt is None or py_dt > latest_py_dt):
-                                latest_py_dt = py_dt
-                                latest_ctx = (lot_num, attempt_val, entry["starts"].copy(), img_name, img_dt)
-
-                        self.processed_images.add(img_name)
-            except Exception as e:
-                print(f"⚠️ Lot CSV 재구성 실패({lot_csv.name}): {e}")
-
-        if not summary or latest_ctx is None:
-            return
-
-        header = ["Equip", "Lot", "Attempt", "MeltedTime", "IcingTime", "IcedTime", "FeedingTime", "MeltedToIcing(min)", "IcingToIced(min)", "IcedToFeeding(min)", "LastImageName", "LastImageTime"]
-        rows: list[list[str]] = []
-
-        for (lot_num, attempt_val), entry in summary.items():
-            starts = entry["starts"]
-            melted_dt = starts.get("Melted")
-            icing_dt = starts.get("Icing")
-            iced_dt = starts.get("Iced")
-
-            # 허용 공정의 마지막 이미지 시간 = FeedingTime 으로 사용
-            feeding_dt = entry.get("last_dt")
-            feeding_str = self._qdatetime_to_str(feeding_dt)
-
-            melted_icing = compute_lead_minutes(melted_dt, icing_dt)
-            icing_iced = compute_lead_minutes(icing_dt, iced_dt)
-            iced_feeding = compute_lead_minutes(iced_dt, feeding_dt)
-
-            rows.append([
-                self.current_equip,
-                lot_num,
-                str(attempt_val),
-                self._qdatetime_to_str(melted_dt),
-                self._qdatetime_to_str(icing_dt),
-                self._qdatetime_to_str(iced_dt),
-                feeding_str,
-                melted_icing,
-                icing_iced,
-                iced_feeding,
-                entry.get("last_img", ""),
-                self._qdatetime_to_str(entry.get("last_dt")),
-            ])
-
-        try:
-            with open(self.equip_csv_path, "w", encoding="utf-8-sig", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(header)
-                writer.writerows(rows)
-        except Exception as e:
-            print(f"❌ 장비 요약 CSV 재작성 실패: {e}")
-
-        lot_num, attempt_val, starts, last_img_name, last_dt = latest_ctx
-        self.current_attempt = attempt_val
-        self.last_processed_dt = last_dt
-        self.lot_csv_path = LOT_DETAILS_DIR / f"{lot_num}.csv"
-
-        # device_info_box 및 패널 상단 기본 정보 복원
-        header_text = ""
-        if last_img_name:
-            info = parse_filename(last_img_name)
-            if info['equip'] and info['lot'] and info['process']:
-                base_info = f"{info['equip']}_{info['lot']}_{info['process']}_{info['attempt']}"
-                self.device_info_box.setText(base_info)
-                header_text = f"[기본 정보]  {base_info}"
-
-        self.panel_canvas.update_panel(header_text, None, "", starts, last_dt)
-
-    def _update_equip_summary(self, info: dict, starts: dict[str, QDateTime | None], last_img_name: str, last_img_dt: QDateTime | None, feeding_dt: QDateTime | None = None):
-        """<장비#.csv> 구성: Lot/Attempt 별 1행으로 Summary (Melted/Icing/Iced/Feeding 시각, 리드타임, 마지막 이미지 정보 저장)"""
-        equip = info.get("equip") or ""
-        lot = info.get("lot") or ""
-        attempt_val = int(info.get("attempt") or 0)
-        if not equip or not lot:
-            return
-
-        equip_csv_path = CSV_OUTPUT_DIR / f"{equip}.csv"
-        self.equip_csv_path = equip_csv_path
-
-        melted_dt = starts.get("Melted")
-        icing_dt = starts.get("Icing")
-        iced_dt = starts.get("Iced")
-        feeding_dt = feeding_dt if isinstance(feeding_dt, QDateTime) and feeding_dt.isValid() else None
-
-        melted_str = self._qdatetime_to_str(melted_dt)
-        icing_str = self._qdatetime_to_str(icing_dt)
-        iced_str = self._qdatetime_to_str(iced_dt)
-        feeding_str = self._qdatetime_to_str(feeding_dt)
-
-        melted_icing = compute_lead_minutes(melted_dt, icing_dt)
-        icing_iced = compute_lead_minutes(icing_dt, iced_dt)
-        iced_feeding = compute_lead_minutes(iced_dt, feeding_dt)
-
-        last_img_time_str = self._qdatetime_to_str(last_img_dt)
-
-        new_row = [equip, lot, str(attempt_val), melted_str, icing_str, iced_str, feeding_str, melted_icing, icing_iced, iced_feeding, last_img_name or "", last_img_time_str]
-
-        header = ["Equip", "Lot", "Attempt", "MeltedTime", "IcingTime", "IcedTime", "FeedingTime", "MeltedToIcing(min)", "IcingToIced(min)", "IcedToFeeding(min)", "LastImageName", "LastImageTime"]
-
-        rows_dict: dict[tuple[str, int], list[str]] = {}
-        if equip_csv_path.exists():
-            try:
-                with open(equip_csv_path, "r", encoding="utf-8-sig", newline="") as f:
-                    reader = csv.reader(f)
-                    _old_header = next(reader, None) or []
-                    idx_map = {name: i for i, name in enumerate(_old_header)}
-
-                    for row in reader:
-                        if not row:
-                            continue
-
-                        def _get(name: str):
-                            idx = idx_map.get(name)
-                            if idx is None or idx >= len(row):
-                                return ""
-                            return row[idx]
-
-                        equip_old = _get("Equip")
-                        lot_old = _get("Lot")
-                        attempt_old = _get("Attempt")
-                        melted_old = _get("MeltedTime")
-                        icing_old = _get("IcingTime")
-                        iced_old = _get("IcedTime")
-                        feeding_old = _get("FeedingTime")
-
-                        melted_dt_old = self._str_to_qdatetime(melted_old)
-                        icing_dt_old = self._str_to_qdatetime(icing_old)
-                        iced_dt_old = self._str_to_qdatetime(iced_old)
-                        feeding_dt_old = self._str_to_qdatetime(feeding_old)
-
-                        melted_icing_old = _get("MeltedToIcing(min)") or compute_lead_minutes(melted_dt_old, icing_dt_old)
-                        icing_iced_old = _get("IcingToIced(min)") or compute_lead_minutes(icing_dt_old, iced_dt_old)
-                        iced_feeding_old = _get("IcedToFeeding(min)") or compute_lead_minutes(iced_dt_old, feeding_dt_old)
-                        last_img_old = _get("LastImageName")
-                        last_time_old = _get("LastImageTime")
-
-                        try:
-                            attempt_key = int(attempt_old)
-                        except Exception:
-                            attempt_key = 0
-
-                        rows_dict[(lot_old, attempt_key)] = [equip_old, lot_old, str(attempt_key), melted_old, icing_old, iced_old, feeding_old,
-                                                             melted_icing_old, icing_iced_old, iced_feeding_old, last_img_old, last_time_old]
-            except Exception as e:
-                print(f"⚠️ 장비 요약 CSV 읽기 실패: {e}")
-
-        # Lot/Attempt 기준 upsert
-        rows_dict[(lot, attempt_val)] = new_row
-        rows = list(rows_dict.values())
-
-        try:
-            with open(equip_csv_path, "w", encoding="utf-8-sig", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(header)
-                writer.writerows(rows)
-        except Exception as e:
-            print(f"❌ 장비 요약 CSV 저장 실패: {e}")
-
-    def _poll_latest_image(self):
-        """FeedingTime 기록 트리거 (비허용 공정으로 '진입'한 후 9초 경과 or 마지막 이미지 유입/처리 이후 9초 경과)"""
-        now = time.monotonic()
-
-        # (A) 비허용 공정 진입 후 9초 경과 트리거
-        if (
-            self.disallowed_mode_latched
-            and self.disallowed_entered_at > 0.0
-            and (not self._feeding_trigger_a_fired)
-            and (now - self.disallowed_entered_at) >= self.no_new_image_grace_s
-        ):
-            if self._record_feeding_time(trigger="A"):
-                self._feeding_trigger_a_fired = True
-
-        # (B) 이미지 유입 중단 상태 감지
-        if self._feeding_trigger_b_fired:
-            return
-
-        if now < self._status_hold_until:
-            return
-        if now < self._no_image_grace_until:
-            return
-        if self.pending_images or (self._backlog_thread and self._backlog_thread.isRunning()):
-            return
-
-        last_seen_any = self.last_image_seen_at
-        if last_seen_any > 0.0 and (now - last_seen_any) > self.no_new_image_grace_s:
-            self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
-            self._set_status("신규 이미지 없음 (폴더 감시 중)", hold_s=0.0)
-            if self._record_feeding_time(trigger="B"):
-                self._feeding_trigger_b_fired = True
-            return
-
-    def _record_feeding_time(self, trigger: str) -> bool:
-        """FeedingTime 기록"""
-        info = self.last_allowed_image_info
-        lot = info.get("lot") if isinstance(info, dict) else None
-        attempt_val = info.get("attempt") if isinstance(info, dict) else None
-        last_img_name = info.get("name") if isinstance(info, dict) else None
-        feeding_dt = info.get("dt") if isinstance(info, dict) else None
-        equip = info.get("equip") if isinstance(info, dict) else None
-
-        if lot is None or attempt_val is None:
-            return False
-        if not isinstance(feeding_dt, QDateTime) or not feeding_dt.isValid():
-            return False
-
-        equip_val = equip or self.current_equip
-        if not equip_val:
-            return False
-
-        starts = self._get_earliest_for(lot, int(attempt_val))
-        self._update_equip_summary({"equip": equip_val, "lot": lot, "attempt": attempt_val}, starts, last_img_name or "", feeding_dt, feeding_dt)
-
-        self.panel_canvas.set_completion_badge(True)
-        return True
-
-    def _main_tick(self):
-        """타이머 통합 틱: 대기 중인 이미지 처리 + '신규 이미지 없음' 상태 갱신"""
-        self._drain_pending_queue()
-        self._poll_latest_image()
-
-    def _is_after_last_processed(self, img_path: Path) -> bool:
-        """<장비#.csv> 기준 '마지막 처리된 시각(self.last_processed_dt)' 이후의 이미지인지 여부 확인"""
-        if self.last_processed_dt is None or not isinstance(self.last_processed_dt, QDateTime):
-            return True
-        if not self.last_processed_dt.isValid():
-            return True
-
-        img_dt = extract_image_datetime(img_path)
-        if not isinstance(img_dt, QDateTime) or not img_dt.isValid():
-            return True
-
-        base = _qdatetime_to_datetime(self.last_processed_dt)
-        cur = _qdatetime_to_datetime(img_dt)
-        if base is None or cur is None:
-            return True
-        return cur > base
-
-    @Slot(object)
-    def _enqueue_new_image(self, path_obj):
-        """watchdog에서 전달된 신규 이미지 경로를 검사 후 처리 대기 큐에 넣기"""
-        if path_obj is None:
-            return
-        path = Path(path_obj)
-        if path.suffix.lower() not in ALLOWED_IMAGE_EXTS:
-            return
-        if not self._is_after_last_processed(path):
-            return
-        if path.name in self.processed_images:
-            return
-
-        self.last_image_seen_at = time.monotonic()
-        self._feeding_trigger_b_fired = False
-        self.pending_images.append(path)
-
-        if not (self._backlog_thread and self._backlog_thread.isRunning()):
-            self._drain_pending_queue()
-
-    def _drain_pending_queue(self):
-        """큐에 쌓인 신규 이미지를 순차 처리"""
-        if self._is_processing_queue:
-            return
-        if self._backlog_thread and self._backlog_thread.isRunning():
-            return
-        self._is_processing_queue = True
-        try:
-            while self.pending_images:
-                path = self.pending_images.popleft()
-                if not isinstance(path, Path):
-                    path = Path(path)
-                if path.suffix.lower() not in ALLOWED_IMAGE_EXTS:
-                    continue
-                if path.name in self.processed_images:
-                    continue
-                self.process_single_image(path)
-        finally:
-            self._is_processing_queue = False
-
-    def _prepare_lot_from_csv(self, lot_number: str, attempt_value: int):
-        """Lot/Attempt 전환 시 초기화 처리 및 <Lot#.csv> 저장"""
-        lot_changed = (self.current_lot != lot_number)
-        attempt_changed = (
-            self.current_lot == lot_number
-            and self.current_attempt is not None
-            and self.current_attempt != attempt_value
-        )
-
-        # <Lot#.csv>는 'icing_info/lot details' 폴더에 저장
-        if self.lot_csv_path is None or lot_changed:
-            self.lot_csv_path = LOT_DETAILS_DIR / f"{lot_number}.csv"
-            self._reset_panel()
-            self.processed_images.clear()
-            # Lot이 바뀔 때 연속 라벨 카운터 및 피딩 타임 기록 상태 초기화
-            self._reset_label_streak()
-            self._reset_feeding_state()
-
-        # Lot은 같고 Attempt만 다르면 같은 <Lot#.csv>에 계속 저장
-        elif attempt_changed:
-            self._reset_panel()
-            self.processed_images.clear()
-            # Attempt가 바뀔 때 연속 라벨 카운터 및 피딩 타임 기록 상태 초기화
-            self._reset_label_streak()
-            self._reset_feeding_state()
-
-        self.current_lot = lot_number
-        self.current_attempt = attempt_value
-
-    def _on_crop1_toggled(self, checked: bool):
-        """ROI 체크박스 ↔ 스핀박스 연동 토글"""
-        for s in (self.crop1_x, self.crop1_y, self.crop1_w, self.crop1_h):
-            s.setEnabled(bool(checked))
-
-        self.update_preview()
-
-    def process_single_image(self, img_path: Path):
-        """단일 이미지 처리 루틴 (파일명 파싱 → Lot/Attempt 상태 갱신 → 분류 → CSV 기록 → 장비 요약 → 미리보기·패널·상태 갱신 처리)"""
-        try:
-            info = parse_filename(img_path.name)
-            lot_number = info['lot']
-            attempt_value = info['attempt']
-            process_name = (info.get('process') or '').upper()
-            img_name = img_path.name
-
-            # 신규 이미지 도착 시각 기록 (허용/비허용 공정 공통)
-            self.last_image_seen_at = time.monotonic()
-            self._feeding_trigger_b_fired = False
-
-            if not self.current_equip:
-                self.current_equip = info['equip'] or None
-
-            # 장비#_Lot#_Process_Attempt 기본 정보 문자열
-            base_info = f"{info['equip']}_{info['lot']}_{info['process']}_{info['attempt']}"
-            self.device_info_box.setText(base_info)
-            self._prepare_lot_from_csv(lot_number, attempt_value)
-            starts = self._get_earliest_for(lot_number, attempt_value)
-
-            if img_name in self.processed_images:
-                return
-
-            # 허용 공정 여부 확인
-            roi_rect = self._get_current_roi()
-            if process_name not in self.ALLOWED_PULLER_MODES:
-                # 비허용 공정 "진입" 시각 래치 (최초 1회만)
-                if not self.disallowed_mode_latched:
-                    self.disallowed_mode_latched = True
-                    self.disallowed_entered_at = time.monotonic()
-                    self._feeding_trigger_a_fired = False
-
-                if self.disallowed_preview_cb.isChecked():
-                    latest_img = safe_image_load(str(img_path), as_gray=True)
-                    if latest_img is not None:
-                        self.preview_label.show_image(latest_img, filename=img_name, roi=roi_rect)
-                    else:
-                        self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
-                else:
-                    self.preview_label.show_placeholder(DISALLOWED_PLACEHOLDER_TEXT)
-                self._set_status("지정된 Puller Mode Status가 아님.", hold_s=0.0)
-                self._mark_image_processed(img_name)
-                return
-
-            # 허용 공정으로 돌아오면 "진입" 시각 래치 해제
-            if self.disallowed_mode_latched:
-                self.disallowed_mode_latched = False
-                self.disallowed_entered_at = 0.0
-
-            self.last_allowed_seen_at = time.monotonic()
-
-            # 여기부터 신규 이미지에 대한 실제 분류 판정
-            label, probs, gray_for_preview = self.classifier.predict(img_path, roi=roi_rect, return_gray_for_preview=True)
-            if label is None or probs is None:
-                self._set_status(f"오류: {img_name} 분류 실패")
-                self._mark_image_processed(img_name)
-                return
-
-            cur_dt = extract_image_datetime(img_path)
-            if not (isinstance(cur_dt, QDateTime) and cur_dt.isValid()):
-                cur_dt = None
-
-            streak_dt = self._update_label_streak(label, cur_dt)
-            if streak_dt is not None:
-                prev_start = starts.get(label)
-                if prev_start is None or streak_dt < prev_start:
-                    starts[label] = streak_dt
-
-            row = [img_name, attempt_value, label]
-            row.extend([f"{p:.4f}" for p in probs])
-            self.save_csv(row)
-            self._update_equip_summary(info, starts, img_name, cur_dt)
-
-            if cur_dt and cur_dt.isValid():
-                old = _qdatetime_to_datetime(self.last_processed_dt) if self.last_processed_dt else None
-                new = _qdatetime_to_datetime(cur_dt)
-                if new is not None and (old is None or new > old):
-                    self.last_processed_dt = cur_dt
-
-            self.last_allowed_image_info = {
-                "equip": self.current_equip or info.get("equip"),
-                "lot": lot_number,
-                "attempt": attempt_value,
-                "name": img_name,
-                "dt": cur_dt,
-            }
-
-            # 분류에서 로딩한 그레이 이미지를 미리보기에 그대로 사용
-            if gray_for_preview is not None:
-                self.preview_label.show_image(gray_for_preview, filename=img_name, roi=roi_rect)
-            else:
-                self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
-
-            header_text = f"[기본 정보]  {base_info}"
-            self.panel_canvas.update_panel(header_text, probs, label, starts, cur_dt)
-            self._set_status(f"처리됨: {img_name} → {label}")
-            self._mark_image_processed(img_name)
-        except Exception as e:
-            self._set_status(f"오류: {e}")
-
-    def save_csv(self, row, max_retries=5, delay=0.2):
-        """<Lot#.csv>에 정보 저장 (Lot 변경 시마다 다른 파일로 저장)"""
-        if not self.lot_csv_path:
-            return False
-        attempt = 0
-        while attempt < max_retries:
-            try:
-                header_exists = self.lot_csv_path.exists()
-                with open(self.lot_csv_path, 'a', newline='', encoding='utf-8-sig') as f:
-                    writer = csv.writer(f)
-                    if not header_exists:
-                        writer.writerow(self.csv_header)
-                    writer.writerow(row)
-                return True
-            except Exception:
-                attempt += 1
-                time.sleep(delay)
-        return False
-
-    def _mark_image_processed(self, filename: str):
-        """현재 세션/Lot에서 이미 처리한 이미지명 기록"""
-        if not filename:
-            return
-        self.processed_images.add(filename)
-
-    def update_preview(self):
-        """이미지 미리보기 / 상부 텍스트 갱신 (최신파일 기준)"""
-        try:
-            cands = [p for p in IMG_INPUT_DIR.iterdir() if p.suffix.lower() in ALLOWED_IMAGE_EXTS]
-            if not cands:
-                self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
-                return
-            latest = max(cands, key=lambda p: p.stat().st_mtime)
-            info = parse_filename(latest.name)
-            process_name = (info.get('process') or '').upper()
-            if process_name not in self.ALLOWED_PULLER_MODES and not self.disallowed_preview_cb.isChecked():
-                self.preview_label.show_placeholder(DISALLOWED_PLACEHOLDER_TEXT)
-                return
-            img = safe_image_load(str(latest), as_gray=True)
-            if img is None:
-                self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
-                return
-            self.preview_label.show_image(img, filename=latest.name, roi=self._get_current_roi())
-        except Exception:
-            self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
-
-    def _init_device_info_from_last_image(self):
-        """GUI 최초 실행 시 최신 이미지명으로 공정 정보 텍스트 초기화"""
-        if self.device_info_box.text():
-            return
-        try:
-            candidates = [p for p in IMG_INPUT_DIR.iterdir() if p.suffix.lower() in ALLOWED_IMAGE_EXTS]
-        except Exception:
-            return
-        if not candidates:
-            return
-        try:
-            latest = max(candidates, key=lambda p: p.stat().st_mtime)
-            info = parse_filename(latest.name)
-            self.current_equip = info['equip'] or None
-            self.device_info_box.setText(f"{info['equip']}_{info['lot']}_{info['process']}_{info['attempt']}")
-            # 장비명이 결정되면 요약 CSV에서 이전 상태 복원
-            self._load_equip_summary_from_csv()
-        except Exception:
-            return
-
-    def start_realtime(self):
-        """실시간 분류 시작 (백로그 → 라이브 테일 순)"""
+    def start_saving(self):
+        """이미지 저장 쓰레드 시작"""
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self.pending_images.clear()
-        self._is_processing_queue = False
-        self.directory_watcher.start()
-        self.tail_timer.start()
+        self.status_label.setText('저장 시작...')
+        self.image_thread = ImageSaverThread(
+            self.source_file,
+            self.output_folder,
+            self.get_crop_rect,
+            self.get_selected_formats,
+            self.get_quality,
+            self.get_interval,
+            self.get_max_files,
+            self.get_allowed_process_rule
+        )
+        self.image_thread.update_status.connect(self.status_label.setText)
+        self.image_thread.update_preview.connect(self.update_preview)
+        self.image_thread.update_device_name.connect(self.update_device_name_from_thread)
+        self.image_thread.allowed_state_changed.connect(self.on_allowed_state_changed)
+        self.image_thread.start()
 
-        self._reset_label_streak()
-        self._reset_feeding_state()
+    def handle_auto_start(self):
+        """실행 파일 실행 시 자동으로 시작 버튼을 눌러주는 핸들러"""
+        if self.auto_start_enabled and not self.auto_start_triggered:
+            self.auto_start_triggered = True
+            self.start_saving()
 
-        now = time.monotonic()
-        self.last_image_seen_at = now
-        self._no_image_grace_until = now + 3.0
-
-        # 백로그
-        backlog: list[Path] = []
-        try:
-            for p in IMG_INPUT_DIR.iterdir():
-                if p.suffix.lower() not in ALLOWED_IMAGE_EXTS:
-                    continue
-                if not self._is_after_last_processed(p):
-                    continue
-                if p.name in self.processed_images:
-                    continue
-                backlog.append(p)
-        except Exception:
-            backlog = []
-
-        self._start_backlog_feeder(backlog)
-        self._set_status("실시간 분류 시작")
-
-    def stop_realtime(self):
-        """실시간 분류 중지"""
+    def stop_saving(self):
+        """이미지 저장 쓰레드 중지"""
+        if self.image_thread:
+            self.image_thread.stop()
+            self.image_thread.wait()
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
-        if self.tail_timer.isActive():
-            self.tail_timer.stop()
-        self.directory_watcher.stop()
-        self.pending_images.clear()
-        self._is_processing_queue = False
-        try:
-            if self._backlog_feeder:
-                self._backlog_feeder.stop()
-            if self._backlog_thread and self._backlog_thread.isRunning():
-                self._backlog_thread.quit()
-                self._backlog_thread.wait(2000)
-        except Exception:
-            pass
-        self._set_status("- 중지 -")
-
-    def _start_backlog_feeder(self, backlog):
-        """시작 시점에 남아 있는 백로그 이미지를 별도 스레드로 순차 처리"""
-        if not backlog:
-            self._set_status("백로그 없음. 라이브 감시 시작.", hold_s=3.0)
-            return
-        if self._backlog_thread and self._backlog_thread.isRunning():
-            return
-        self._backlog_thread = QThread()
-        self._backlog_feeder = BacklogFeeder(backlog)
-        self._backlog_feeder.moveToThread(self._backlog_thread)
-        self._backlog_thread.started.connect(self._backlog_feeder.run)
-        self._backlog_feeder.next_image.connect(self.process_single_image)
-        self._backlog_feeder.finished.connect(self._on_backlog_finished)
-        self._backlog_feeder.finished.connect(self._backlog_thread.quit)
-        self._backlog_thread.finished.connect(self._backlog_thread.deleteLater)
-        self._backlog_thread.finished.connect(lambda: setattr(self, "_backlog_thread", None))
-        self._backlog_thread.destroyed.connect(lambda: setattr(self, "_backlog_thread", None))
-        self._backlog_feeder.finished.connect(lambda: setattr(self, "_backlog_feeder", None))
-        self._backlog_thread.finished.connect(self._drain_pending_queue)
-        self._backlog_thread.start()
-        self._set_status(f"백로그 처리 시작: {len(backlog)}장")
-
-    @Slot()
-    def _on_backlog_finished(self):
-        self._set_status("백로그 처리 완료 → 실시간 감시 중")
-        self._drain_pending_queue()
+        self.status_label.setText('저장 중지.')
 
     def closeEvent(self, event):
-        """메인 윈도우 종료 시 현재 설정을 .ini에 자동 저장"""
+        """윈도우 종료 시 설정 저장(.ini) 및 쓰레드 정리"""
         try:
-            self.stop_realtime()
             self.save_options()
         except Exception:
             pass
-        finally:
-            super().closeEvent(event)
+        self.stop_saving()
+        event.accept()
 
-def main():
-    app = QApplication(sys.argv)
-    gui = IcingClassificationGUI()
-    gui.show()
-    if gui.auto_start_on_launch:
-        gui.start_realtime()
-    sys.exit(app.exec())
+    def get_crop_rect(self):
+        return (self.crop_x.value(), self.crop_y.value(), self.crop_w.value(), self.crop_h.value())
 
+    def get_selected_formats(self):
+        formats = []
+        if self.bmp_check.isChecked():
+            formats.append('BMP')
+        if self.jpg_check.isChecked():
+            formats.append('JPEG')
+        return formats
+
+    def get_quality(self):
+        return self.quality_slider.value()
+
+    def get_interval(self):
+        return self.interval_spin.value()
+
+    def get_max_files(self):
+        return self.max_files_spin.value()
+
+    def set_quality(self, val):
+        self.quality_label.setText(f'JPEG 품질: {val}')
+
+    def on_format_check(self):
+        """포맷 체크 박스 상태에 따른 UI 동작 제어"""
+        sender = self.sender()
+        if not self.bmp_check.isChecked() and not self.jpg_check.isChecked():
+            if sender == self.bmp_check:
+                self.jpg_check.setChecked(True)
+            else:
+                self.bmp_check.setChecked(True)
+        if self.bmp_check.isChecked() and self.jpg_check.isChecked():
+            if sender == self.bmp_check:
+                self.jpg_check.setChecked(False)
+            else:
+                self.bmp_check.setChecked(False)
+        self.quality_slider.setEnabled(self.jpg_check.isChecked())
+        self.quality_label.setEnabled(self.jpg_check.isChecked())
+
+    def update_preview(self):
+        """소스 이미지를 불러와서 프리뷰와 크롭 미리보기 업데이트"""
+        self.placeholder_active = False
+        if not self.source_file.exists():
+            self.preview_label.clear()
+            self.preview_label.setText('이미지 없음')
+            return
+        try:
+            img_gray = safe_read_gray(self.source_file)
+            if img_gray is None:
+                raise RuntimeError("이미지 읽기 실패(쓰기중/락)")
+            pil_img = Image.fromarray(img_gray)
+            self.last_preview_size = pil_img.size
+            crop_rect = self.get_crop_rect()
+            self.preview_label.set_image(pil_img, crop_rect)
+        except Exception as e:
+            self.preview_label.clear()
+            self.preview_label.setText(str(e))
+
+    def _on_disallowed_timer(self):
+        """허용 공정이 아닌 상태가 10초 이상 지속되면 프리뷰를 경고 화면으로 교체"""
+        if self.disallowed_since is None or self.placeholder_active:
+            return
+
+        if time.time() - self.disallowed_since >= 10:
+            self._show_disallowed_placeholder()
+
+    def _show_disallowed_placeholder(self):
+        """검은 배경 위에 안내 문구를 추가한 대체 프리뷰 생성"""
+        size = self.last_preview_size or (self.preview_label.width() or 250, self.preview_label.height() or 250)
+        placeholder = Image.new("L", size, color=0)
+        draw = ImageDraw.Draw(placeholder)
+        message = "저장 허용 공정이 아님"
+
+        font_size = max(18, size[1] // 12)
+        try:
+            font = ImageFont.truetype("malgun.ttf", font_size)
+        except Exception:
+            font = ImageFont.load_default()
+
+        # 글자 크기 계산
+        try:
+            text_bbox = draw.textbbox((0, 0), message, font=font)
+            text_w = text_bbox[2] - text_bbox[0]
+            text_h = text_bbox[3] - text_bbox[1]
+        except AttributeError:
+            text_w, text_h = draw.textsize(message, font=font)
+
+        x = (size[0] - text_w) / 2
+        y = (size[1] - text_h) / 2
+        draw.text((x, y), message, fill=255, font=font)
+
+        # 검은 화면일 때 Crop 사각 박스 제거
+        self.preview_label.set_image(placeholder, crop_rect=None)
+        self.placeholder_active = True
+
+    def on_allowed_state_changed(self, is_allowed):
+        """허용/비허용 전환 시 타이머와 프리뷰 상태를 관리"""
+        if is_allowed:
+            self.disallowed_since = None
+            if self.placeholder_active:
+                self.update_preview()
+        else:
+            if self.disallowed_since is None:
+                self.disallowed_since = time.time()
+
+    def save_options(self):
+        """GUI 옵션을 설정 파일에 저장"""
+        self.settings.setValue('crop_x', self.crop_x.value())
+        self.settings.setValue('crop_y', self.crop_y.value())
+        self.settings.setValue('crop_w', self.crop_w.value())
+        self.settings.setValue('crop_h', self.crop_h.value())
+        self.settings.setValue('interval', self.interval_spin.value())
+        self.settings.setValue('max_files', self.max_files_spin.value())
+        self.settings.setValue('bmp_checked', self.bmp_check.isChecked())
+        self.settings.setValue('jpg_checked', self.jpg_check.isChecked())
+        self.settings.setValue('jpeg_quality', self.quality_slider.value())
+
+        # allowed_processes를 항상 "표준 문자열"로 저장
+        allow_all, allowed_set = self.get_allowed_process_rule()
+        if allow_all:
+            canonical = 'ALL'
+        else:
+            canonical = ', '.join(sorted(allowed_set)) if allowed_set else 'NECK'
+        self._allowed_process_raw = canonical
+        self.settings.setValue('allowed_processes', canonical)
+
+        # 메인 창 위치 저장
+        top_left = self.frameGeometry().topLeft()
+        self.settings.setValue('main_window_pos_x', int(top_left.x()))
+        self.settings.setValue('main_window_pos_y', int(top_left.y()))
+
+        self.settings.sync()
+        self.status_label.setText('설정 저장됨.')
+
+    def load_options(self):
+        """설정 파일에서 옵션 읽어 GUI에 적용"""
+        self.crop_x.setValue(int(self.settings.value('crop_x', 103)))
+        self.crop_y.setValue(int(self.settings.value('crop_y', 0)))
+        self.crop_w.setValue(int(self.settings.value('crop_w', 280)))
+        self.crop_h.setValue(int(self.settings.value('crop_h', 600)))
+        self.interval_spin.setValue(int(self.settings.value('interval', 4)))
+        max_files_val = self.settings.value('max_files', None)
+        if max_files_val is None:
+            max_files_val = self.settings.value('delete_interval', 1000)
+        self.max_files_spin.setValue(int(max_files_val))
+        self.bmp_check.setChecked(self.settings.value('bmp_checked', 'False') in ['true', 'True', True])
+        self.jpg_check.setChecked(self.settings.value('jpg_checked', 'True') in ['true', 'True', True])
+        self.device_edit.setText(str(self.settings.value('device_name', '')))
+        qual = int(self.settings.value('jpeg_quality', 90))
+        self.quality_slider.setValue(qual)
+
+        allowed_processes_value = self.settings.value('allowed_processes', 'ALL')
+        if allowed_processes_value is None:
+            allowed_processes_value = 'ALL'
+        self._set_allowed_processes(allowed_processes_value)
+
+    def update_device_name_from_thread(self, full_device_name):
+        """ImageSaverThread에서 보낸 최신 장비명으로 GUI 장비명 입력란 갱신"""
+        self.device_edit.setText(full_device_name)
+
+    def _set_allowed_processes(self, value):
+        """value는 리스트/튜플/셋 어떤 형태든 허용 공정 집합으로 정상화"""
+        tokens = []
+
+        if isinstance(value, (list, tuple, set)):
+            tokens = [str(v).strip() for v in value if str(v).strip()]
+        elif isinstance(value, str):
+            s = value.strip()
+            if s.startswith('[') and s.endswith(']'):
+                try:
+                    parsed = ast.literal_eval(s)
+                    if isinstance(parsed, (list, tuple, set)):
+                        tokens = [str(v).strip() for v in parsed if str(v).strip()]
+                    else:
+                        tokens = [p.strip() for p in s.strip('[]').split(',')]
+                except Exception:
+                    tokens = [p.strip() for p in s.strip('[]').split(',')]
+            else:
+                tokens = [p.strip() for p in s.split(',') if p.strip()]
+        else:
+            tokens = []
+
+        upper_tokens = {t.upper() for t in tokens if t}
+
+        self._allowed_process_raw = 'ALL' if 'ALL' in upper_tokens else ', '.join(tokens) if tokens else 'NECK'
+
+        if 'ALL' in upper_tokens:
+            self._allowed_process_allow_all = True
+            self._allowed_process_set = set()
+        elif upper_tokens:
+            self._allowed_process_allow_all = False
+            self._allowed_process_set = upper_tokens
+        else:
+            self._allowed_process_allow_all = False
+            self._allowed_process_set = {"NECK"}
+
+    def get_allowed_process_rule(self):
+        return (self._allowed_process_allow_all, set(self._allowed_process_set))
+
+def run_gui():
+    """QApplication 인스턴스 생성 및 초기 Lot 표시"""
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    else:
+        try:
+            app.quit()
+        except Exception:
+            pass
+        app = QApplication(sys.argv)
+
+    window = MainWindow()
+
+    tracker = CsvTracker()
+    try:
+        tracker.get_info(datetime.now())
+        latest_csv_fname = tracker.name
+    finally:
+        tracker._reset_connection()
+
+    host_and_csvname = f"{host_name} / {latest_csv_fname.rsplit('.', 1)[0] if latest_csv_fname else 'N/A'}"
+    window.device_edit.setText(host_and_csvname)
+
+    window.show()
+    app.exec()
 
 if __name__ == '__main__':
-    main()
+    run_gui()
