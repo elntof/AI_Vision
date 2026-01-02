@@ -6,16 +6,17 @@ import time
 import re
 import numpy as np
 import cv2
-import matplotlib.pyplot as plt
-import matplotlib as mpl
 import matplotlib
 matplotlib.use('QtAgg')
+
+import matplotlib.pyplot as plt
+import matplotlib as mpl
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox,
     QGroupBox, QSizePolicy, QLineEdit, QLayout, QCheckBox, QTextEdit, QScrollArea, QDialog
 )
-from PySide6.QtCore import Qt, QTimer, QSettings, QRect, QThread, QObject, Signal, Slot, QDateTime, QEvent, QUrl
+from PySide6.QtCore import Qt, QTimer, QDate, QTime, QSettings, QRect, QThread, QObject, Signal, Slot, QDateTime, QEvent, QUrl
 from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QGuiApplication, QDesktopServices
 import csv
 from collections import deque
@@ -98,6 +99,7 @@ WINDOW_OFFSET_Y = 200
 
 # 신규 이미지 부재 시 미리보기 플레이스홀더 텍스트
 NO_IMAGE_PLACEHOLDER_TEXT = "신규 이미지 없음"
+DISALLOWED_PLACEHOLDER_TEXT = "허용 공정이 아님"
 
 # 감시 대상 이미지 확장자 목록
 ALLOWED_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
@@ -213,13 +215,11 @@ def extract_image_datetime(path: Path) -> QDateTime:
     stem = path.stem
     m = re.search(r'(\d{4})(\d{2})(\d{2})[_-]?(\d{2})(\d{2})(\d{0,2})', stem)
     if m:
-        yyyy = int(m.group(1))
-        mm = int(m.group(2))
-        dd = int(m.group(3))
-        hh = int(m.group(4))
-        mi = int(m.group(5))
+        yyyy = int(m.group(1)); mm = int(m.group(2)); dd = int(m.group(3))
+        hh = int(m.group(4)); mi = int(m.group(5))
         ss = int(m.group(6)) if m.group(6) else 0
-        qdt = QDateTime(yyyy, mm, dd, hh, mi, ss)
+
+        qdt = QDateTime(QDate(yyyy, mm, dd), QTime(hh, mi, ss))
         if qdt.isValid():
             return qdt
     try:
@@ -236,7 +236,7 @@ def particle_detection(image_source, exclude_boxes, threshold=None, area_min=PAR
         img = safe_image_load(image_source, as_gray=True)
 
     if img is None:
-        print(f"❌ 오류: {image_source} 이미지 로딩 실패")
+        print(f"오류: {image_source} 이미지 로딩 실패")
         return None, None, None
 
     try:
@@ -276,7 +276,7 @@ def particle_detection(image_source, exclude_boxes, threshold=None, area_min=PAR
         return gray, vis_img, particle_info
 
     except Exception as e:
-        print(f"❌ 오류: {e}")
+        print(f"오류: {e}")
         return None, None, None
 
 def find_new_images(img_dir, processed_set):
@@ -316,17 +316,27 @@ class ImageDirectoryWatcher(QObject):
     def __init__(self, directory: Path, allow_ext=None, parent=None):
         super().__init__(parent)
         self._directory = Path(directory)
-        self._observer: Observer | None = None # pyright: ignore[reportInvalidTypeForm]
+        self._observer: Observer | None = None  # pyright: ignore[reportInvalidTypeForm]
         self._handler: _ImageFileEventHandler | None = None
         if allow_ext is None:
             allow_ext = ALLOWED_IMAGE_EXTS
         self._allow_ext = {ext.lower() for ext in allow_ext}
 
     def start(self):
-        if self._observer is not None:
+        if self._observer is not None and self._observer.is_alive():
             return
+        if self._observer is not None and (not self._observer.is_alive()):
+            try:
+                self._observer.stop()
+                self._observer.join(timeout=1.0)
+            except Exception:
+                pass
+            self._observer = None
+            self._handler = None
+
         if not self._directory.exists():
             self._directory.mkdir(parents=True, exist_ok=True)
+
         self._handler = _ImageFileEventHandler(self.file_created.emit, self._allow_ext)
         observer = Observer()
         observer.schedule(self._handler, str(self._directory), recursive=False)
@@ -346,7 +356,7 @@ class ImageDirectoryWatcher(QObject):
             pass
 
     def is_running(self) -> bool:
-        return self._observer is not None
+        return self._observer is not None and self._observer.is_alive()
 
 def parse_filename(fname: str):
     """파일명 파서 (형식: EQUIP_Lot#_Process_Attempt_YYYYMMDD_HHMM(SS).ext)"""
@@ -401,7 +411,6 @@ class ParticlePlotCanvas(FigureCanvas):
             return
 
         self.is_empty_plot = False
-
         self.ax.axis('on')
 
         # X 좌표, 틱 계산 및 y 길이 보정
@@ -415,15 +424,14 @@ class ParticlePlotCanvas(FigureCanvas):
         if len(y_list) < n:
             y_list = np.pad(y_list, (0, n - len(y_list)), mode='constant', constant_values=0)
 
-        # 본선 플롯
         self.ax.plot(x_coords, y_list, linestyle='-', color='black', linewidth=1.5)
 
-        # 빨간 마커(>0)
+        # 빨간 마커 (파티클 탐지)
         x_markers = x_coords[y_list > 0]
         y_markers = y_list[y_list > 0]
         self.ax.scatter(x_markers, y_markers, marker='o', s=80, facecolors='red', edgecolors='black', linewidths=1.5)
 
-        # 현재 포인트(연녹)
+        # 연녹 마커 (현재 포인트)
         if latest_index is not None and 0 <= latest_index < n:
             y_val = y_list[latest_index]
             self.ax.scatter(latest_index, y_val, marker='o', s=80, facecolors='lightgreen', edgecolors='black', linewidths=1.5)
@@ -441,19 +449,15 @@ class ParticlePlotCanvas(FigureCanvas):
             y_min, y_max = self.ax.get_ylim()
             label_y = y_max - (y_max - y_min) * 0.05
 
-            # 교차 배경 밴딩, 경계선, 그룹 라벨
             for idx, (s, e, att) in enumerate(groups):
                 if s > e:
                     continue
-                # 배경 밴딩
                 span_color = "#D8D8D8" if (idx % 2 == 0) else "#AACFFF"
                 self.ax.axvspan(s - 0.5, e + 0.5, facecolor=span_color, alpha=0.5, zorder=0)
 
-                # 경계선 (왼쪽 경계만 표시)
                 if s > 0:
                     self.ax.axvline(s - 0.5, color='#444444', linestyle='-', linewidth=0.8, alpha=0.8, zorder=1)
 
-                # att 레이블
                 mid = (s + e) / 2.0
                 self.ax.text(mid, label_y, f"Att-{int(att)}", ha='center', va='top', fontsize=9, fontweight='bold', color='#334455', zorder=2)
 
@@ -684,6 +688,7 @@ class DeletionDialog(QDialog):
     deleteConfirmed = Signal(list, bool)
 
     def __init__(self, history_entries, parent=None):
+        """오탐 삭제를 위해 탐지 이력 목록 형태로 보여주고, 삭제 후 승인 다이얼로그 초기화"""
         super().__init__(parent)
         self.setWindowTitle('오탐 삭제')
         self.resize(960, 650)
@@ -692,7 +697,6 @@ class DeletionDialog(QDialog):
 
         self._bulk_updating = False
 
-        # 이력에서 장비/LOT 기본 정보를 추출해 상단에 노출
         base_info_label = QLabel(self._extract_base_info(history_entries))
         base_info_label.setAlignment(Qt.AlignLeft)
         base_info_font = base_info_label.font()
@@ -744,9 +748,11 @@ class DeletionDialog(QDialog):
         layout.addLayout(btn_box)
 
     def _make_pixmap(self, img_path: Path) -> QPixmap:
+        """이미지 파일을 다이얼로그 카드 표시용 고정 크기(QPixmap)로 로드해 반환"""
         return load_pixmap_from_path(img_path, (200, 450))   # 픽스맵 크기
 
     def _add_entry(self, entry: dict, order: int):
+        """탐지 이력을 시간/미리보기 이미지/삭제 체크박스로 구성된 위젯으로 목록 레이아웃에 추가"""
         card = QWidget()
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(2, 2, 2, 2)
@@ -779,6 +785,7 @@ class DeletionDialog(QDialog):
         self.entry_layout.insertWidget(self.entry_layout.count() - 1, card)
 
     def _on_all_toggled(self, checked: bool):
+        """'전체 삭제' 체크 상태를 모든 개별 항목 체크박스에 일괄 반영"""
         if self._bulk_updating:
             return
 
@@ -790,6 +797,7 @@ class DeletionDialog(QDialog):
         self._bulk_updating = False
 
     def _on_entry_toggled(self, _checked: bool):
+        """개별 항목 체크 적용 시 현재 전체 선택 여부를 계산해 '전체 삭제' 체크박스를 동기화"""
         if self._bulk_updating:
             return
 
@@ -801,6 +809,7 @@ class DeletionDialog(QDialog):
         self._bulk_updating = False
 
     def _emit_confirm(self):
+        """선택된 이미지 이름 목록과 전체 삭제 여부 방출한 뒤 다이얼로그를 종료"""
         selected = [chk.property('image_name') for chk in self.chk_list if chk.isChecked()]
         self.deleteConfirmed.emit([s for s in selected if s], self.chk_all.isChecked())
         self.close()
@@ -830,6 +839,7 @@ class AlertPopup(QWidget):
     deleteRequested = Signal()
 
     def __init__(self, parent=None):
+        """탐지 발생 시 표시할 팝업 UI(정보/그래프/이미지/로그)와 타이머/시그널을 초기화"""
         super().__init__(parent)
         self.setWindowTitle('Particle Alert')
         self.resize(1000, 720)
@@ -847,7 +857,7 @@ class AlertPopup(QWidget):
         self.ignore_cb = QCheckBox()
         self.ignore_min_spin = QSpinBox()
         self.ignore_min_spin.setRange(1, 120)
-        self.ignore_min_spin.setValue(5)  # Default 5분
+        self.ignore_min_spin.setValue(5)
         self.ignore_min_spin.setFixedWidth(60)
         small_font = self.ignore_cb.font()
         small_font.setPointSize(9)
@@ -857,24 +867,21 @@ class AlertPopup(QWidget):
         ignore_label = QLabel('분간 팝업 무시')
         ignore_label.setFont(small_font)
 
-        # 확인/오탐 삭제 버튼 (우측 상단 배치)
+        # 확인/오탐 삭제 버튼
         self.btn_ok = QPushButton('확인')
         self.btn_delete = QPushButton('오탐 삭제')
-        # 오탐 삭제 버튼을 강조 (진회색 배경+흰색 텍스트)
         self.btn_delete.setSizePolicy(self.btn_ok.sizePolicy())
         self.btn_delete.setMinimumSize(self.btn_ok.sizeHint())
         self.btn_delete.setStyleSheet(
             "QPushButton { background-color: #444; color: white; }"
             "QPushButton:hover { background-color: #555; }"
         )
+
         # 탐지 이미지 저장 폴더 Link 버튼 생성
         self.btn_open_folder = QPushButton('Particle 탐지 이미지 저장 폴더 Link')
         self.btn_open_folder.setCursor(Qt.PointingHandCursor)
         self.btn_open_folder.setFlat(True)
-        self.btn_open_folder.setStyleSheet(
-            'QPushButton { color: #1a73e8; text-decoration: underline; } '
-            'QPushButton:hover { color: #0b59d4; }'
-        )
+        self.btn_open_folder.setStyleSheet('QPushButton { color: #1a73e8; text-decoration: underline; }' 'QPushButton:hover { color: #0b59d4; }')
         self.btn_open_folder.setEnabled(False)
         self.btn_open_folder.clicked.connect(self._on_open_folder)
 
@@ -891,13 +898,10 @@ class AlertPopup(QWidget):
         top_row = QHBoxLayout()
         top_row.setContentsMargins(0, 0, 0, 0)
         top_row.setSpacing(6)
-
         top_row.addWidget(self.ignore_cb)
         top_row.addWidget(self.ignore_min_spin)
         top_row.addWidget(ignore_label)
-
         top_row.addStretch()
-
         top_row.addWidget(self.btn_ok)
         top_row.addWidget(self.btn_delete)
 
@@ -974,7 +978,6 @@ class AlertPopup(QWidget):
         image_section = QGroupBox(' 탐지 이미지 ')
         image_layout = QVBoxLayout(image_section)
         image_layout.setContentsMargins(12, 12, 12, 12)
-
         image_layout.addWidget(self.img_scroll)
 
         # 로그 영역
@@ -1028,16 +1031,19 @@ class AlertPopup(QWidget):
         self._log_entries: list[tuple[QDateTime, str]] = []
 
     def start_blink(self):
-        self._blink_timer.start(500)  # 0.5초 주기
+        """탐지 상태를 강조하기 위해 발생 정보 영역의 배경 깜빡임 타이머를 시작"""
+        self._blink_timer.start(500)
         self._blink_red = False
         self._toggle_blink()
 
     def stop_blink(self):
+        """발생 정보 영역의 배경 깜빡임을 중지하고 원래 스타일로 복귀"""
         self._blink_timer.stop()
         self._blink_red = False
         self.info_group_container.setStyleSheet("")
 
     def _toggle_blink(self):
+        """깜빡임 토글에 따라 발생 정보 영역 배경색을 번갈아 적용"""
         self._blink_red = not self._blink_red
         if self._blink_red:
             self.info_group_container.setStyleSheet("#infoGroupBody {background-color: rgba(255,30,30,0.25); border-radius:8px;}")
@@ -1045,6 +1051,7 @@ class AlertPopup(QWidget):
             self.info_group_container.setStyleSheet("")
 
     def set_first_detect_time(self, qdt: QDateTime | None):
+        """최초 탐지 시각을 저장하고 경과 시간 표시용 타이머를 시작/중지"""
         self._first_dt = qdt if (qdt and qdt.isValid()) else None
         self._elapsed_timer.stop()
         if self._first_dt:
@@ -1052,6 +1059,7 @@ class AlertPopup(QWidget):
         self._update_elapsed()
 
     def _update_elapsed(self):
+        """최초 탐지 시각부터 현재까지의 경과 시간을 계산해 라벨에 갱신"""
         if not self._first_dt:
             self.elapsed_label.setText('- [경과 시간] -')
             return
@@ -1064,18 +1072,21 @@ class AlertPopup(QWidget):
         self.elapsed_label.setText(f"- [경과 시간] {hh:02d}시간 {mm:02d}분 {ss:02d}초")
 
     def set_info(self, base_info_text: str, when_text: str, count_text: str):
+        """기본정보/발생시각/누적횟수 텍스트를 팝업 상단 정보 라벨에 반영"""
         display_text = self._format_base_info(base_info_text)
         self.info_label.setText(f"- [기본 정보] {display_text}")
         self.time_label.setText(f"- [발생 시각] {when_text}")
         self.count_label.setText(f"- [누적 횟수] {count_text}")
 
     def _format_base_info(self, text: str) -> str:
+        """기본 정보 문자열(equip_lot_process_attempt)로 정규화"""
         parts = text.split('_')
         if len(parts) >= 4:
             return '_'.join(parts[:4])
         return text
 
     def set_graph_pixmap(self, pm: QPixmap):
+        """외부에서 전달받은 그래프 스냅샷 픽스맵을 저장 및 표시"""
         if pm is None or pm.isNull():
             self._graph_pixmap = QPixmap()
             self.graph_view.clear()
@@ -1084,12 +1095,14 @@ class AlertPopup(QWidget):
         self._refresh_graph_view()
 
     def append_log(self, text: str, when: QDateTime | None = None):
+        """로그 항목을 누적한 뒤 로그 화면을 다시 렌더링"""
         if when is None:
             when = QDateTime.currentDateTime()
         self._log_entries.append((when, text))
         self._render_logs()
 
     def _render_logs(self):
+        """저장된 로그 이력을 시간순으로 정렬해 텍스트 영역에 출력"""
         self.log_edit.clear()
         entries = sorted(self._log_entries, key=lambda x: x[0].toSecsSinceEpoch())
         for when, text in entries:
@@ -1099,6 +1112,7 @@ class AlertPopup(QWidget):
             self.log_edit.verticalScrollBar().setValue(self.log_edit.verticalScrollBar().maximum())
 
     def sync_detection_history(self, history_entries: list[dict]):
+        """탐지 이력 기반으로 'Particle 탐지 횟수' 로그를 생성해서 표시"""
         non_detection_logs = [(dt, txt) for dt, txt in self._log_entries if not txt.startswith('Particle 탐지 ')]
 
         detection_logs: list[tuple[QDateTime, str]] = []
@@ -1111,7 +1125,7 @@ class AlertPopup(QWidget):
         self._render_logs()
 
     def set_images(self, image_infos):
-        # 기존 라벨 제거
+        """팝업 하단에 탐지 이미지를 새로 구성해 가로 스크롤 영역에 배치"""
         for lab in self._pix_labels:
             self.img_container.removeWidget(lab)
             lab.deleteLater()
@@ -1147,16 +1161,20 @@ class AlertPopup(QWidget):
             self._pix_labels.append(wrapper)
 
     def _load_pix(self, p: Path) -> QPixmap:
+        """이미지 파일을 팝업 표시용 썸네일 크기의 QPixmap으로 로드해 반환"""
         return load_pixmap_from_path(p, (180, 240))
 
     def _format_image_timestamp(self, path: Path) -> str:
+        """이미지 파일의 추정 시각(파일명/mtime 기반)을 팝업 표시용 문자열로 포맷"""
         qdt = self._extract_image_datetime(path)
         return qdt.toString('MM/dd_HH:mm:ss')
 
     def _extract_image_datetime(self, path: Path) -> QDateTime:
+        """이미지 파일명(YYYYMMDD_HHMMSS) 또는 mtime을 이용해 QDateTime을 추출해 반환"""
         return extract_image_datetime(path)
 
     def _refresh_graph_view(self):
+        """저장된 그래프 픽스맵을 현재 그래프 뷰 크기에 맞게 스케일링하여 표시"""
         if self._graph_pixmap.isNull():
             self.graph_view.clear()
             return
@@ -1167,15 +1185,18 @@ class AlertPopup(QWidget):
         self.graph_view.setPixmap(scaled)
 
     def eventFilter(self, obj, event):
+        """그래프 뷰 리사이즈 이벤트를 감지해 그래프 픽스맵을 재스케일링"""
         if obj is self.graph_view and event.type() == QEvent.Resize:
             self._refresh_graph_view()
         return super().eventFilter(obj, event)
 
     def set_event_folder(self, path: Path | str | None):
+        """탐지 이미지 저장 폴더 경로를 설정하고 링크 버튼 활성/비활성을 갱신"""
         self._event_folder_path = Path(path) if path else None
         self.btn_open_folder.setEnabled(self._event_folder_path is not None)
 
     def _on_open_folder(self):
+        """탐지 이미지 저장 폴더를 탐색기로 활성화"""
         if not self._event_folder_path:
             return
         try:
@@ -1188,12 +1209,14 @@ class AlertPopup(QWidget):
             pass
 
     def closeEvent(self, event):
+        """팝업 닫힘 시 깜빡임/경과 타이머를 정리하고 내부 상태를 초기화"""
         self.stop_blink()
         self._elapsed_timer.stop()
         self._first_dt = None
         super().closeEvent(event)
 
     def _close_with(self, reason: str):
+        """닫힘 버튼 종류와 무시 시각을 신호로 전달하고 로그에 남긴 뒤 팝업을 종료"""
         self.stop_blink()
         self._elapsed_timer.stop()
         self._first_dt = None
@@ -1305,6 +1328,10 @@ class ParticleDetectionGUI(QWidget):
         self.crop2_enabled_cb = QCheckBox()
         self.crop2_enabled_cb.setChecked(_load_bool('crop2_enabled', True))
 
+        # 이미지 미리보기 On/Off Default 설정
+        self.disallowed_preview_cb = QCheckBox()
+        self.disallowed_preview_cb.setChecked(_load_bool('preview_disallowed_enabled', False))
+
         # 위젯 초기화
         self.start_button = QPushButton('시작')
         self.stop_button = QPushButton('종료')
@@ -1360,6 +1387,7 @@ class ParticleDetectionGUI(QWidget):
         right_panel = QVBoxLayout()
         right_panel.addSpacing(4)  # 이미지 미리보기 상단부 여백
         popup_btn_layout = QHBoxLayout()
+        popup_btn_layout.addWidget(self.disallowed_preview_cb)
         popup_btn_layout.addStretch()
         popup_btn_layout.addWidget(self.popup_button)
 
@@ -1377,6 +1405,7 @@ class ParticleDetectionGUI(QWidget):
         self.stop_button.clicked.connect(self.stop_realtime)
         self.save_opt_button.clicked.connect(self.save_options)
         self.popup_button.clicked.connect(self._open_popup_manually)
+        self.disallowed_preview_cb.toggled.connect(self.update_preview)
 
         # Crop 영역 체크박스 (활성/비활성)
         self.crop1_enabled_cb.toggled.connect(self._on_crop1_toggled)
@@ -1390,6 +1419,11 @@ class ParticleDetectionGUI(QWidget):
         self.tail_timer = QTimer(self)
         self.tail_timer.setInterval(500)
         self.tail_timer.timeout.connect(self.process_new_images_tick)
+
+        # watchdog health-check 타이머 (감시 스레드 죽음 감지/복구)
+        self.watcher_health_timer = QTimer(self)
+        self.watcher_health_timer.setInterval(60000)  # 60초
+        self.watcher_health_timer.timeout.connect(self._watcher_health_check)
 
         # 백로그 스레드 구성 요소
         self._backlog_thread: QThread | None = None
@@ -1409,7 +1443,7 @@ class ParticleDetectionGUI(QWidget):
             self.plot_canvas.update_plot([], [], latest_index=None)
 
     def showEvent(self, event):
-        """"메인 창 최초 표시 시 INI 저장 좌표 복원 또는 좌하단 오프셋 기본 위치 적용"""
+        """메인 창 최초 표시 시 INI 저장 좌표 복원 또는 좌하단 오프셋 기본 위치 적용"""
         super().showEvent(event)
         if not self._window_position_restored:
             self._window_position_restored = True
@@ -1544,13 +1578,13 @@ class ParticleDetectionGUI(QWidget):
 
     @Slot(bool)
     def _on_crop1_toggled(self, checked: bool):
-        "체크박스1 토글 핸들러"
+        """체크박스1 토글 핸들러"""
         self._apply_crop_enable_states()
         self.update_preview()
 
     @Slot(bool)
     def _on_crop2_toggled(self, checked: bool):
-        "체크박스2 토글 핸들러"
+        """체크박스2 토글 핸들러"""
         self._apply_crop_enable_states()
         self.update_preview()
 
@@ -1576,7 +1610,7 @@ class ParticleDetectionGUI(QWidget):
             return
         # 노이즈 개수 표기
         if self.prev_particles:
-            text = f"[Noise] {len(self.prev_particles)}개"
+            text = f"[Noise] {len(self.prev_particles)} EA"
         else:
             text = "[Noise] None"
         self.preview_label.set_noise_text(text)
@@ -1591,6 +1625,16 @@ class ParticleDetectionGUI(QWidget):
                 return
 
             latest = max(cands, key=lambda p: p.stat().st_mtime)
+
+            parts = latest.stem.split('_')
+            process_name = parts[2] if len(parts) > 2 else None
+            process_ok = (process_name in self.ALLOWED_PULLER_MODES) if process_name else True
+
+            if (not process_ok) and (not self.disallowed_preview_cb.isChecked()):
+                self.preview_label.show_placeholder(DISALLOWED_PLACEHOLDER_TEXT)
+                self.preview_label.set_anchor_value(None)
+                return
+
             img = safe_image_load(str(latest), as_gray=True)
             if img is None:
                 self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
@@ -1599,11 +1643,7 @@ class ParticleDetectionGUI(QWidget):
             boxes = [self.get_box1(), self.get_box2()]
             self.preview_label.show_image(img, boxes, filename=latest.name)
 
-            # 파일명 형식: EQUIP_Lot#_Process_Attempt_YYYYMMDD_HHMM(SS)
-            fields = latest.stem.split('_')  # [0]=장비, [1]=Lot, [2]=Process, [3]=Attempt, [4]=YYYYMMDD, [5]=HHMM(SS)
-
-            # 허용 모드일 때만 앵커 밝기 표시
-            process_ok = (fields[2] in self.ALLOWED_PULLER_MODES)
+            # 허용 모드일 때만 앵커 밝기 표시 (비허용+미리보기 ON이면 앵커 숨김)
             self.preview_label.set_anchor_value(compute_anchor_brightness(img) if process_ok else None)
 
         except Exception:
@@ -1639,7 +1679,6 @@ class ParticleDetectionGUI(QWidget):
         self._backlog_thread.started.connect(self._backlog_feeder.run)
         self._backlog_feeder.next_image.connect(self.process_single_image)
         self._backlog_feeder.finished.connect(self._on_backlog_finished)
-        # 안전 종료 연결
         self._backlog_feeder.finished.connect(self._backlog_thread.quit)
         self._backlog_thread.finished.connect(self._backlog_thread.deleteLater)
         self._backlog_thread.finished.connect(lambda: setattr(self, "_backlog_thread", None))
@@ -1659,8 +1698,12 @@ class ParticleDetectionGUI(QWidget):
         state = {
             'tail_timer': self.tail_timer.isActive(),
             'watcher': self.directory_watcher.is_running(),
+            'health_timer': self.watcher_health_timer.isActive(),
             'backlog': bool(self._backlog_thread and self._backlog_thread.isRunning()),
         }
+
+        if state['health_timer']:
+            self.watcher_health_timer.stop()
 
         if state['tail_timer']:
             self.tail_timer.stop()
@@ -1676,22 +1719,22 @@ class ParticleDetectionGUI(QWidget):
                 pass
         return state
 
-
     def _resume_ingestion_after_deletion(self, state: dict):
         """오탐 삭제 작업 종료 후, 중단 전 상태에 맞춰 백로그/실시간 감시를 재개"""
         if state.get('watcher'):
             self.directory_watcher.start()
         if state.get('tail_timer'):
             self.tail_timer.start()
+        if state.get('health_timer'):
+            self.watcher_health_timer.start()
+
         if state.get('backlog'):
             self._restart_backlog_scan()
         else:
             self._drain_pending_queue()
 
-
     def start_realtime(self):
         """실시간 파티클 판정 시작 (백로그 → 라이브 테일 순)"""
-        # 워밍업 초기화
         self.collecting_initial = True
         self.prev_particles = []
         self.frame_buffer = []
@@ -1706,32 +1749,34 @@ class ParticleDetectionGUI(QWidget):
         self.pending_images.clear()
         self._is_processing_queue = False
         self.directory_watcher.start()
+        self.watcher_health_timer.start()
         self.tail_timer.start()
         self.last_image_seen_at = time.monotonic()
         self.last_allowed_image_seen_at = 0.0
         self.lot_loaded_at = time.monotonic()
         self.last_snapshot_source_time = 0.0
-
-        # 비허용 모드 진입 타이머 초기화
         self.disallowed_mode_latched = False
         self.disallowed_entered_at = 0.0
 
-        # 백로그 목록 구성 (processed_images 기준 미처리 파일 전체)
         backlog = find_new_images(IMG_INPUT_DIR, self.session_processed_images)
         self._start_backlog_feeder(backlog)
-        # 초기 Noise 텍스트
         self._update_noise_text()
 
     def stop_realtime(self):
         """실시간 파티클 판정 중지"""
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+
         if self.tail_timer.isActive():
             self.tail_timer.stop()
+
+        if hasattr(self, "watcher_health_timer") and self.watcher_health_timer.isActive():
+            self.watcher_health_timer.stop()
+
         self.directory_watcher.stop()
         self.pending_images.clear()
         self._is_processing_queue = False
-        # 백로그 중지
+
         try:
             if self._backlog_feeder:
                 self._backlog_feeder.stop()
@@ -1740,6 +1785,7 @@ class ParticleDetectionGUI(QWidget):
                 self._backlog_thread.wait(2000)
         except Exception:
             pass
+
         self.status_label.setText("- 중지 -")
 
     def save_options(self):
@@ -1756,12 +1802,12 @@ class ParticleDetectionGUI(QWidget):
         self.settings.setValue('crop2_w', self.crop2_w.value())
         self.settings.setValue('crop2_h', self.crop2_h.value())
         self.settings.setValue('crop2_enabled', bool(self.crop2_enabled_cb.isChecked()))
+        self.settings.setValue('preview_disallowed_enabled', bool(self.disallowed_preview_cb.isChecked()))
 
         # 메인 창 위치 저장
         top_left = self.frameGeometry().topLeft()
         self.settings.setValue('main_window_pos_x', int(top_left.x()))
         self.settings.setValue('main_window_pos_y', int(top_left.y()))
-
         self.settings.sync()
         self.status_label.setText("설정 저장됨.")
     
@@ -1774,6 +1820,32 @@ class ParticleDetectionGUI(QWidget):
             pass
         finally:
             super().closeEvent(event)
+
+    def _watcher_health_check(self):
+        """watchdog observer 오류 상태를 자동 복구"""
+        try:
+            if not self.stop_button.isEnabled():
+                return
+            if self.directory_watcher.is_running():
+                return
+
+            self._set_status("폴더 감시 비정상 감지 → 감시 재시작", hold_s=3.0)
+
+            try:
+                self.directory_watcher.stop()
+            except Exception:
+                pass
+            self.directory_watcher.start()
+
+            backlog = find_new_images(IMG_INPUT_DIR, self.session_processed_images)
+            if backlog:
+                for p in backlog:
+                    self.pending_images.append(p)
+
+                self._drain_pending_queue()
+
+        except Exception:
+            pass
 
     def process_new_images_tick(self):
         """watchdog 큐 처리 및 신규 이미지 부재 상태 갱신 + 스냅샷 트리거"""
@@ -1853,7 +1925,6 @@ class ParticleDetectionGUI(QWidget):
         self.update_preview()
         self._drain_pending_queue()
 
-
     @Slot(object)
     def process_single_image(self, img_path):
         """단일 이미지 처리 루틴 (메인 스레드에서 실행 → 모든 UI 요소 매 이미지 갱신)"""
@@ -1863,20 +1934,20 @@ class ParticleDetectionGUI(QWidget):
 
             # 파일명 형식 기반 파싱: EQUIP_Lot#_Process_Attempt_YYYYMMDD_HHMM(SS).ext
             info = parse_filename(img_name)
-            lot_number    = info['lot']
-            process_name  = info['process']
+            lot_number = info['lot']
+            process_name = info['process']
             attempt_value = info['attempt']
+
+            gray_prev = None
 
             # Lot 변경 시 CSV 생성 + 그래프 초기화 + 워밍업 리셋 + 팝업 초기화
             if self.current_lot != lot_number:
-                # 새 Lot로 전환 및 현재 공정 상태 동기화
+
                 self.current_lot = lot_number
                 self.current_process = process_name
                 self.last_allowed_image_seen_at = 0.0
                 self.lot_loaded_at = time.monotonic()
                 self.last_snapshot_source_time = 0.0
-
-                # Lot 바뀌면 비허용 모드 상태도 초기화
                 self.disallowed_mode_latched = False
                 self.disallowed_entered_at = 0.0
 
@@ -1903,7 +1974,7 @@ class ParticleDetectionGUI(QWidget):
                 except Exception as e:
                     self._set_status(f"CSV 초기화 오류: {e}", hold_s=3.0)
 
-                # 기존 CSV가 있으면 중복 방지 세트 재로딩
+                # 기존 CSV가 있으면 처리된 이미지 세트 복구
                 if self.csv_path and self.csv_path.exists():
                     try:
                         with open(self.csv_path, 'r', encoding='utf-8-sig', newline='') as f:
@@ -1925,6 +1996,7 @@ class ParticleDetectionGUI(QWidget):
                 self._load_detection_history()
 
             else:
+                # Attempt 변경 감지 시 워밍업 재시작
                 if self.current_attempt is None:
                     self.current_attempt = attempt_value
                 elif self.current_attempt != attempt_value:
@@ -1934,67 +2006,71 @@ class ParticleDetectionGUI(QWidget):
                 # 동일 Lot 내에서 Process만 변경된 경우에도 공정 텍스트 갱신
                 if self.current_process != process_name:
                     self.current_process = process_name
-                    # 장비_Lot_공정_Attempt 형식으로 반영
                     self.device_info_box.setText(f"{info['equip']}_{info['lot']}_{info['process']}_{info['attempt']}")
 
-            # Lot 전환 이후 CSV 기반 중복 세트 로딩이 완료된 상태에서 중복 여부 재확인
-            if img_name in self.processed_images:
-                self.status_label.setText(f"이미 처리됨: {img_path.name}")
-                return
+                # Lot 전환 이후 CSV 기반 중복 세트 로딩이 완료된 상태에서 중복 여부 재확인
+                if img_name in self.processed_images:
+                    self.status_label.setText(f"이미 처리됨: {img_name}")
+                    return
 
-            gray_prev = safe_image_load(str(img_path), as_gray=True)
-            if gray_prev is None:
-                self.status_label.setText(f"오류: {img_path.name} 이미지 로딩 실패")
-                self._mark_image_processed(img_path.name)
-                return
-
+            # 마지막 이미지 관측 시각 갱신
             self.last_image_seen_at = time.monotonic()
 
-            # 허용 모드 체크
-            if process_name not in self.ALLOWED_PULLER_MODES:
-                # 비허용 모드 → "진입" 순간만 기록 (진입 후 9초 지나면 1회 저장)
+            # 비허용 + 미리보기 옵션 OFF면 "로딩 없이" 바로 종료
+            if (process_name not in self.ALLOWED_PULLER_MODES) and (not self.disallowed_preview_cb.isChecked()):
                 if not self.disallowed_mode_latched:
                     self.disallowed_mode_latched = True
-                    self.disallowed_entered_at = self.last_image_seen_at  # (폴더 유입/처리 시각 둘 중 뭐든 OK)
+                    self.disallowed_entered_at = self.last_image_seen_at
 
                 self.show_noise_text = False
                 self._update_noise_text()
                 self._set_status("지정된 Puller Mode Status가 아님.")
 
-                # 미리보기는 최신 이미지로 갱신하되 앵커값은 숨김
-                if gray_prev is not None:
-                    self.preview_label.show_image(gray_prev, [self.get_box1(), self.get_box2()], filename=img_path.name)
-                else:
-                    self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
+                self.preview_label.show_placeholder(DISALLOWED_PLACEHOLDER_TEXT)
                 self.preview_label.set_anchor_value(None)
 
-                self._mark_image_processed(img_path.name)
+                self._mark_image_processed(img_name)
                 return
-            else:
-                # 허용 모드 → 래치 해제 + 비허용 진입 타이머 리셋
-                if self.disallowed_mode_latched:
-                    self.disallowed_mode_latched = False
-                    self.disallowed_entered_at = 0.0
 
-                self.last_allowed_image_seen_at = self.last_image_seen_at
+            # 허용 공정 또는 비허용이지만 미리보기 ON인 경우에만 여기서 로딩
+            gray_prev = safe_image_load(str(img_path), as_gray=True)
+            if gray_prev is None:
+                self._set_status(f"오류: {img_name} 이미지 로딩 실패", hold_s=3.0)
+                self._mark_image_processed(img_name)
+                return
+
+            # 허용이지만 미리보기 ON인 경우: 미리보기만 갱신하고 종료
+            if process_name not in self.ALLOWED_PULLER_MODES:
+                if not self.disallowed_mode_latched:
+                    self.disallowed_mode_latched = True
+                    self.disallowed_entered_at = self.last_image_seen_at
+
+                self.show_noise_text = False
+                self._update_noise_text()
+                self._set_status("지정된 Puller Mode Status가 아님.")
+
+                self.preview_label.show_image(gray_prev, [self.get_box1(), self.get_box2()], filename=img_name)
+                self.preview_label.set_anchor_value(None)
+
+                self._mark_image_processed(img_name)
+                return
+
+            # 허용 공정이면 래치 해제 + 허용 시각 기록
+            if self.disallowed_mode_latched:
+                self.disallowed_mode_latched = False
+                self.disallowed_entered_at = 0.0
+            self.last_allowed_image_seen_at = self.last_image_seen_at
 
             # 현재 처리 대상 파일 기준으로 이미지 미리보기 표기 + 앵커값
-            anchor_current = None
-            if gray_prev is not None:
-                anchor_current = compute_anchor_brightness(gray_prev)
-                self.preview_label.show_image(gray_prev, [self.get_box1(), self.get_box2()], filename=img_path.name)
-                self.preview_label.set_anchor_value(anchor_current)
-            else:
-                self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
-                self.preview_label.set_anchor_value(None)
+            anchor_current = compute_anchor_brightness(gray_prev)
+            self.preview_label.show_image(gray_prev, [self.get_box1(), self.get_box2()], filename=img_name)
+            self.preview_label.set_anchor_value(anchor_current)
 
-            # 현재 Noise 정보 텍스트 갱신 및 임계값 계산
             adaptive_value = compute_adaptive_threshold(anchor_current)
             self._update_noise_text()
 
             # 워밍업 구간 (해당 구간에는 '판정/CSV/그래프' 수행하지 않음)
             if self.collecting_initial and not self.frame_buffer:
-                # 워밍업 시작 시 "공정 정보(텍스트)"를 "현재 처리 이미지" 기준으로 1회 갱신
                 self.device_info_box.setText(f"{info['equip']}_{info['lot']}_{info['process']}_{info['attempt']}")
 
             if self.collecting_initial:
@@ -2003,17 +2079,22 @@ class ParticleDetectionGUI(QWidget):
                 self._update_noise_text()
 
                 # 후보 파티클만 수집(판정/CSV/그래프/이벤트 저장 없음)
-                _, _, particle_info = particle_detection(gray_prev, [self.get_box1(), self.get_box2()], adaptive_value, area_min=WARMUP_NOISE_AREA_MIN, area_max=PARTICLE_AREA_MAX)
+                _, _, particle_info = particle_detection(
+                    gray_prev,
+                    [self.get_box1(), self.get_box2()],
+                    adaptive_value,
+                    area_min=WARMUP_NOISE_AREA_MIN,
+                    area_max=PARTICLE_AREA_MAX
+                )
                 if particle_info is None:
-                    # 로딩/후보 추출 실패 시 스킵
-                    self.status_label.setText(f"오류: {img_path.name} 로딩/후보 추출 실패 (워밍업)")
-                    self._mark_image_processed(img_path.name)
+                    self.status_label.setText(f"오류: {img_name} 로딩/후보 추출 실패 (워밍업)")
+                    self._mark_image_processed(img_name)
                     return
 
                 self.frame_buffer.append(particle_info)
 
                 if len(self.frame_buffer) >= WARMUP_FRAMES:
-                    # 서로 20px 반경 이내에서 2회 이상 반복되는 좌표를 노이즈 기준으로 채택
+                    # 지정된 반경 이내에서 2회 이상 반복되는 좌표를 노이즈 기준으로 채택
                     noise_clusters = []
                     for frame_particles in self.frame_buffer:
                         for (x, y, area) in frame_particles:
@@ -2023,7 +2104,6 @@ class ParticleDetectionGUI(QWidget):
                                 dist = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
                                 if dist < self.distance_threshold:
                                     new_cnt = cnt + 1
-                                    # 반복 탐지 시, 좌표/면적은 간단한 가중 평균으로 업데이트하여 대표값으로 사용
                                     cluster[0] = (cx * cnt + x) / new_cnt
                                     cluster[1] = (cy * cnt + y) / new_cnt
                                     cluster[2] = (carea * cnt + area) / new_cnt
@@ -2033,7 +2113,6 @@ class ParticleDetectionGUI(QWidget):
                             if not matched:
                                 noise_clusters.append([float(x), float(y), float(area), 1])
 
-                    # MIN_NOISE_REPEAT 회 이상 등장한 클러스터만 최종 노이즈 좌표로 채택
                     self.prev_particles = [(int(round(cx)), int(round(cy)), float(carea)) for (cx, cy, carea, cnt) in noise_clusters if cnt >= MIN_NOISE_REPEAT]
 
                     # 워밍업 종료 이후부터 '허용 모드의 판정 이미지'에서 [Noise] 표기/적용
@@ -2043,32 +2122,29 @@ class ParticleDetectionGUI(QWidget):
                     self.status_label.setText("▶ 워밍업 완료 → 실시간 판정 시작")
                     self._update_noise_text()
 
-                self._mark_image_processed(img_path.name)
+                self._mark_image_processed(img_name)
                 return
 
             # 실시간 판정 구간 (워밍업 이후 이미지부터)
-            self.status_label.setText(f"처리 중: {img_path.name}")
-
+            self.status_label.setText(f"처리 중: {img_name}")
             self.show_noise_text = True
             self._update_noise_text()
 
             # 실제 판정 처리 (OpenCV 파이프라인)
             gray, overlay_img, particle_info = particle_detection(gray_prev, [self.get_box1(), self.get_box2()], adaptive_value)
             if overlay_img is None or particle_info is None:
-                self.status_label.setText(f"오류: {img_path.name} 처리 실패")
-                self._mark_image_processed(img_path.name)
+                self.status_label.setText(f"오류: {img_name} 처리 실패")
+                self._mark_image_processed(img_name)
                 return
 
-            # 이미지의 앵커 밝기 계산 (CSV 기록용)
             anchor_brightness = anchor_current
 
-            # 유효 파티클 판별 (prev_particles와 매칭되지 않은 것만)
+            # 유효 파티클 판별
             valid_particles = []
             for (cx, cy, area) in particle_info:
                 matched = False
                 for (px, py, _) in self.prev_particles:
                     dist = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
-                    # 위치 기준(거리)으로 노이즈 여부를 판정
                     if dist < self.distance_threshold:
                         matched = True
                         break
@@ -2077,23 +2153,17 @@ class ParticleDetectionGUI(QWidget):
 
             has_particle = 'O' if valid_particles else 'X'
 
-            # 오버레이: prev(흰) + valid(빨강) + [Noise] 텍스트
+            # '흰 원(노이즈 파티클), 빨간 원(유효 파티클) + [Noise] 텍스트' 오버레이
             if overlay_img is not None:
-                # prev (white)
                 for (px, py, _) in self.prev_particles:
                     cv2.circle(overlay_img, (px, py), NOISE_CIRCLE_RADIUS, (255, 255, 255), NOISE_CIRCLE_THICKNESS, cv2.LINE_AA)
-                # valid (red)
                 for (vx, vy, _) in valid_particles:
                     cv2.circle(overlay_img, (vx, vy), VALID_CIRCLE_RADIUS, (0, 0, 255), VALID_CIRCLE_THICKNESS, cv2.LINE_AA)
-                # [Noise] 텍스트
+
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 font_scale = 0.5
                 thickness_text = 1
-                # 노이즈 개수 출력
-                if not self.prev_particles:
-                    noise_text = "[Noise] None"
-                else:
-                    noise_text = f"[Noise] {len(self.prev_particles)}개"
+                noise_text = "[Noise] None" if not self.prev_particles else f"[Noise] {len(self.prev_particles)} EA"
                 img_h, img_w = overlay_img.shape[:2]
                 (text_w, _), _ = cv2.getTextSize(noise_text, font, font_scale, thickness_text)
                 text_x = img_w - text_w - 10
@@ -2103,17 +2173,17 @@ class ParticleDetectionGUI(QWidget):
             # CSV 저장
             if has_particle == 'O':
                 for (x, y, a) in valid_particles:
-                    row = [img_path.name, attempt_value, anchor_brightness, adaptive_value, has_particle, a, x, y, 0]
+                    row = [img_name, attempt_value, anchor_brightness, adaptive_value, has_particle, a, x, y, 0]
                     self.save_csv(row)
             else:
-                row = [img_path.name, attempt_value, anchor_brightness, adaptive_value, has_particle, 0, 0, 0, 0]
+                row = [img_name, attempt_value, anchor_brightness, adaptive_value, has_particle, 0, 0, 0, 0]
                 self.save_csv(row)
 
             # 이벤트 이미지 저장 (Lot# 폴더 내) + 팝업 호출/갱신
             if has_particle == 'O' and overlay_img is not None:
                 lot_dir = EVENT_OUTPUT_DIR / lot_number
                 os.makedirs(lot_dir, exist_ok=True)
-                event_path = lot_dir / img_path.name
+                event_path = lot_dir / img_name
                 cv2.imwrite(str(event_path), overlay_img)
 
                 event_dt = self._parse_info_datetime(info)
@@ -2123,15 +2193,13 @@ class ParticleDetectionGUI(QWidget):
                 if time.monotonic() >= self.popup_snooze_until:
                     self._maybe_open_or_update_popup(info, event_path, event_dt)
 
-            # 그래프 갱신
             self.update_graph()
-
-            # 처리 완료 → 3초간 상태 홀드로 깜빡임 억제
-            self._set_status(f"처리됨: {img_path.name}  - 파티클:{has_particle}", hold_s=3.0)
-            self._mark_image_processed(img_path.name)
+            self._set_status(f"처리됨: {img_name}  - 파티클:{has_particle}", hold_s=3.0)
+            self._mark_image_processed(img_name)
 
         except Exception as e:
             self.status_label.setText(f"오류: {e}")
+            self._mark_image_processed(img_name)
 
     def _record_graph_row(self, row):
         """그래프 버퍼에 행 추가"""
@@ -2233,7 +2301,7 @@ class ParticleDetectionGUI(QWidget):
             except Exception:
                 attempt += 1
                 time.sleep(delay)
-        print("❌ CSV 저장 최종 실패 - 데이터가 저장되지 않았습니다.")
+        print("CSV 저장 최종 실패 - 데이터가 저장되지 않았습니다.")
         return False
 
     def update_graph(self):
@@ -2415,7 +2483,8 @@ class ParticleDetectionGUI(QWidget):
         hh = int(info['time'][0:2])
         mi = int(info['time'][2:4])
         ss = int(info['time'][4:6]) if len(info['time']) >= 6 else 0
-        qdt = QDateTime(yyyy, mm, dd, hh, mi, ss)
+
+        qdt = QDateTime(QDate(yyyy, mm, dd), QTime(hh, mi, ss))
         if not qdt.isValid():
             qdt = QDateTime.currentDateTime()
         return qdt
