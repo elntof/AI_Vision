@@ -71,14 +71,15 @@ os.makedirs(EVENT_OUTPUT_DIR, exist_ok=True)
 os.makedirs(GRAPH_OUTPUT_DIR, exist_ok=True)
 
 # 파티클 탐지 파라미터
-WARMUP_FRAMES = 15             # 워밍업 프레임 수
-MIN_NOISE_REPEAT = 2           # 워밍업 구간 내 몇 회 이상 등장 좌표를 노이즈로 설정
-MANUAL_THRESHOLD   = 7         # 이진화 임계값
-KERNEL_SIZE_TOPHAT = (3, 3)    # tophat 모폴로지 연산 커널 크기
-KERNEL_SIZE_MORPH  = (3, 3)    # 모폴로지 클로즈 연산 커널 크기
-PARTICLE_AREA_MIN  = 8         # 파티클 최소 면적
-PARTICLE_AREA_MAX  = 50        # 파티클 최대 면적
-WARMUP_NOISE_AREA_MIN = 2      # 워밍업 노이즈 판별 전용 최소 면적
+WARMUP_FRAMES = 15                   # 워밍업 프레임 수
+MIN_NOISE_REPEAT = 2                 # 워밍업 구간 내 몇 회 이상 등장 좌표를 노이즈로 설정
+MANUAL_THRESHOLD   = 7               # 이진화 임계값
+KERNEL_SIZE_TOPHAT = (3, 3)          # tophat 모폴로지 연산 커널 크기
+KERNEL_SIZE_MORPH  = (3, 3)          # 모폴로지 클로즈 연산 커널 크기
+PARTICLE_AREA_MIN  = 8               # 파티클 최소 면적
+PARTICLE_AREA_MAX  = 50              # 파티클 최대 면적
+WARMUP_NOISE_AREA_MIN = 2            # 워밍업 노이즈 판별 전용 최소 면적
+RESUME_WARMUP_ON_STOP_START = True   # True: 이어서 워밍업 / False: 처음부터 재워밍업
 
 # 파티클 표기 원 파라미터 (유효/노이즈)
 VALID_CIRCLE_RADIUS    = 25    # 유효(빨강) 원 반지름
@@ -1267,6 +1268,7 @@ class ParticleDetectionGUI(QWidget):
         self.frame_buffer = []           # 워밍 업 시, 파티클 리스트 버퍼
         self.distance_threshold = 20     # 거리 임계값 (반경 내 같은 Noise로 인식)
         self.collecting_initial = True   # 최초 10장 워밍업 플래그
+        self._preserve_noise_on_warmup = False  # 워밍업 시 노이즈 좌표 유지 여부
 
         # 허용 모드 집합 & 래치/홀드 상태
         self.ALLOWED_PULLER_MODES = {"NECK"}     # 허용 모드
@@ -1514,12 +1516,23 @@ class ParticleDetectionGUI(QWidget):
         else:
             self.status_hold_until = 0.0
 
-    def _reset_noise_warmup(self, status_text: str):
+    def _merge_noise_particles(self, base_particles, new_particles):
+        """기존 노이즈 좌표에 신규 노이즈 좌표를 중복 없이 병합"""
+        merged = list(base_particles)
+        for (nx, ny, narea) in new_particles:
+            if any((((nx - px) ** 2 + (ny - py) ** 2) ** 0.5) < self.distance_threshold for (px, py, _) in merged):
+                continue
+            merged.append((nx, ny, narea))
+        return merged
+
+    def _reset_noise_warmup(self, status_text: str, clear_noise: bool = True):
         """노이즈 정의 및 워밍업 상태 초기화"""
         self.collecting_initial = True
-        self.prev_particles.clear()
+        if clear_noise:
+            self.prev_particles.clear()
         self.frame_buffer.clear()
         self.show_noise_text = False
+        self._preserve_noise_on_warmup = not clear_noise
         self._set_status(status_text)
         self._update_noise_text()
 
@@ -1735,14 +1748,29 @@ class ParticleDetectionGUI(QWidget):
 
     def start_realtime(self):
         """실시간 파티클 판정 시작 (백로그 → 라이브 테일 순)"""
-        self.collecting_initial = True
-        self.prev_particles = []
-        self.frame_buffer = []
 
-        self.show_noise_text = False
-        self._update_noise_text()
+        # (A) 워밍업 도중에 Stop→Start: 옵션에 따라 '이어가기' 또는 '처음부터'
+        if self.collecting_initial and len(self.frame_buffer) > 0:
+            if RESUME_WARMUP_ON_STOP_START:
+                self.show_noise_text = False
+                self._preserve_noise_on_warmup = True
+                self._set_status(f"워밍업 재개... ({len(self.frame_buffer)} / {WARMUP_FRAMES})")
+                self._update_noise_text()
+            else:
+                self._reset_noise_warmup(f"워밍업 재시작... (최초 {WARMUP_FRAMES}장 데이터 수집)", clear_noise=False)
 
-        self.status_label.setText(f"초기 워밍업 중... (최초 {WARMUP_FRAMES}장 데이터 수집)")
+        # (B) 워밍업이 이미 끝난 후 Stop→Start: 워밍업 생략
+        elif (not self.collecting_initial):
+            self.frame_buffer.clear()
+            self.show_noise_text = True
+            self._preserve_noise_on_warmup = True
+            self._set_status("기존 Noise 유지 → 워밍업 생략, 실시간 판정 재개")
+            self._update_noise_text()
+
+        # (C) 워밍업 정보가 아예 없으면: 정상 워밍업
+        else:
+            self._reset_noise_warmup(f"초기 워밍업 중... (최초 {WARMUP_FRAMES}장 데이터 수집)", clear_noise=False)
+
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
 
@@ -1987,7 +2015,7 @@ class ParticleDetectionGUI(QWidget):
                         pass
 
                 # 워밍업/Noise/상태 리셋
-                self._reset_noise_warmup(f"LOT 변경 감지 → 워밍업 재시작 ({WARMUP_FRAMES}장)")
+                self._reset_noise_warmup(f"LOT 변경 감지 → 워밍업 재시작 ({WARMUP_FRAMES}장)", clear_noise=True)
 
                 # 빈 CSV 기반 그래프 즉시 초기화
                 self.graph_records.clear()
@@ -2001,7 +2029,7 @@ class ParticleDetectionGUI(QWidget):
                     self.current_attempt = attempt_value
                 elif self.current_attempt != attempt_value:
                     self.current_attempt = attempt_value
-                    self._reset_noise_warmup(f"Attempt 변경 감지 → 워밍업 재시작 ({WARMUP_FRAMES}장)")
+                    self._reset_noise_warmup(f"Attempt 변경 감지 → 워밍업 재시작 ({WARMUP_FRAMES}장)", clear_noise=False)
 
                 # 동일 Lot 내에서 Process만 변경된 경우에도 공정 텍스트 갱신
                 if self.current_process != process_name:
@@ -2113,13 +2141,17 @@ class ParticleDetectionGUI(QWidget):
                             if not matched:
                                 noise_clusters.append([float(x), float(y), float(area), 1])
 
-                    self.prev_particles = [(int(round(cx)), int(round(cy)), float(carea)) for (cx, cy, carea, cnt) in noise_clusters if cnt >= MIN_NOISE_REPEAT]
+                    new_particles = [(int(round(cx)), int(round(cy)), float(carea)) for (cx, cy, carea, cnt) in noise_clusters if cnt >= MIN_NOISE_REPEAT]
+                    if self._preserve_noise_on_warmup and self.prev_particles:
+                        self.prev_particles = self._merge_noise_particles(self.prev_particles, new_particles)
+                    else:
+                        self.prev_particles = new_particles
 
                     # 워밍업 종료 이후부터 '허용 모드의 판정 이미지'에서 [Noise] 표기/적용
                     self.collecting_initial = False
                     self.frame_buffer.clear()
                     self.show_noise_text = True
-                    self.status_label.setText("▶ 워밍업 완료 → 실시간 판정 시작")
+                    self.status_label.setText("워밍업 완료 → 실시간 판정 시작")
                     self._update_noise_text()
 
                 self._mark_image_processed(img_name)
