@@ -21,12 +21,12 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 # 환경 플래그: 경로 및 저장동작 테스트(True) / 운영(False) 모드 구분
-LOAD_TEST_MODE = True
-SAVE_TEST_MODE = True
-INI_TEST_MODE = True
+LOAD_TEST_MODE = False
+SAVE_TEST_MODE = False
+INI_TEST_MODE = False
 
 # 실행파일 실행 시, "자동 시작 동작 수행" 여부 플래그 : 자동 시작(True) / 수동 시작(False)
-AUTO_START_ON_LAUNCH = False
+AUTO_START_ON_LAUNCH = True
 
 # 이미지/CSV/INI 경로 설정
 if LOAD_TEST_MODE:
@@ -708,14 +708,14 @@ class IcingClassificationGUI(QWidget):
         self.pending_images: deque[Path] = deque()
         self._is_processing_queue = False
 
-        # 허용 모드/리드타임/피딩 타임 관리
+        # 허용 모드/Leadtime/PulloutEndTime 관리
         self.ALLOWED_PULLER_MODES = set(ALLOWED_PULLER_MODES)
         self.no_new_image_grace_s = 9.0
         self.last_allowed_image_info: dict[str, object] = {"equip": None, "lot": None, "attempt": None, "name": None, "dt": None}
     
-        # FeedingTime 기록 트리거 1회용 플래그
-        self._feeding_trigger_a_fired: bool = False
-        self._feeding_trigger_b_fired: bool = False
+        # PulloutEndTime 기록 트리거 1회용 플래그
+        self._pullout_end_trigger_a_fired: bool = False
+        self._pullout_end_trigger_b_fired: bool = False
 
         # 비허용 공정 진입 감지용 래치/타이머
         self.disallowed_mode_latched: bool = False
@@ -997,8 +997,8 @@ class IcingClassificationGUI(QWidget):
         self._streak_count = 0
         self._streak_start_dt = None
 
-    def _reset_feeding_state(self, keep_last_allowed: bool = False, keep_badge: bool = False):
-        """피딩 타임 기록 상태 초기화"""
+    def _reset_pullout_end_state(self, keep_last_allowed: bool = False, keep_badge: bool = False):
+        """PulloutEndTime 기록 상태 초기화"""
         if not keep_last_allowed:
             self.last_allowed_image_info = {"equip": None, "lot": None, "attempt": None, "name": None, "dt": None}
 
@@ -1009,8 +1009,8 @@ class IcingClassificationGUI(QWidget):
 
         self.disallowed_mode_latched = False
         self.disallowed_entered_at = 0.0
-        self._feeding_trigger_a_fired = False
-        self._feeding_trigger_b_fired = False
+        self._pullout_end_trigger_a_fired = False
+        self._pullout_end_trigger_b_fired = False
 
     def _should_keep_last_allowed(self) -> bool:
         """마지막 허용 이미지 정보를 유지할지 여부"""
@@ -1030,12 +1030,12 @@ class IcingClassificationGUI(QWidget):
         self._reset_panel()
         self.processed_images.clear()
         self._reset_label_streak()
-        self._reset_feeding_state(keep_last_allowed=self._should_keep_last_allowed())
+        self._reset_pullout_end_state(keep_last_allowed=self._should_keep_last_allowed())
 
         if clear_recent_candidate:
             self._recent_cycle_candidate = None
 
-    def _set_recent_cycle_candidate(self, completed: bool, last_dt: QDateTime | None, feeding_dt: QDateTime | None):
+    def _set_recent_cycle_candidate(self, completed: bool, last_dt: QDateTime | None, pullout_end_dt: QDateTime | None):
         """최근 cycle 후보 딕셔너리 생성/갱신"""
         if (self.current_cycle_start_lot is None
             or self.current_cycle_start_attempt is None
@@ -1046,7 +1046,7 @@ class IcingClassificationGUI(QWidget):
             "cycle_csv_path": self.cycle_csv_path,
             "cycle_key": (self.current_cycle_start_lot, int(self.current_cycle_start_attempt)),
             "last_dt": last_dt,
-            "feeding_dt": feeding_dt,
+            "pullout_end_dt": pullout_end_dt,
             "completed": bool(completed),
         }
 
@@ -1157,7 +1157,7 @@ class IcingClassificationGUI(QWidget):
         return starts, processed, last_img_name, last_img_dt, last_label, last_probs
 
     def _read_existing_equip_summary(self, equip_csv_path: Path) -> dict[tuple[str, int], dict[str, object]]:
-        """<장비 요약 csv>를 읽어 FeedingTime 등 기존 요약 정보를 유지하기 위한 헬퍼"""
+        """<장비 요약 csv>를 읽어 PulloutEndTime 등 기존 요약 정보를 유지하기 위한 헬퍼"""
         existing_summary: dict[tuple[str, int], dict[str, object]] = {}
         if not equip_csv_path.exists():
             return existing_summary
@@ -1186,7 +1186,7 @@ class IcingClassificationGUI(QWidget):
                     except Exception:
                         start_attempt_val = 0
 
-                    feeding_dt = self._str_to_qdatetime(_csv_get(row, idx_map, "FeedingTime"))
+                    pullout_end_dt = self._str_to_qdatetime(_csv_get(row, idx_map, "PulloutEndTime"))
                     end_lot = _csv_get(row, idx_map, end_lot_key) if end_lot_key in idx_map else ""
                     end_attempt = _csv_get(row, idx_map, end_attempt_key) if end_attempt_key in idx_map else ""
                     try:
@@ -1195,7 +1195,7 @@ class IcingClassificationGUI(QWidget):
                         end_attempt_val = None
 
                     existing_summary[(start_lot, start_attempt_val)] = {
-                        "feeding_dt": feeding_dt,
+                        "pullout_end_dt": pullout_end_dt,
                         "end_lot": end_lot,
                         "end_attempt": end_attempt_val,
                     }
@@ -1243,9 +1243,9 @@ class IcingClassificationGUI(QWidget):
                     end_attempt_val = None
 
             existing = existing_summary.get(cycle_key, {})
-            feeding_dt = existing.get("feeding_dt")
-            if not isinstance(feeding_dt, QDateTime) or not feeding_dt.isValid():
-                feeding_dt = None
+            pullout_end_dt = existing.get("pullout_end_dt")
+            if not isinstance(pullout_end_dt, QDateTime) or not pullout_end_dt.isValid():
+                pullout_end_dt = None
 
             end_lot = existing.get("end_lot") or end_lot
             end_attempt_val = existing.get("end_attempt") if existing.get("end_attempt") is not None else end_attempt_val
@@ -1256,10 +1256,10 @@ class IcingClassificationGUI(QWidget):
 
             melted_icing = compute_lead_minutes(melted_dt, icing_dt)
             icing_iced = compute_lead_minutes(icing_dt, iced_dt)
-            iced_feeding = compute_lead_minutes(iced_dt, feeding_dt)
+            iced_end = compute_lead_minutes(iced_dt, pullout_end_dt)
 
             summary_rows.append([self.current_equip, start_lot, str(start_attempt), end_lot, "" if end_attempt_val is None else str(end_attempt_val), self._qdatetime_to_str(melted_dt),
-                                 self._qdatetime_to_str(icing_dt), self._qdatetime_to_str(iced_dt), self._qdatetime_to_str(feeding_dt), melted_icing, icing_iced, iced_feeding])
+                                 self._qdatetime_to_str(icing_dt), self._qdatetime_to_str(iced_dt), self._qdatetime_to_str(pullout_end_dt), melted_icing, icing_iced, iced_end])
 
             if last_img_dt and isinstance(last_img_dt, QDateTime) and last_img_dt.isValid():
                 py_dt = _qdatetime_to_datetime(last_img_dt)
@@ -1267,7 +1267,7 @@ class IcingClassificationGUI(QWidget):
                     latest_py_dt = py_dt
                     latest_ctx = (cycle_key, starts.copy(), last_img_name, last_img_dt, processed, last_label, last_probs)
 
-        header = ["Equip", "Start_Lot", "Start_Attempt", "End_Lot", "End_Attempt", "MeltedTime", "IcingTime", "IcedTime", "FeedingTime", "MeltedToIcing(min)", "IcingToIced(min)", "IcedToFeeding(min)"]
+        header = ["Equip", "Start_Lot", "Start_Attempt", "End_Lot", "End_Attempt", "MeltedTime", "IcingTime", "IcedTime", "PulloutEndTime", "MeltedToIcing(min)", "IcingToIced(min)", "IcedToEnd(min)"]
 
         if summary_rows:
             try:
@@ -1289,11 +1289,11 @@ class IcingClassificationGUI(QWidget):
         self.processed_images = processed
 
         existing = existing_summary.get((start_lot, start_attempt), {})
-        feeding_dt = existing.get("feeding_dt")
-        self.current_cycle_completed = bool(isinstance(feeding_dt, QDateTime) and feeding_dt.isValid())
-        if not isinstance(feeding_dt, QDateTime) or not feeding_dt.isValid():
-            feeding_dt = None
-        self._set_recent_cycle_candidate(self.current_cycle_completed, last_dt, feeding_dt)
+        pullout_end_dt = existing.get("pullout_end_dt")
+        self.current_cycle_completed = bool(isinstance(pullout_end_dt, QDateTime) and pullout_end_dt.isValid())
+        if not isinstance(pullout_end_dt, QDateTime) or not pullout_end_dt.isValid():
+            pullout_end_dt = None
+        self._set_recent_cycle_candidate(self.current_cycle_completed, last_dt, pullout_end_dt)
 
         # device_info_box 및 패널 상단 기본 정보 복원
         header_text = ""
@@ -1318,15 +1318,15 @@ class IcingClassificationGUI(QWidget):
 
         self._reset_label_streak()
 
-    def _rebuild_equip_summary(self, feeding_override: dict[tuple[str, int], QDateTime | None] | None = None):
-        """FeedingTime 시점에만 <Cycle 상세 csv>를 집계해 <장비 요약 csv>를 재생성"""
+    def _rebuild_equip_summary(self, pullout_end_override: dict[tuple[str, int], QDateTime | None] | None = None):
+        """PulloutEndTime 시점에만 <Cycle 상세 csv>를 집계해 <장비 요약 csv>를 재생성"""
         if not self.current_equip:
             return
 
         equip_csv_path = CSV_OUTPUT_DIR / f"{self.current_equip}.csv"
         self.equip_csv_path = equip_csv_path
 
-        # 기존 요약 정보(FeedingTime 등)를 보존하기 위해 먼저 읽어둔다
+        # 기존 요약 정보(PulloutEndTime 등)를 보존하기 위해 먼저 읽어둔다
         existing_summary = self._read_existing_equip_summary(equip_csv_path)
 
         # 상태 보존: 실시간 판정 streak 상태는 요약 재생성에 의해 흔들리지 않도록 저장/복원
@@ -1352,16 +1352,16 @@ class IcingClassificationGUI(QWidget):
                 except Exception:
                     end_attempt_val = None
 
-            # FeedingTime 결정: override가 있으면 우선, 없으면 기존 요약에서 유지
+            # PulloutEndTime 결정: override가 있으면 우선, 없으면 기존 요약에서 유지
             existing = existing_summary.get(cycle_key, {})
 
-            feeding_dt: QDateTime | None = None
-            if feeding_override is not None and cycle_key in feeding_override:
-                ov = feeding_override.get(cycle_key)
-                feeding_dt = ov if (isinstance(ov, QDateTime) and ov.isValid()) else None
+            pullout_end_dt: QDateTime | None = None
+            if pullout_end_override is not None and cycle_key in pullout_end_override:
+                ov = pullout_end_override.get(cycle_key)
+                pullout_end_dt = ov if (isinstance(ov, QDateTime) and ov.isValid()) else None
             else:
-                ft = existing.get("feeding_dt")
-                feeding_dt = ft if (isinstance(ft, QDateTime) and ft.isValid()) else None
+                ft = existing.get("pullout_end_dt")
+                pullout_end_dt = ft if (isinstance(ft, QDateTime) and ft.isValid()) else None
 
             # end_lot/end_attempt도 가능하면 기존 요약값을 우선 유지
             end_lot = existing.get("end_lot") or end_lot
@@ -1373,7 +1373,7 @@ class IcingClassificationGUI(QWidget):
 
             melted_icing = compute_lead_minutes(melted_dt, icing_dt)
             icing_iced = compute_lead_minutes(icing_dt, iced_dt)
-            iced_feeding = compute_lead_minutes(iced_dt, feeding_dt)
+            iced_end = compute_lead_minutes(iced_dt, pullout_end_dt)
 
             summary_rows.append([
                 self.current_equip,
@@ -1382,8 +1382,8 @@ class IcingClassificationGUI(QWidget):
                 self._qdatetime_to_str(melted_dt),
                 self._qdatetime_to_str(icing_dt),
                 self._qdatetime_to_str(iced_dt),
-                self._qdatetime_to_str(feeding_dt),
-                melted_icing, icing_iced, iced_feeding,
+                self._qdatetime_to_str(pullout_end_dt),
+                melted_icing, icing_iced, iced_end,
             ])
 
         # streak 상태 복원
@@ -1392,7 +1392,7 @@ class IcingClassificationGUI(QWidget):
         if not summary_rows:
             return
 
-        header = ["Equip", "Start_Lot", "Start_Attempt", "End_Lot", "End_Attempt", "MeltedTime", "IcingTime", "IcedTime", "FeedingTime", "MeltedToIcing(min)", "IcingToIced(min)", "IcedToFeeding(min)"]
+        header = ["Equip", "Start_Lot", "Start_Attempt", "End_Lot", "End_Attempt", "MeltedTime", "IcingTime", "IcedTime", "PulloutEndTime", "MeltedToIcing(min)", "IcingToIced(min)", "IcedToEnd(min)"]
 
         try:
             with open(equip_csv_path, "w", encoding="utf-8-sig", newline="") as f:
@@ -1403,16 +1403,16 @@ class IcingClassificationGUI(QWidget):
             print(f"장비 요약 CSV 저장 실패: {e}")
 
     def _poll_latest_image(self):
-        """FeedingTime 기록 트리거 (비허용 공정으로 '진입'한 후 9초 경과 or 마지막 이미지 유입/처리 이후 9초 경과)"""
+        """PulloutEndTime 기록 트리거 (비허용 공정으로 '진입'한 후 9초 경과 or 마지막 이미지 유입/처리 이후 9초 경과)"""
         now = time.monotonic()
 
         # (A) 비허용 공정 진입 후 9초 경과 트리거
         if (self.disallowed_mode_latched
             and self.disallowed_entered_at > 0.0
-            and (not self._feeding_trigger_a_fired)
+            and (not self._pullout_end_trigger_a_fired)
             and (now - self.disallowed_entered_at) >= self.no_new_image_grace_s):
-            if self._record_feeding_time(trigger="A"):
-                self._feeding_trigger_a_fired = True
+            if self._record_pullout_end_time(trigger="A"):
+                self._pullout_end_trigger_a_fired = True
 
         # (B) 이미지 유입 중단 후 후 9초 경과 트리거
         if now < self._status_hold_until:
@@ -1427,30 +1427,27 @@ class IcingClassificationGUI(QWidget):
             self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
             self._set_status("신규 이미지 없음 (폴더 감시 중)", hold_s=0.0)
 
-            if not self._feeding_trigger_b_fired:
-                if self._record_feeding_time(trigger="B"):
-                    self._feeding_trigger_b_fired = True
+            if not self._pullout_end_trigger_b_fired:
+                if self._record_pullout_end_time(trigger="B"):
+                    self._pullout_end_trigger_b_fired = True
             return
 
-    def _is_cycle_stage_times_ready(self, starts: dict[str, QDateTime | None]) -> bool:
-        """Melted/Icing/Iced 시작 시각이 모두 기록됐는지 체크"""
-        for k in ("Melted", "Icing", "Iced"):
-            dt = starts.get(k)
-            if not isinstance(dt, QDateTime) or not dt.isValid():
-                return False
-        return True
+    def _is_cycle_melted_time_ready(self, starts: dict[str, QDateTime | None]) -> bool:
+        """Melted 시작 시각이 기록됐는지 체크"""
+        dt = starts.get("Melted")
+        return isinstance(dt, QDateTime) and dt.isValid()
 
-    def _record_feeding_time(self, trigger: str) -> bool:
-        """FeedingTime 기록"""
+    def _record_pullout_end_time(self, trigger: str) -> bool:
+        """PulloutEndTime 기록"""
         info = self.last_allowed_image_info
         lot = info.get("lot") if isinstance(info, dict) else None
         attempt_val = info.get("attempt") if isinstance(info, dict) else None
-        feeding_dt = info.get("dt") if isinstance(info, dict) else None
+        pullout_end_dt = info.get("dt") if isinstance(info, dict) else None
         equip = info.get("equip") if isinstance(info, dict) else None
 
         if lot is None or attempt_val is None:
             return False
-        if not isinstance(feeding_dt, QDateTime) or not feeding_dt.isValid():
+        if not isinstance(pullout_end_dt, QDateTime) or not pullout_end_dt.isValid():
             return False
 
         equip_val = equip or self.current_equip
@@ -1460,19 +1457,19 @@ class IcingClassificationGUI(QWidget):
         if self.current_cycle_start_lot is None or self.current_cycle_start_attempt is None:
             return False
 
-        # Melted/Icing/Iced 3개가 모두 기록된 경우에만 FeedingTime 기록
+        # Melted 시작 시각이 기록된 경우에만 PulloutEndTime 기록
         starts = self._get_earliest_for(self.current_cycle_start_lot, self.current_cycle_start_attempt)
-        if not self._is_cycle_stage_times_ready(starts):
+        if not self._is_cycle_melted_time_ready(starts):
             return False
 
-        # FeedingTime 입력 시점에만 Cycle 상세 csv를 집계해 요약을 재생성
+        # PulloutEndTime 입력 시점에만 Cycle 상세 csv를 집계해 요약을 재생성
         cycle_key = (self.current_cycle_start_lot, int(self.current_cycle_start_attempt))
-        self._rebuild_equip_summary({cycle_key: feeding_dt})
+        self._rebuild_equip_summary({cycle_key: pullout_end_dt})
         self.current_cycle_completed = True
 
         # 최근 cycle candidate 갱신
-        if isinstance(feeding_dt, QDateTime) and feeding_dt.isValid():
-            self._set_recent_cycle_candidate(True, feeding_dt, feeding_dt)
+        if isinstance(pullout_end_dt, QDateTime) and pullout_end_dt.isValid():
+            self._set_recent_cycle_candidate(True, pullout_end_dt, pullout_end_dt)
 
         self.panel_canvas.set_completion_badge(True)
         return True
@@ -1513,7 +1510,7 @@ class IcingClassificationGUI(QWidget):
             return
 
         self.last_image_seen_at = time.monotonic()
-        self._feeding_trigger_b_fired = False
+        self._pullout_end_trigger_b_fired = False
         self.pending_images.append(path)
 
         if not (self._backlog_thread and self._backlog_thread.isRunning()):
@@ -1544,7 +1541,7 @@ class IcingClassificationGUI(QWidget):
 
         cand = self._recent_cycle_candidate
 
-        # FeedingTime 여부와 무관하게 마지막 처리 시각 대비 60분 이상이면 강제 새 cycle 시작
+        # PulloutEndTime 여부와 무관하게 마지막 처리 시각 대비 60분 이상이면 강제 새 cycle 시작
         if isinstance(cur_dt, QDateTime) and cur_dt.isValid():
             ref_dt = None
 
@@ -1584,7 +1581,7 @@ class IcingClassificationGUI(QWidget):
 
                 # last_dt와 60분 이내면 Cycle 이어붙이기(resume)
                 if diff_min is not None and 0.0 <= diff_min < 60.0:
-                    # 1) FeedingTime 롤백 없이 Cycle 상세 재로딩으로 이어붙이기 (요약은 다음 FeedingTime 때 재생성)
+                    # 1) PulloutEndTime 롤백 없이 Cycle 상세 재로딩으로 이어붙이기 (요약은 다음 PulloutEndTime 때 재생성)
                     starts, processed, _, last_img_dt, _, _ = self._load_cycle_details(cycle_path)
 
                     # 2) 상태 복원 (진행중으로 전환)
@@ -1606,8 +1603,8 @@ class IcingClassificationGUI(QWidget):
 
                     # UI/트리거 리셋
                     self.panel_canvas.set_completion_badge(False)
-                    self._feeding_trigger_a_fired = False
-                    self._feeding_trigger_b_fired = False
+                    self._pullout_end_trigger_a_fired = False
+                    self._pullout_end_trigger_b_fired = False
                     return
 
         # resume 조건이 아니면: 기존 로직대로 새 cycle 시작
@@ -1626,7 +1623,7 @@ class IcingClassificationGUI(QWidget):
         if not self.disallowed_mode_latched:
             self.disallowed_mode_latched = True
             self.disallowed_entered_at = time.monotonic()
-            self._feeding_trigger_a_fired = False
+            self._pullout_end_trigger_a_fired = False
 
         if self.disallowed_preview_cb.isChecked():
             latest_img = safe_image_load(str(img_path), as_gray=True)
@@ -1650,7 +1647,7 @@ class IcingClassificationGUI(QWidget):
 
             # 신규 이미지 도착 시각 기록 (허용/비허용 공정 공통)
             self.last_image_seen_at = time.monotonic()
-            self._feeding_trigger_b_fired = False
+            self._pullout_end_trigger_b_fired = False
 
             if not self.current_equip:
                 self.current_equip = info['equip'] or None
@@ -1700,7 +1697,7 @@ class IcingClassificationGUI(QWidget):
             row = [img_name, attempt_value, label]
             row.extend([f"{p:.4f}" for p in probs])
             self.save_csv(row)
-            # 장비 요약 CSV는 FeedingTime 시점에만 재생성 (실시간 갱신은 메모리 기반)
+            # 장비 요약 CSV는 PulloutEndTime 시점에만 재생성 (실시간 갱신은 메모리 기반)
 
             if cur_dt and cur_dt.isValid():
                 old = _qdatetime_to_datetime(self.last_processed_dt) if self.last_processed_dt else None
@@ -1818,11 +1815,11 @@ class IcingClassificationGUI(QWidget):
 
         keep_badge = bool(self.current_cycle_completed)
 
-        self._reset_feeding_state(keep_last_allowed=keep_last, keep_badge=keep_badge)
+        self._reset_pullout_end_state(keep_last_allowed=keep_last, keep_badge=keep_badge)
 
         if self.current_cycle_completed:
-            self._feeding_trigger_a_fired = True
-            self._feeding_trigger_b_fired = True
+            self._pullout_end_trigger_a_fired = True
+            self._pullout_end_trigger_b_fired = True
 
         now = time.monotonic()
         self.last_image_seen_at = now
