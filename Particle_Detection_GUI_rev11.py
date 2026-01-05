@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox,
     QGroupBox, QSizePolicy, QLineEdit, QLayout, QCheckBox, QTextEdit, QScrollArea, QDialog
 )
-from PySide6.QtCore import Qt, QTimer, QDate, QTime, QSettings, QRect, QThread, QObject, Signal, Slot, QDateTime, QEvent, QUrl
+from PySide6.QtCore import Qt, QTimer, QSettings, QRect, QThread, QObject, Signal, Slot, QDateTime, QEvent, QUrl, QDate, QTime, QDateTime
 from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QGuiApplication, QDesktopServices
 import csv
 from collections import deque
@@ -28,12 +28,12 @@ mpl.rcParams['font.family'] = 'Malgun Gothic'
 mpl.rcParams['axes.unicode_minus'] = False
 
 # 환경 플래그: 경로 및 저장동작 테스트(True) / 운영(False) 모드 구분
-LOAD_TEST_MODE = False
-SAVE_TEST_MODE = False
-INI_TEST_MODE  = False
+LOAD_TEST_MODE = True
+SAVE_TEST_MODE = True
+INI_TEST_MODE  = True
 
 # 실행파일 실행 시, "자동 시작 동작 수행" 여부 플래그 : 자동 시작(True) / 수동 시작(False)
-AUTO_START_ON_LAUNCH = True
+AUTO_START_ON_LAUNCH = False
 
 # 이미지/CSV/그래프/이벤트 파일 경로 설정
 if LOAD_TEST_MODE:
@@ -223,9 +223,10 @@ def extract_image_datetime(path: Path) -> QDateTime:
         qdt = QDateTime(QDate(yyyy, mm, dd), QTime(hh, mi, ss))
         if qdt.isValid():
             return qdt
+
     try:
-        ts = path.stat().st_mtime
-        return QDateTime.fromSecsSinceEpoch(int(ts))
+        ts = int(path.stat().st_mtime)
+        return QDateTime.fromSecsSinceEpoch(ts, Qt.LocalTime)
     except Exception:
         return QDateTime()
 
@@ -324,20 +325,10 @@ class ImageDirectoryWatcher(QObject):
         self._allow_ext = {ext.lower() for ext in allow_ext}
 
     def start(self):
-        if self._observer is not None and self._observer.is_alive():
+        if self._observer is not None:
             return
-        if self._observer is not None and (not self._observer.is_alive()):
-            try:
-                self._observer.stop()
-                self._observer.join(timeout=1.0)
-            except Exception:
-                pass
-            self._observer = None
-            self._handler = None
-
         if not self._directory.exists():
             self._directory.mkdir(parents=True, exist_ok=True)
-
         self._handler = _ImageFileEventHandler(self.file_created.emit, self._allow_ext)
         observer = Observer()
         observer.schedule(self._handler, str(self._directory), recursive=False)
@@ -357,7 +348,7 @@ class ImageDirectoryWatcher(QObject):
             pass
 
     def is_running(self) -> bool:
-        return self._observer is not None and self._observer.is_alive()
+        return self._observer is not None
 
 def parse_filename(fname: str):
     """파일명 파서 (형식: EQUIP_Lot#_Process_Attempt_YYYYMMDD_HHMM(SS).ext)"""
@@ -1422,11 +1413,6 @@ class ParticleDetectionGUI(QWidget):
         self.tail_timer.setInterval(500)
         self.tail_timer.timeout.connect(self.process_new_images_tick)
 
-        # watchdog health-check 타이머 (감시 스레드 죽음 감지/복구)
-        self.watcher_health_timer = QTimer(self)
-        self.watcher_health_timer.setInterval(60000)  # 60초
-        self.watcher_health_timer.timeout.connect(self._watcher_health_check)
-
         # 백로그 스레드 구성 요소
         self._backlog_thread: QThread | None = None
         self._backlog_feeder: BacklogFeeder | None = None
@@ -1711,12 +1697,8 @@ class ParticleDetectionGUI(QWidget):
         state = {
             'tail_timer': self.tail_timer.isActive(),
             'watcher': self.directory_watcher.is_running(),
-            'health_timer': self.watcher_health_timer.isActive(),
             'backlog': bool(self._backlog_thread and self._backlog_thread.isRunning()),
         }
-
-        if state['health_timer']:
-            self.watcher_health_timer.stop()
 
         if state['tail_timer']:
             self.tail_timer.stop()
@@ -1738,9 +1720,6 @@ class ParticleDetectionGUI(QWidget):
             self.directory_watcher.start()
         if state.get('tail_timer'):
             self.tail_timer.start()
-        if state.get('health_timer'):
-            self.watcher_health_timer.start()
-
         if state.get('backlog'):
             self._restart_backlog_scan()
         else:
@@ -1777,7 +1756,6 @@ class ParticleDetectionGUI(QWidget):
         self.pending_images.clear()
         self._is_processing_queue = False
         self.directory_watcher.start()
-        self.watcher_health_timer.start()
         self.tail_timer.start()
         self.last_image_seen_at = time.monotonic()
         self.last_allowed_image_seen_at = 0.0
@@ -1797,9 +1775,6 @@ class ParticleDetectionGUI(QWidget):
 
         if self.tail_timer.isActive():
             self.tail_timer.stop()
-
-        if hasattr(self, "watcher_health_timer") and self.watcher_health_timer.isActive():
-            self.watcher_health_timer.stop()
 
         self.directory_watcher.stop()
         self.pending_images.clear()
@@ -1848,32 +1823,6 @@ class ParticleDetectionGUI(QWidget):
             pass
         finally:
             super().closeEvent(event)
-
-    def _watcher_health_check(self):
-        """watchdog observer 오류 상태를 자동 복구"""
-        try:
-            if not self.stop_button.isEnabled():
-                return
-            if self.directory_watcher.is_running():
-                return
-
-            self._set_status("폴더 감시 비정상 감지 → 감시 재시작", hold_s=3.0)
-
-            try:
-                self.directory_watcher.stop()
-            except Exception:
-                pass
-            self.directory_watcher.start()
-
-            backlog = find_new_images(IMG_INPUT_DIR, self.session_processed_images)
-            if backlog:
-                for p in backlog:
-                    self.pending_images.append(p)
-
-                self._drain_pending_queue()
-
-        except Exception:
-            pass
 
     def process_new_images_tick(self):
         """watchdog 큐 처리 및 신규 이미지 부재 상태 갱신 + 스냅샷 트리거"""
