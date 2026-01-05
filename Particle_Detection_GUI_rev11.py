@@ -73,7 +73,7 @@ os.makedirs(GRAPH_OUTPUT_DIR, exist_ok=True)
 # 파티클 탐지 파라미터
 WARMUP_FRAMES = 15                   # 워밍업 프레임 수
 MIN_NOISE_REPEAT = 2                 # 워밍업 구간 내 몇 회 이상 등장 좌표를 노이즈로 설정
-MANUAL_THRESHOLD   = 7               # 이진화 임계값
+MANUAL_THRESHOLD   = 3               # 이진화 임계값
 KERNEL_SIZE_TOPHAT = (3, 3)          # tophat 모폴로지 연산 커널 크기
 KERNEL_SIZE_MORPH  = (3, 3)          # 모폴로지 클로즈 연산 커널 크기
 PARTICLE_AREA_MIN  = 8               # 파티클 최소 면적
@@ -1021,6 +1021,7 @@ class AlertPopup(QWidget):
 
         # 로그 이력 보관
         self._log_entries: list[tuple[QDateTime, str]] = []
+        self._closed_with_action = False
 
     def start_blink(self):
         """탐지 상태를 강조하기 위해 발생 정보 영역의 배경 깜빡임 타이머를 시작"""
@@ -1205,20 +1206,25 @@ class AlertPopup(QWidget):
         self.stop_blink()
         self._elapsed_timer.stop()
         self._first_dt = None
+        if not self._closed_with_action:
+            now = QDateTime.currentDateTime()
+            self.append_log('창 닫기', now)
         super().closeEvent(event)
 
     def _close_with(self, reason: str):
         """닫힘 버튼 종류와 무시 시각을 신호로 전달하고 로그에 남긴 뒤 팝업을 종료"""
+        self._closed_with_action = True
         self.stop_blink()
         self._elapsed_timer.stop()
         self._first_dt = None
-        snooze_min = self.ignore_min_spin.value() if self.ignore_cb.isChecked() else 0
+        ignore_min = self.ignore_min_spin.value()
+        snooze_min = ignore_min if self.ignore_cb.isChecked() else 0
         now = QDateTime.currentDateTime()
         if snooze_min > 0:
             action = '확인 종료' if reason == 'ok' else '창 종료'
             self.append_log(f"{snooze_min:02d}분 팝업 무시 체크 후 {action}", now)
         elif reason == 'ok':
-            self.append_log('확인 종료', now)
+            self.append_log(f"{ignore_min:02d}분 팝업 무시 체크 해제 후 확인 종료", now)
         else:
             self.append_log('창 종료', now)
         self.closedWithAction.emit(reason, snooze_min)
