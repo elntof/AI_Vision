@@ -2496,6 +2496,17 @@ class ParticleDetectionGUI(QWidget):
             self.alert_popup.deleteRequested.connect(self._open_false_positive_dialog)
         return self.alert_popup
 
+    def _center_popup_on_screen(self, pop: QWidget):
+        """알림 팝업을 현재 화면 중앙으로 이동"""
+        screen = QGuiApplication.screenAt(pop.pos()) or QGuiApplication.primaryScreen()
+        if not screen:
+            return
+        geom = screen.availableGeometry()
+        size = pop.size()
+        new_x = geom.x() + (geom.width() - size.width()) // 2
+        new_y = geom.y() + (geom.height() - size.height()) // 2
+        pop.move(new_x, new_y)
+
     def _open_popup_manually(self):
         """메인 창 우측 상단 '팝업' 버튼으로 현재 상태의 알림 팝업을 즉시 표시"""
         self._refresh_popup_images_from_history()
@@ -2532,7 +2543,10 @@ class ParticleDetectionGUI(QWidget):
         else:
             pop.stop_blink()
 
-        if not pop.isVisible():
+        if pop.isMinimized():
+            pop.showNormal()
+            self._center_popup_on_screen(pop)
+        elif not pop.isVisible():
             pop.show()
         pop.raise_()
         pop.activateWindow()
@@ -2558,10 +2572,13 @@ class ParticleDetectionGUI(QWidget):
         pop.append_log(f"Particle 탐지 {len(self.detection_history)}회", event_dt)
         pop.start_blink()
 
-        if not pop.isVisible():
+        if pop.isMinimized():
+            pop.showNormal()
+            self._center_popup_on_screen(pop)
+        elif not pop.isVisible():
             pop.show()
-            pop.raise_()
-            pop.activateWindow()
+        pop.raise_()
+        pop.activateWindow()
 
     @Slot(str, int)
     def _on_popup_closed(self, reason: str, snooze_min: int):
