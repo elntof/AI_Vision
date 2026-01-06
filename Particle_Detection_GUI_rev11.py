@@ -28,12 +28,12 @@ mpl.rcParams['font.family'] = 'Malgun Gothic'
 mpl.rcParams['axes.unicode_minus'] = False
 
 # 환경 플래그: 경로 및 저장동작 테스트(True) / 운영(False) 모드 구분
-LOAD_TEST_MODE = True
-SAVE_TEST_MODE = True
-INI_TEST_MODE  = True
+LOAD_TEST_MODE = False
+SAVE_TEST_MODE = False
+INI_TEST_MODE  = False
 
 # 실행파일 실행 시, "자동 시작 동작 수행" 여부 플래그 : 자동 시작(True) / 수동 시작(False)
-AUTO_START_ON_LAUNCH = False
+AUTO_START_ON_LAUNCH = True
 
 # 이미지/CSV/그래프/이벤트 파일 경로 설정
 if LOAD_TEST_MODE:
@@ -72,8 +72,9 @@ os.makedirs(GRAPH_OUTPUT_DIR, exist_ok=True)
 
 # 파티클 탐지 파라미터
 WARMUP_FRAMES = 15                   # 워밍업 프레임 수
-MIN_NOISE_REPEAT = 2                 # 워밍업 구간 내 몇 회 이상 등장 좌표를 노이즈로 설정
-MANUAL_THRESHOLD   = 3               # 이진화 임계값
+MIN_NOISE_REPEAT = 3                 # 워밍업 구간 내 몇 회 이상 등장 좌표를 노이즈로 설정
+MANUAL_THRESHOLD   = 7               # 이진화 임계값
+WARMUP_THRESHOLD_OFFSET = -3         # 워밍업 시 이진화 임계값 보정값
 KERNEL_SIZE_TOPHAT = (3, 3)          # tophat 모폴로지 연산 커널 크기
 KERNEL_SIZE_MORPH  = (3, 3)          # 모폴로지 클로즈 연산 커널 크기
 PARTICLE_AREA_MIN  = 8               # 파티클 최소 면적
@@ -1261,10 +1262,10 @@ class ParticleDetectionGUI(QWidget):
         self._csv_header_checked = False
 
         # Noise Particle 판정 파라미터
-        self.prev_particles = []         # 워밍 업 시, 반복 좌표 및 크기 기억
-        self.frame_buffer = []           # 워밍 업 시, 파티클 리스트 버퍼
-        self.distance_threshold = 20     # 거리 임계값 (반경 내 같은 Noise로 인식)
-        self.collecting_initial = True   # 최초 10장 워밍업 플래그
+        self.prev_particles = []         # 워밍업 시, 반복 좌표 및 크기 기억
+        self.frame_buffer = []           # 워밍업 시, 파티클 리스트 버퍼
+        self.distance_threshold = 10     # 거리 임계값 (워밍업 중 같은 Noise로 인식 반경 / 워밍업 후 Noise 판정 제외 반경)
+        self.collecting_initial = True   # 최초 15장 워밍업 플래그
         self._preserve_noise_on_warmup = False  # 워밍업 시 노이즈 좌표 유지 여부
 
         # 허용 모드 집합 & 래치/홀드 상태
@@ -2062,10 +2063,11 @@ class ParticleDetectionGUI(QWidget):
                 self._update_noise_text()
 
                 # 후보 파티클만 수집(판정/CSV/그래프/이벤트 저장 없음)
+                warmup_threshold = max(0, min(255, MANUAL_THRESHOLD + WARMUP_THRESHOLD_OFFSET))
                 _, _, particle_info = particle_detection(
                     gray_prev,
                     [self.get_box1(), self.get_box2()],
-                    adaptive_value,
+                    warmup_threshold,
                     area_min=WARMUP_NOISE_AREA_MIN,
                     area_max=PARTICLE_AREA_MAX
                 )
