@@ -123,14 +123,7 @@ def parse_datetime(date_str, time_str):
 def extract_row_info(row):
     """CSV에서 장비명, Lot#, Status, 날짜/시간 등의 정보 추출 후 딕셔너리로 반환"""
     if row is None:
-        return {
-            "date_time": "",
-            "equipment": "",
-            "lot_number": "",
-            "status_display": "",
-            "status_text": "",
-            "puller_status": None
-        }
+        return {"dt": None, "lot_number": "", "status_text": ""}
 
     date_str = row.get('Date', '')
     time_str = row.get('Time', '')
@@ -140,14 +133,10 @@ def extract_row_info(row):
     max_light_raw = row.get('Camera 1 Max Light', '')
     bottom_heater_raw = row.get('Bottom Heater Set Point', '')
     seed_lift_raw = row.get('Seed Lift Set Point', '')
+    gas_pressure_raw = row.get('Gas Pressure Set Point', '')
 
     dt_full = parse_datetime(date_str, time_str)
-    if dt_full:
-        date_time = dt_full.strftime('%Y%m%d_%H%M%S')
-    else:
-        date_time = ''
 
-    equipment = host_name[3:5]
     lot_number = run_number
 
     puller_status_str = puller_status_raw.strip() if isinstance(puller_status_raw, str) else str(puller_status_raw)
@@ -171,6 +160,10 @@ def extract_row_info(row):
         seed_lift = float(seed_lift_raw)
     except (ValueError, TypeError):
         seed_lift = 0.0
+    try:
+        gas_pressure = float(gas_pressure_raw)
+    except (ValueError, TypeError):
+        gas_pressure = 0.0
 
     status_map = {0: "IDLE", 4: "TAKEOVER", 5: "PUMPDOWN"}
 
@@ -182,8 +175,7 @@ def extract_row_info(row):
         elif 20 <= puller_status <= 29:
             status_text = "STABILIZATION"
         elif 30 <= puller_status <= 39:
-            # [mode 30~39 조건 下] ① Max Light==0 & BH Power≥5 → "BEFOFEED" / ② BH Power≥10 → "REMELT" / ③ Neck Att≥1 & Seed Lift≥0.1 → "NECK" / ④ 아니면 "NECK(STAB)"
-            if max_light == 0 and bottom_heater >= 5:
+            if max_light == 0 and bottom_heater >= 5 and gas_pressure == 20:
                 status_text = "BEFOFEED"
             elif bottom_heater >= 10:
                 status_text = "REMELT"
@@ -200,29 +192,21 @@ def extract_row_info(row):
         elif 80 <= puller_status <= 89:
             status_text = "SHUTDOWN"
         elif 90 <= puller_status <= 99:
-            # [mode 90~99 조건 下] ① Max Light==0 & BH Power≥5 → "BEFOFEED" / ② 아니면 "PULLOUT"
             if max_light == 0 and bottom_heater >= 5:
                 status_text = "BEFOFEED"
             else:
                 status_text = "PULLOUT"
         else:
             status_text = f"알 수 없는 상태({puller_status})"
-
-        status_display = f"{puller_status} / {status_text}"
     else:
         status_text = ""
-        status_display = f"{puller_status_str} / 상태 정보 없음"
 
     return {
-        "date_time": date_time,
         "dt": dt_full,
-        "equipment": equipment,
         "lot_number": lot_number,
-        "status_display": status_display,
         "status_text": status_text,
-        "puller_status": puller_status,
-        "max_light": max_light
     }
+
 
 # Attempt_NEW 계산 (온라인/스트리밍)
 INTEREST_STATUSES = ("NECK", "CROWN", "SHOULDER", "BODY", "BEFOFEED")
@@ -318,14 +302,7 @@ def find_closest_row_and_attempt(csv_text, target_dt):
             # CSV 구조가 비정상/빈 경우 안전한 기본값 반환
             selected_row = None
             selected_attempt = 0
-            selected_info = {
-                "date_time": "",
-                "equipment": "",
-                "lot_number": "",
-                "status_display": "",
-                "status_text": "",
-                "puller_status": None
-            }
+            selected_info = {"dt": None, "lot_number": "", "status_text": ""}
 
     return selected_row, selected_attempt, selected_info
 
@@ -356,7 +333,7 @@ class CsvTracker:
         self.text = None
 
         self.cached_attempt = 0
-        self.cached_info = {"status_text": "", "lot_number": "", "status_display": "", "puller_status": None}
+        self.cached_info = {"dt": None, "status_text": "", "lot_number": ""}
 
         self.conn = None
         self.last_dir_scan_ts = 0
@@ -376,7 +353,7 @@ class CsvTracker:
         self.size = None
         self.text = None
         self.cached_attempt = 0
-        self.cached_info = {"status_text": "", "lot_number": "", "status_display": "", "puller_status": None}
+        self.cached_info = {"dt": None, "status_text": "", "lot_number": ""}
 
     def _connect(self):
         """SMB 서버에 연결을 시도하고, 성공 시 연결 객체를 보관"""
@@ -469,7 +446,7 @@ class CsvTracker:
         if latest_meta is None:
             if self.text is None:
                 self.cached_attempt = 0
-                self.cached_info = {"status_text": "", "lot_number": "", "status_display": "", "puller_status": None}
+                self.cached_info = {"dt": None, "status_text": "", "lot_number": ""}
             return self.cached_attempt, self.cached_info
 
         need_reload = False
@@ -1178,7 +1155,6 @@ class MainWindow(QWidget):
         self.max_files_spin.setValue(int(max_files_val))
         self.bmp_check.setChecked(self.settings.value('bmp_checked', 'False') in ['true', 'True', True])
         self.jpg_check.setChecked(self.settings.value('jpg_checked', 'True') in ['true', 'True', True])
-        self.device_edit.setText(str(self.settings.value('device_name', '')))
         qual = int(self.settings.value('jpeg_quality', 90))
         self.quality_slider.setValue(qual)
 
