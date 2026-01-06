@@ -28,12 +28,12 @@ mpl.rcParams['font.family'] = 'Malgun Gothic'
 mpl.rcParams['axes.unicode_minus'] = False
 
 # 환경 플래그: 경로 및 저장동작 테스트(True) / 운영(False) 모드 구분
-LOAD_TEST_MODE = False
-SAVE_TEST_MODE = False
-INI_TEST_MODE  = False
+LOAD_TEST_MODE = True
+SAVE_TEST_MODE = True
+INI_TEST_MODE  = True
 
 # 실행파일 실행 시, "자동 시작 동작 수행" 여부 플래그 : 자동 시작(True) / 수동 시작(False)
-AUTO_START_ON_LAUNCH = True
+AUTO_START_ON_LAUNCH = False
 
 # 이미지/CSV/그래프/이벤트 파일 경로 설정
 if LOAD_TEST_MODE:
@@ -2397,9 +2397,11 @@ class ParticleDetectionGUI(QWidget):
                         img_path.unlink()
                     except Exception:
                         pass
+            self._remove_empty_event_dir_if_needed()
 
             self.graph_records = [rec for rec in self.graph_records if rec[0] not in names_set]
             self.update_graph()
+            self._save_graph_snapshot_after_deletion()
 
             self.lot_event_count = len(self.detection_history)
             self._refresh_popup_images_from_history()
@@ -2438,6 +2440,29 @@ class ParticleDetectionGUI(QWidget):
                 writer.writerows(rows)
         except Exception as e:
             self._set_status(f"CSV 삭제 실패: {e}", hold_s=3.0)
+
+    def _remove_empty_event_dir_if_needed(self):
+        """오탐 삭제 후 현재 Lot의 폴더가 비면 폴더까지 삭제"""
+        if not self.current_lot:
+            return
+        event_dir = EVENT_OUTPUT_DIR / self.current_lot
+        if not event_dir.exists():
+            return
+        try:
+            if any(event_dir.iterdir()):
+                return
+            event_dir.rmdir()
+        except Exception:
+            pass
+
+    def _save_graph_snapshot_after_deletion(self):
+        """오탐 삭제 후 갱신된 그래프를 현재 Lot 기준으로 즉시 스냅샷 저장"""
+        lot_for_snapshot = self._get_snapshot_lot()
+        if not lot_for_snapshot:
+            return
+        if not self.graph_records:
+            return
+        self._save_graph_snapshot_file(lot_for_snapshot)
 
     def _refresh_alert_popup_after_deletion(self):
         """오탐 삭제 후, 알림 팝업의 기본 정보/그래프/이미지/로그를 최신 이력 상태로 다시 반영"""
