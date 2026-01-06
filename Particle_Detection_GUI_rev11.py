@@ -1479,6 +1479,13 @@ class ParticleDetectionGUI(QWidget):
         target_x, target_y = self._adjust_position_to_screen(target_x, target_y, window_width, window_height)
         self.move(target_x, target_y)
 
+    def _bring_window_to_front_once(self):
+        """탐지 시작 시점에 창을 한 번만 앞으로 가져오기"""
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
     def _adjust_position_to_screen(self, x, y, window_width=None, window_height=None):
         """메인 창의 좌표가 현재 모니터의 표시 가능한 영역을 벗어나지 않도록 보정"""
         screen = self.screen() or QGuiApplication.primaryScreen()
@@ -1737,6 +1744,7 @@ class ParticleDetectionGUI(QWidget):
 
     def start_realtime(self):
         """실시간 파티클 판정 시작 (백로그 → 라이브 테일 순)"""
+        self._bring_window_to_front_once()
 
         # (A) 워밍업 도중에 Stop→Start: 옵션에 따라 '이어가기' 또는 '처음부터'
         if self.collecting_initial and len(self.frame_buffer) > 0:
