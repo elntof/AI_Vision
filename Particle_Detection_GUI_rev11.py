@@ -99,6 +99,9 @@ ADAPTIVE_THRESHOLD_GAIN = 0.2       # 적응 임계 보정계수
 WINDOW_OFFSET_X = 100
 WINDOW_OFFSET_Y = 200
 
+# 알림 팝업 좌측 여백 (모니터 좌측 기준)
+POPUP_LEFT_MARGIN = 40
+
 # 신규 이미지 부재 시 미리보기 플레이스홀더 텍스트
 NO_IMAGE_PLACEHOLDER_TEXT = "신규 이미지 없음"
 DISALLOWED_PLACEHOLDER_TEXT = "허용 공정이 아님"
@@ -2529,14 +2532,14 @@ class ParticleDetectionGUI(QWidget):
             self.alert_popup.deleteRequested.connect(self._open_false_positive_dialog)
         return self.alert_popup
 
-    def _center_popup_on_screen(self, pop: QWidget):
-        """알림 팝업을 현재 화면 중앙으로 이동"""
+    def _position_popup_on_screen(self, pop: QWidget):
+        """알림 팝업을 현재 화면 좌측 여백 위치로 이동"""
         screen = QGuiApplication.screenAt(pop.pos()) or QGuiApplication.primaryScreen()
         if not screen:
             return
         geom = screen.availableGeometry()
         size = pop.size()
-        new_x = geom.x() + (geom.width() - size.width()) // 2
+        new_x = geom.x() + POPUP_LEFT_MARGIN
         new_y = geom.y() + (geom.height() - size.height()) // 2
         pop.move(new_x, new_y)
 
@@ -2578,9 +2581,10 @@ class ParticleDetectionGUI(QWidget):
 
         if pop.isMinimized():
             pop.showNormal()
-            self._center_popup_on_screen(pop)
+            self._position_popup_on_screen(pop)
         elif not pop.isVisible():
             pop.show()
+            self._position_popup_on_screen(pop)
         pop.raise_()
         pop.activateWindow()
 
@@ -2607,9 +2611,10 @@ class ParticleDetectionGUI(QWidget):
 
         if pop.isMinimized():
             pop.showNormal()
-            self._center_popup_on_screen(pop)
+            self._position_popup_on_screen(pop)
         elif not pop.isVisible():
             pop.show()
+            self._position_popup_on_screen(pop)
         pop.raise_()
         pop.activateWindow()
 
