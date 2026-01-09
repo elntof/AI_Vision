@@ -28,12 +28,12 @@ mpl.rcParams['font.family'] = 'Malgun Gothic'
 mpl.rcParams['axes.unicode_minus'] = False
 
 # 환경 플래그: 경로 및 저장동작 테스트(True) / 운영(False) 모드 구분
-LOAD_TEST_MODE = True
-SAVE_TEST_MODE = True
-INI_TEST_MODE  = True
+LOAD_TEST_MODE = False
+SAVE_TEST_MODE = False
+INI_TEST_MODE  = False
 
 # 실행파일 실행 시, "자동 시작 동작 수행" 여부 플래그 : 자동 시작(True) / 수동 시작(False)
-AUTO_START_ON_LAUNCH = False
+AUTO_START_ON_LAUNCH = True
 
 # 이미지/CSV/그래프/이벤트 파일 경로 설정
 if LOAD_TEST_MODE:
@@ -1480,7 +1480,7 @@ class ParticleDetectionGUI(QWidget):
         self.move(target_x, target_y)
 
     def _bring_window_to_front_once(self):
-        """탐지 시작 시점에 창을 한 번만 앞으로 가져오기"""
+        """워밍업 시작 시점에 창을 한 번만 앞으로 가져오기"""
         if self.isMinimized():
             self.showNormal()
         self.raise_()
@@ -1530,6 +1530,7 @@ class ParticleDetectionGUI(QWidget):
 
     def _reset_noise_warmup(self, status_text: str, clear_noise: bool = True):
         """노이즈 정의 및 워밍업 상태 초기화"""
+        self._bring_window_to_front_once()
         self.collecting_initial = True
         if clear_noise:
             self.prev_particles.clear()
@@ -1744,8 +1745,6 @@ class ParticleDetectionGUI(QWidget):
 
     def start_realtime(self):
         """실시간 파티클 판정 시작 (백로그 → 라이브 테일 순)"""
-        self._bring_window_to_front_once()
-
         # (A) 워밍업 도중에 Stop→Start: 옵션에 따라 '이어가기' 또는 '처음부터'
         if self.collecting_initial and len(self.frame_buffer) > 0:
             if RESUME_WARMUP_ON_STOP_START:
