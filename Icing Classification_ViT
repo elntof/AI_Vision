@@ -946,6 +946,13 @@ class IcingClassificationGUI(QWidget):
         target_x, target_y = self._adjust_position_to_screen(target_x, target_y, window_width, window_height)
         self.move(target_x, target_y)
 
+    def _bring_window_to_front_once(self):
+        """Cycle 시작 시점에 창을 한 번만 앞으로 가져오기"""
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
     def _adjust_position_to_screen(self, x, y, window_width=None, window_height=None):
         """창이 화면 영역을 벗어나지 않도록 x, y 좌표를 보정해 반환"""
         screen = self.screen() or QGuiApplication.primaryScreen()
@@ -1022,6 +1029,7 @@ class IcingClassificationGUI(QWidget):
 
     def _start_new_cycle(self, lot_number: str, attempt_value: int, clear_recent_candidate: bool = True):
         """새 cycle 시작 시 공통 초기화 처리"""
+        self._bring_window_to_front_once()
         self.current_cycle_start_lot = lot_number
         self.current_cycle_start_attempt = attempt_value
         self.cycle_csv_path = LOT_DETAILS_DIR / f"{lot_number}_{attempt_value}.csv"
