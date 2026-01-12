@@ -162,6 +162,24 @@ def load_pixmap_from_path(img_path: Path, target_size: tuple[int, int] | None = 
         return QPixmap()
     return pixmap_from_numpy(img, target_size)
 
+def draw_dashed_circle(image, center, radius, color, thickness=1, dash_length=3, gap_length=2):
+    """OpenCV 이미지에 Noise 좌표에 원(점선)을 그리기"""
+    if image is None or radius <= 0:
+        return
+    if dash_length <= 0:
+        dash_length = 1
+    if gap_length < 0:
+        gap_length = 0
+    angle = 0.0
+    dash_angle = dash_length / radius
+    gap_angle = gap_length / radius
+    full_circle = 2 * np.pi
+    while angle < full_circle:
+        start_deg = np.degrees(angle)
+        end_deg = np.degrees(min(angle + dash_angle, full_circle))
+        cv2.ellipse(image, center, (int(radius), int(radius)), 0, start_deg, end_deg, color, thickness, cv2.LINE_AA)
+        angle += dash_angle + gap_angle
+
 def get_ref_roi_from_crop1(crop1_rect):
     """crop1 좌하단 기준 좌측 10px 이동 지점을 REF_ROI 우하단으로 설정"""
     crop_x, crop_y, crop_w, crop_h = crop1_rect
@@ -627,6 +645,9 @@ class ImagePreviewLabel(QLabel):
                     radius = max(1, int(round(NOISE_CIRCLE_RADIUS * scale)))
                     thickness = max(1, int(round(NOISE_CIRCLE_THICKNESS * scale)))
                     pen_noise = QPen(QColor(255, 255, 255), thickness)
+                    dash_length = max(1, int(round(3 * scale)))
+                    gap_length = max(1, int(round(2 * scale)))
+                    pen_noise.setDashPattern([dash_length, gap_length])
                     painter.setPen(pen_noise)
                     painter.drawEllipse(cx - radius, cy - radius, radius * 2, radius * 2)
 
@@ -2185,10 +2206,10 @@ class ParticleDetectionGUI(QWidget):
 
             has_particle = 'O' if valid_particles else 'X'
 
-            # '흰 원(노이즈 파티클), 빨간 원(유효 파티클) + [Noise] 텍스트' 오버레이
+            # 흰색 점선 원(노이즈 파티클), 빨간색 실선 원(유효 파티클) + [Noise] 텍스트 오버레이
             if overlay_img is not None:
                 for (px, py, _) in self.prev_particles:
-                    cv2.circle(overlay_img, (px, py), NOISE_CIRCLE_RADIUS, (255, 255, 255), NOISE_CIRCLE_THICKNESS, cv2.LINE_AA)
+                    draw_dashed_circle(overlay_img, (px, py), NOISE_CIRCLE_RADIUS, (255, 255, 255), NOISE_CIRCLE_THICKNESS, dash_length=3, gap_length=2)
                 for (vx, vy, _) in valid_particles:
                     cv2.circle(overlay_img, (vx, vy), VALID_CIRCLE_RADIUS, (0, 0, 255), VALID_CIRCLE_THICKNESS, cv2.LINE_AA)
 
