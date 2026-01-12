@@ -28,12 +28,12 @@ mpl.rcParams['font.family'] = 'Malgun Gothic'
 mpl.rcParams['axes.unicode_minus'] = False
 
 # 환경 플래그: 경로 및 저장동작 테스트(True) / 운영(False) 모드 구분
-LOAD_TEST_MODE = False
-SAVE_TEST_MODE = False
-INI_TEST_MODE  = False
+LOAD_TEST_MODE = True
+SAVE_TEST_MODE = True
+INI_TEST_MODE  = True
 
 # 실행파일 실행 시, "자동 시작 동작 수행" 여부 플래그 : 자동 시작(True) / 수동 시작(False)
-AUTO_START_ON_LAUNCH = True
+AUTO_START_ON_LAUNCH = False
 
 # 이미지/CSV/그래프/이벤트 파일 경로 설정
 if LOAD_TEST_MODE:
@@ -88,8 +88,10 @@ VALID_CIRCLE_THICKNESS = 2     # 유효(빨강) 원 테두리 두께
 NOISE_CIRCLE_RADIUS    = 10    # 노이즈(흰색) 원 반지름
 NOISE_CIRCLE_THICKNESS = 1     # 노이즈(흰색) 원 테두리 두께
 
-# 밝기 참조 영역 (ROI)
-REF_ROI = (70, 90, 20, 20)
+# 밝기 참조 영역 설정 (ROI)
+REF_ROI_WIDTH = 20
+REF_ROI_HEIGHT = 20
+REF_ROI_RIGHT_OFFSET_FROM_CROP1 = -5
 
 # 앵커 밝기 기반 동적 임계값 파라미터
 ANCHOR_BRIGHTNESS_REF = 48          # 기준 앵커 밝기
@@ -160,11 +162,21 @@ def load_pixmap_from_path(img_path: Path, target_size: tuple[int, int] | None = 
         return QPixmap()
     return pixmap_from_numpy(img, target_size)
 
-def compute_anchor_brightness(gray_img):
+def get_ref_roi_from_crop1(crop1_rect):
+    """crop1 좌하단 기준 좌측 10px 이동 지점을 REF_ROI 우하단으로 설정"""
+    crop_x, crop_y, crop_w, crop_h = crop1_rect
+    ref_w, ref_h = REF_ROI_WIDTH, REF_ROI_HEIGHT
+    ref_right = crop_x + REF_ROI_RIGHT_OFFSET_FROM_CROP1
+    ref_bottom = crop_y + crop_h
+    ref_x = ref_right - ref_w
+    ref_y = ref_bottom - ref_h
+    return (ref_x, ref_y, ref_w, ref_h)
+
+def compute_anchor_brightness(gray_img, ref_roi=None):
     """70% 최빈 구간 앵커 밝기 계산"""
     if gray_img is None or gray_img.ndim != 2:
         return 0
-    x, y, w, h = REF_ROI
+    x, y, w, h = ref_roi if ref_roi is not None else (0, 0, REF_ROI_WIDTH, REF_ROI_HEIGHT)
     h_img, w_img = gray_img.shape[:2]
 
     x0 = max(0, min(x, w_img-1))
@@ -489,6 +501,7 @@ class ImagePreviewLabel(QLabel):
         self.anchor_value = None
         self.noise_points = []
         self.placeholder_text = ""
+        self.ref_roi = (0, 0, REF_ROI_WIDTH, REF_ROI_HEIGHT)
 
     def set_noise_text(self, text: str):
         """미리보기 하단에 표시할 Noise 정보 텍스트 설정"""
@@ -505,6 +518,14 @@ class ImagePreviewLabel(QLabel):
         self.noise_points = list(points) if points else []
         self.update()
 
+    def set_ref_roi(self, ref_roi):
+        """미리보기에 표시할 밝기 참조 ROI 좌표 저장"""
+        if ref_roi is not None:
+            self.ref_roi = tuple(ref_roi)
+        else:
+            self.ref_roi = (0, 0, REF_ROI_WIDTH, REF_ROI_HEIGHT)
+        self.update()
+
     def show_placeholder(self, text: str):
         """이미지 대신 표시할 플레이스홀더 텍스트 설정"""
         self.pixmap = None
@@ -514,6 +535,7 @@ class ImagePreviewLabel(QLabel):
         self.noise_text = ""
         self.noise_points = []
         self.anchor_value = None
+        self.ref_roi = (0, 0, REF_ROI_WIDTH, REF_ROI_HEIGHT)
         self.update()
 
     def clear(self):
@@ -526,9 +548,10 @@ class ImagePreviewLabel(QLabel):
         self.noise_text = ""
         self.noise_points = []
         self.anchor_value = None
+        self.ref_roi = (0, 0, REF_ROI_WIDTH, REF_ROI_HEIGHT)
         self.update()
 
-    def show_image(self, npimg, box=None, filename=None):
+    def show_image(self, npimg, box=None, filename=None, ref_roi=None):
         if box is not None:
             if isinstance(box, (list, tuple)) and len(box) == 2 and isinstance(box[0], (list, tuple)):
                 self.box1 = tuple(box[0])
@@ -538,6 +561,8 @@ class ImagePreviewLabel(QLabel):
 
         if filename is not None:
             self.filename = filename
+        if ref_roi is not None:
+            self.ref_roi = tuple(ref_roi)
         self.src_shape = npimg.shape[:2]
         h, w = self.src_shape
         self.placeholder_text = ""
@@ -580,7 +605,7 @@ class ImagePreviewLabel(QLabel):
                 painter.drawRect(rect2_x, rect2_y, rect2_w, rect2_h)
 
             # 밝기 참조 ROI 박스 + 밝기 값 표기
-            rx, ry, rw, rh = REF_ROI
+            rx, ry, rw, rh = self.ref_roi
             rect_ref_x = int(x0 + rx * scale)
             rect_ref_y = int(y0 + ry * scale)
             rect_ref_w = int(rw * scale)
@@ -1612,6 +1637,11 @@ class ParticleDetectionGUI(QWidget):
         return (self.crop1_x.value(), self.crop1_y.value(),
                 self.crop1_w.value(), self.crop1_h.value())
 
+    def get_crop1_rect_raw(self):
+        """Crop 박스1 좌표 반환"""
+        return (self.crop1_x.value(), self.crop1_y.value(),
+                self.crop1_w.value(), self.crop1_h.value())
+
     def get_box2(self):
         """Crop 박스2 좌표 반환"""
         if not self.crop2_enabled_cb.isChecked():
@@ -1658,10 +1688,11 @@ class ParticleDetectionGUI(QWidget):
                 return
 
             boxes = [self.get_box1(), self.get_box2()]
-            self.preview_label.show_image(img, boxes, filename=latest.name)
+            ref_roi = get_ref_roi_from_crop1(self.get_crop1_rect_raw())
+            self.preview_label.show_image(img, boxes, filename=latest.name, ref_roi=ref_roi)
 
             # 허용 모드일 때만 앵커 밝기 표시 (비허용+미리보기 ON이면 앵커 숨김)
-            self.preview_label.set_anchor_value(compute_anchor_brightness(img) if process_ok else None)
+            self.preview_label.set_anchor_value(compute_anchor_brightness(img, ref_roi) if process_ok else None)
 
         except Exception:
             self.preview_label.show_placeholder(NO_IMAGE_PLACEHOLDER_TEXT)
@@ -2043,7 +2074,8 @@ class ParticleDetectionGUI(QWidget):
                 self._update_noise_text()
                 self._set_status("지정된 Puller Mode Status가 아님.")
 
-                self.preview_label.show_image(gray_prev, [self.get_box1(), self.get_box2()], filename=img_name)
+                ref_roi = get_ref_roi_from_crop1(self.get_crop1_rect_raw())
+                self.preview_label.show_image(gray_prev, [self.get_box1(), self.get_box2()], filename=img_name, ref_roi=ref_roi)
                 self.preview_label.set_anchor_value(None)
 
                 self._mark_image_processed(img_name)
@@ -2056,8 +2088,9 @@ class ParticleDetectionGUI(QWidget):
             self.last_allowed_image_seen_at = self.last_image_seen_at
 
             # 현재 처리 대상 파일 기준으로 이미지 미리보기 표기 + 앵커값
-            anchor_current = compute_anchor_brightness(gray_prev)
-            self.preview_label.show_image(gray_prev, [self.get_box1(), self.get_box2()], filename=img_name)
+            ref_roi = get_ref_roi_from_crop1(self.get_crop1_rect_raw())
+            anchor_current = compute_anchor_brightness(gray_prev, ref_roi)
+            self.preview_label.show_image(gray_prev, [self.get_box1(), self.get_box2()], filename=img_name, ref_roi=ref_roi)
             self.preview_label.set_anchor_value(anchor_current)
 
             adaptive_value = compute_adaptive_threshold(anchor_current)
